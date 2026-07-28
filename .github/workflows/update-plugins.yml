@@ -1,15 +1,12 @@
 name: Update Plugins
 on:
-  # 推送到主分支时也触发更新
   push:
     branches:
       - main
       - master
   schedule:
-    # 每 3 天 UTC 00:00 运行
     - cron: '0 0 */3 * *'
   workflow_dispatch:
-    # 支持手动触发
 
 permissions:
   contents: write
@@ -20,26 +17,30 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
+
+      - name: Configure git
+        run: |
+          git config user.name "pi-plugins-bot"
+          git config user.email "bot@pi-plugins.local"
 
       - name: Sync plugins to latest versions
         run: bash scripts/sync-plugins.sh
 
       - name: Commit and push if changed
         run: |
-          git config user.name "pi-plugins-bot"
-          git config user.email "bot@pi-plugins.local"
           git add -A
-          if ! git diff --quiet && ! git diff --staged --quiet; then
-            git commit -m "chore: sync plugins to latest versions"
-            git push
-          elif ! git diff --staged --quiet; then
-            git commit -m "chore: sync plugins to latest versions"
-            git push
-          else
+          if git diff --quiet && git diff --staged --quiet; then
             echo "No changes to commit"
+            exit 0
           fi
+          git commit -m "chore: sync plugins to latest versions"
+          # Pull rebase first to handle concurrent runs
+          git pull --rebase origin main 2>/dev/null || true
+          git push

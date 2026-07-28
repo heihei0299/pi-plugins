@@ -165,6 +165,13 @@ while IFS='|' read -r name url ref dir_path; do
 
     DEST_DIR="$ROOT_DIR/$dir_path"
 
+    # 在 CI 中确保使用 HTTPS URL
+    CI_URL="$url"
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        # 将 SSH URL 转换为 HTTPS
+        CI_URL=$(echo "$url" | sed 's|git@github.com:|https://github.com/|; s|ssh://git@github.com/|https://github.com/|')
+    fi
+
     if [ ! -d "$DEST_DIR" ] || [ ! -d "$DEST_DIR/.git" ]; then
         if [ -d "$DEST_DIR" ] && [ ! -d "$DEST_DIR/.git" ]; then
             info "  目录存在但无 .git，重新克隆..."
@@ -173,11 +180,11 @@ while IFS='|' read -r name url ref dir_path; do
             info "  本地无目录，克隆..."
         fi
         mkdir -p "$(dirname "$DEST_DIR")"
-        if git clone --depth 1 "$url" "$DEST_DIR" 2>/dev/null; then
+        if git clone --depth 1 "$CI_URL" "$DEST_DIR" 2>/dev/null; then
             ok "  已克隆: $name"
             ANY_UPDATED=true
         else
-            warn "  克隆失败: $url"
+            warn "  克隆失败: $CI_URL"
         fi
         continue
     fi
@@ -185,11 +192,19 @@ while IFS='|' read -r name url ref dir_path; do
     # 拉取最新
     info "  本地目录存在，拉取更新..."
     cd "$DEST_DIR"
+
+    # 更新 remote URL（防止 SSH URL 在 CI 中不工作）
+    CURRENT_REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
+    if [ "$CURRENT_REMOTE" != "$CI_URL" ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
+        git remote set-url origin "$CI_URL"
+        info "  已更新 remote URL 为 HTTPS"
+    fi
+
     if git fetch --depth 1 origin 2>/dev/null; then
         LOCAL=$(git rev-parse HEAD)
         REMOTE=$(git rev-parse origin/HEAD 2>/dev/null || git rev-parse origin/main 2>/dev/null || git rev-parse origin/master 2>/dev/null || echo "")
         if [ -n "$REMOTE" ] && [ "$LOCAL" != "$REMOTE" ]; then
-            git reset --hard origin/HEAD 2>/dev/null || git reset --hard origin/main 2>/dev/null || git reset --hard origin/master 2>/dev/null || true
+            git reset --hard "$REMOTE" 2>/dev/null || true
             ok "  已更新 $name"
             ANY_UPDATED=true
         else
@@ -197,15 +212,16 @@ while IFS='|' read -r name url ref dir_path; do
         fi
     else
         warn "  拉取失败: $name"
-        # 如果拉取失败，尝试重新克隆
-        info "  尝试重新克隆..."
+        # 尝试 HTTPS 重新克隆
+        info "  尝试重新克隆（HTTPS）..."
+        cd "$ROOT_DIR"
         rm -rf "$DEST_DIR"
         mkdir -p "$(dirname "$DEST_DIR")"
-        if git clone --depth 1 "$url" "$DEST_DIR" 2>/dev/null; then
+        if git clone --depth 1 "$CI_URL" "$DEST_DIR" 2>/dev/null; then
             ok "  已重新克隆: $name"
             ANY_UPDATED=true
         else
-            warn "  重新克隆也失败: $url"
+            warn "  重新克隆也失败: $CI_URL"
         fi
     fi
     cd "$ROOT_DIR"
