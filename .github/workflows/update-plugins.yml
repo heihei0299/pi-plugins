@@ -20,6 +20,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Clean up any stale nested git repos from previous runs
+        run: |
+          # Remove .git dirs inside extensions/ so checkout action cleanup
+          # doesn't try to process them as submodules
+          find extensions -name '.git' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          # Remove any stale submodule entries from previous checkouts
+          git config --local --name-only --get-regexp 'submodule\..*' 2>/dev/null | while read key; do
+            git config --local --unset-all "$key" 2>/dev/null || true
+          done 2>/dev/null || true
+          rm -f .gitmodules 2>/dev/null || true
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
@@ -33,6 +43,16 @@ jobs:
       - name: Sync plugins to latest versions
         run: bash scripts/sync-plugins.sh
 
+      - name: Clean up nested git repos to prevent post-job errors
+        run: |
+          # Remove .git dirs inside extensions/ so checkout action cleanup
+          # doesn't try to process them as submodules
+          find extensions -name '.git' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          # Remove any stale submodule entries that checkout may have auto-registered
+          git config --local --name-only --get-regexp 'submodule\..*' 2>/dev/null | while read key; do
+            git config --local --unset-all "$key" 2>/dev/null || true
+          done 2>/dev/null || true
+          rm -f .gitmodules 2>/dev/null || true
       - name: Commit and push if changed
         run: |
           git add -A
