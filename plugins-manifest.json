@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-07-28T21:39:37Z",
+  "updatedAt": "2026-07-28T21:46:27Z",
   "plugins": {
     "npm": {
       "@cortexkit/pi-magic-context": {
