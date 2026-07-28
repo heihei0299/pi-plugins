@@ -60,7 +60,19 @@ jobs:
             echo "No changes to commit"
             exit 0
           fi
+
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+          if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+            echo "Detached HEAD state, skipping push"
+            exit 0
+          fi
+
           git commit -m "chore: sync plugins to latest versions"
-          # Pull rebase first to handle concurrent runs
-          git pull --rebase origin main 2>/dev/null || true
-          git push
+
+          # Pull rebase first to handle concurrent runs; abort on conflict
+          git pull --rebase origin "$CURRENT_BRANCH" 2>/dev/null && PULL_OK=true || PULL_OK=false
+          if [ "$PULL_OK" = false ]; then
+            git rebase --abort 2>/dev/null || true
+          fi
+
+          git push origin "$CURRENT_BRANCH"
