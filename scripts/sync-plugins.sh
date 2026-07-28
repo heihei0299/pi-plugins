@@ -172,15 +172,16 @@ while IFS='|' read -r name url ref dir_path; do
         CI_URL=$(echo "$url" | sed 's|git@github.com:|https://github.com/|; s|ssh://git@github.com/|https://github.com/|')
     fi
 
-    if [ ! -d "$DEST_DIR" ] || [ ! -d "$DEST_DIR/.git" ]; then
-        if [ -d "$DEST_DIR" ] && [ ! -d "$DEST_DIR/.git" ]; then
-            info "  目录存在但无 .git，重新克隆..."
+    if [ ! -d "$DEST_DIR" ] || [ -z "$(ls -A "$DEST_DIR" 2>/dev/null)" ]; then
+        if [ -d "$DEST_DIR" ]; then
+            info "  目录为空，重新克隆..."
             rm -rf "$DEST_DIR"
         else
             info "  本地无目录，克隆..."
         fi
         mkdir -p "$(dirname "$DEST_DIR")"
         if git clone --depth 1 "$CI_URL" "$DEST_DIR" 2>/dev/null; then
+            rm -rf "$DEST_DIR/.git" 2>/dev/null || true
             ok "  已克隆: $name"
             ANY_UPDATED=true
         else
@@ -205,6 +206,7 @@ while IFS='|' read -r name url ref dir_path; do
         REMOTE=$(git rev-parse origin/HEAD 2>/dev/null || git rev-parse origin/main 2>/dev/null || git rev-parse origin/master 2>/dev/null || echo "")
         if [ -n "$REMOTE" ] && [ "$LOCAL" != "$REMOTE" ]; then
             git reset --hard "$REMOTE" 2>/dev/null || true
+            rm -rf "$DEST_DIR/.git" 2>/dev/null || true
             ok "  已更新 $name"
             ANY_UPDATED=true
         else
@@ -218,6 +220,7 @@ while IFS='|' read -r name url ref dir_path; do
         rm -rf "$DEST_DIR"
         mkdir -p "$(dirname "$DEST_DIR")"
         if git clone --depth 1 "$CI_URL" "$DEST_DIR" 2>/dev/null; then
+            rm -rf "$DEST_DIR/.git" 2>/dev/null || true
             ok "  已重新克隆: $name"
             ANY_UPDATED=true
         else
