@@ -22,6 +22,8 @@
 
 ## 已备份的扩展插件
 
+> 以下内容由脚本自动生成，基于 `plugins-manifest.json`。
+
 ### npm 包
 
 所有通过 npm 安装的扩展插件的源码保存在 `extensions/npm/` 下。
@@ -47,7 +49,7 @@
 | pi-agent-browser-native | 0.2.72 | [npm](https://www.npmjs.com/package/pi-agent-browser-native) |
 | pi-autoresearch | 1.6.2 | [npm](https://www.npmjs.com/package/pi-autoresearch) |
 | pi-cache-optimizer | 2.6.25 | [npm](https://www.npmjs.com/package/pi-cache-optimizer) |
-| pi-hashline-edit-pro | 0.17.14 | [npm](https://www.npmjs.com/package/pi-hashline-edit-pro) |
+| pi-hashline-edit-pro | 0.18.0 | [npm](https://www.npmjs.com/package/pi-hashline-edit-pro) |
 | pi-mcp-adapter | 2.15.0 | [npm](https://www.npmjs.com/package/pi-mcp-adapter) |
 | pi-rtk-optimizer | 0.9.0 | [npm](https://www.npmjs.com/package/pi-rtk-optimizer) |
 | pi-slopchop | 0.10.1 | [npm](https://www.npmjs.com/package/pi-slopchop) |
@@ -60,7 +62,7 @@
 
 | 包名 | 远程仓库 |
 |------|----------|
-| justhil/pi-ace-tool | [GitHub](https://github.com/justhil/pi-ace-tool) |
+| github.com/justhil/pi-ace-tool | [GitHub](https://github.com/justhil/pi-ace-tool) |
 
 ### 本地包
 
@@ -69,9 +71,6 @@
 | 包名 | 源路径 |
 |------|--------|
 | pi-guard-extension | `../../Project/Pi/guard/pi-guard-extension` |
-
----
-
 ## Skill：管理备份流程
 
 本仓库提供了一个 pi skill `plugin-backup`，用于管理扩展插件的备份与更新。skill 定义在 `.agents/skills/plugin-backup/SKILL.md`，pi 自动发现后可通过命令调用。

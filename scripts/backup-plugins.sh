@@ -274,8 +274,6 @@ for p in sorted(pkgs):
                 break
             done
         fi
-            done
-        fi
 
         if [ -n "$GIT_SRC" ] && [ -d "$GIT_SRC" ]; then
             # 确定目标路径

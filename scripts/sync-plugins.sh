@@ -236,8 +236,13 @@ with open('$MANIFEST_FILE', 'w') as f:
 "
 fi
 
+# ====== 更新 README 扩展表格 ======
+SCRIPT_DIR="$(dirname "$0")"
+if [ -f "$SCRIPT_DIR/update-readme.sh" ]; then
+    bash "$SCRIPT_DIR/update-readme.sh"
+fi
+
 # ====== 摘要 ======
-echo ""
 echo "============================================"
 if [ "$ANY_UPDATED" = true ]; then
     echo " 结果: 有更新已同步"

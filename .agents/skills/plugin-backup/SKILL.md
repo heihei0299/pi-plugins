@@ -54,7 +54,15 @@ the source `package.json` files.
    cat plugins-manifest.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['plugins']['npm']), 'npm packages')"
    ```
 
-3. **Commit**
+3. **Regenerate README extension table**
+
+   ```bash
+   bash scripts/update-readme.sh
+   ```
+
+   Updates the plugin listing table in `README.md` to match the new manifest.
+
+4. **Commit**
 
    ```bash
    git add extensions/ plugins-manifest.json
@@ -88,14 +96,20 @@ The `updatedAt` field reflects this run.
    it downloads and extracts the tarball (npm) or pulls (git) and
    updates the manifest.
 
-2. **Review what changed**
+2. **Regenerate README extension table**
 
    ```bash
-   git diff --stat
-   # Check individual version bumps:
-   git diff plugins-manifest.json
+   bash scripts/update-readme.sh
    ```
 
+   Reads `plugins-manifest.json` and regenerates the plugin listing
+   table under `## 已备份的扩展插件` in `README.md`, keeping
+   version numbers and npm/GitHub links in sync with the manifest.
+
+3. **Review what changed**
+   git diff plugins-manifest.json
+   ```
+4. **Commit**
 3. **Commit**
 
    ```bash
