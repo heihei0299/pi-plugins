@@ -1,0 +1,32 @@
+{
+  "name": "pi-guard-extension",
+  "version": "0.1.0",
+  "description": "Pi extension that enforces 'no unauthorized actions after skill conversations' via a three-state guard",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "guard",
+    "skill"
+  ],
+  "license": "MIT",
+  "author": "",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

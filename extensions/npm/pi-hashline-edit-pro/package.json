@@ -1,0 +1,71 @@
+{
+  "name": "pi-hashline-edit-pro",
+  "version": "0.17.14",
+  "type": "module",
+  "description": "Strict hashline read/replace tool for pi-coding-agent with hash-anchored edits (3-char, 18-bit, perfect hashing)",
+  "main": "index.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YuGiMob/pi-hashline-edit-pro.git"
+  },
+  "author": "pi-hashline-edit-pro contributors",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "extension",
+    "hashline",
+    "hash-anchored",
+    "strict"
+  ],
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "src",
+    "prompts",
+    "README.md",
+    "LICENSE",
+    "scripts"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.1",
+    "diff": "^8.0.2",
+    "file-type": "^21.3.0",
+    "sql.js": "1.11",
+    "xxhash-wasm": "^1.1.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.74.0",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint 'src/**/*.ts' 'index.ts'",
+    "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/ensure-better-sqlite3.cjs",
+    "preuninstall": "node scripts/cleanup-better-sqlite3.cjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/sql.js": "^1.4.11",
+    "eslint": "^10.7.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.65.0",
+    "vitest": "^4.1.8"
+  },
+  "allowScripts": {
+    "better-sqlite3@13.0.1": true,
+    "@google/genai@1.52.0": true,
+    "koffi@2.16.2": true,
+    "protobufjs@7.6.4": true
+  }
+}

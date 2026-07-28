@@ -1,0 +1,46 @@
+{
+  "name": "@juanibiapina/pi-extension-settings",
+  "version": "0.9.1",
+  "description": "Pi extension for centralized settings management across extensions",
+  "type": "module",
+  "scripts": {
+    "check": "biome check --write --error-on-warnings . && tsc --noEmit",
+    "test": "node --test --import tsx test/*.test.ts"
+  },
+  "files": [
+    "src/**/*",
+    "README.md"
+  ],
+  "keywords": [
+    "pi",
+    "pi-package",
+    "extension",
+    "config",
+    "utilities"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "author": "Juan Ibiapina",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/juanibiapina/pi-extension-settings"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.4",
+    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@types/node": "^26.0.1",
+    "tsx": "^4.22.3",
+    "typescript": "^7.0.2"
+  }
+}

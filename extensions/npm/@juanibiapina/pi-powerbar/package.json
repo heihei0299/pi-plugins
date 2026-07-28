@@ -1,0 +1,51 @@
+{
+  "name": "@juanibiapina/pi-powerbar",
+  "version": "0.13.0",
+  "description": "Pi extension that renders a persistent powerline status bar with left/right segments updated via events",
+  "type": "module",
+  "scripts": {
+    "test": "node --test --import tsx test/*.test.js",
+    "check": "biome check --write --error-on-warnings . && tsc --noEmit"
+  },
+  "files": [
+    "src/**/*",
+    "README.md"
+  ],
+  "keywords": [
+    "pi",
+    "pi-package",
+    "extension",
+    "powerline",
+    "status-bar"
+  ],
+  "pi": {
+    "extensions": [
+      "./src",
+      "node_modules/@juanibiapina/pi-usage/index.ts"
+    ]
+  },
+  "author": "Juan Ibiapina",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/juanibiapina/pi-powerbar"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@juanibiapina/pi-extension-settings": "^0.9.0",
+    "@juanibiapina/pi-usage": "^0.3.0"
+  },
+  "bundleDependencies": [
+    "@juanibiapina/pi-usage"
+  ],
+  "devDependencies": {
+    "@biomejs/biome": "2.5.4",
+    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@earendil-works/pi-tui": "^0.80.2",
+    "@types/node": "^26.0.1",
+    "tsx": "^4.22.3",
+    "typescript": "^7.0.2"
+  }
+}

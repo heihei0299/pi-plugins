@@ -1,0 +1,1 @@
+- `read`: call before `replace` when you need fresh HASH anchors for a file.

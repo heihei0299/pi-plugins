@@ -1,0 +1,42 @@
+{
+	"name": "@narumitw/pi-caffeinate",
+	"version": "0.35.0",
+	"description": "Pi extension that keeps the computer awake while the agent is running.",
+	"type": "module",
+	"license": "MIT",
+	"private": false,
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi",
+		"caffeinate",
+		"awake",
+		"sleep"
+	],
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"check": "biome check . && npm run typecheck",
+		"format": "biome check --write .",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.5",
+		"@earendil-works/pi-coding-agent": "0.82.1",
+		"@types/node": "26.1.1",
+		"typescript": "7.0.2"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/narumiruna/pi-extensions",
+		"directory": "extensions/pi-caffeinate"
+	}
+}

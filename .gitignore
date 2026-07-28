@@ -1,0 +1,43 @@
+# Pi Plugins .gitignore
+
+# Node dependencies (should not be in extensions)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-*
+
+# Build artifacts
+*.tsbuildinfo
+*.js.map
+dist/
+build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Extensions: keep only what matters
+# Node modules inside extensions should not be committed
+extensions/npm/*/node_modules/
+extensions/git/*/node_modules/
+extensions/local/*/node_modules/
