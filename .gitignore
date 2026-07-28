@@ -38,6 +38,8 @@ __pycache__/
 
 # Extensions: keep only what matters
 # Node modules inside extensions should not be committed
-extensions/npm/*/node_modules/
-extensions/git/*/node_modules/
-extensions/local/*/node_modules/
+# Prevent nested git repos inside extensions from becoming gitlinks
+extensions/git/*/.git
+extensions/git/**/.git
+extensions/npm/*/.git
+extensions/local/*/.git
