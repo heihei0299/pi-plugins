@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-07-28T20:43:32Z",
+  "updatedAt": "2026-07-28T20:55:24Z",
   "plugins": {
     "npm": {
       "@cortexkit/pi-magic-context": {
@@ -117,6 +117,11 @@
         "version": "0.10.1",
         "resolved": "https://registry.npmjs.org/pi-slopchop/-/pi-slopchop-0.10.1.tgz",
         "dir": "extensions/npm/pi-slopchop"
+      },
+      "pi-web-access": {
+        "version": "0.15.0",
+        "resolved": "https://registry.npmjs.org/pi-web-access/-/pi-web-access-0.15.0.tgz",
+        "dir": "extensions/npm/pi-web-access"
       },
       "pi-workspace-history": {
         "version": "0.2.2",
