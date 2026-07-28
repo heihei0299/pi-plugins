@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-07-28T21:36:20Z",
+  "updatedAt": "2026-07-28T21:38:52Z",
   "plugins": {
     "npm": {
       "@cortexkit/pi-magic-context": {
@@ -99,8 +99,8 @@
         "dir": "extensions/npm/pi-cache-optimizer"
       },
       "pi-hashline-edit-pro": {
-        "version": "0.18.0",
-        "resolved": "https://registry.npmjs.org/pi-hashline-edit-pro/-/pi-hashline-edit-pro-0.18.0.tgz",
+        "version": "0.17.14",
+        "resolved": "https://registry.npmjs.org/pi-hashline-edit-pro/-/pi-hashline-edit-pro-0.17.14.tgz",
         "dir": "extensions/npm/pi-hashline-edit-pro"
       },
       "pi-mcp-adapter": {
