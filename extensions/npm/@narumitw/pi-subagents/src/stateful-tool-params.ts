@@ -73,6 +73,7 @@ export type ValidatedMailboxParams =
 
 export function validateManageParams(params: unknown): ValidatedManageParams {
 	const values = parameterRecord(params, "subagent_manage");
+	assertKnownKeys("subagent_manage", values, ["action", "agentId", "includeClosed", "subtree"]);
 	const action = values.action;
 	if (
 		typeof action !== "string" ||
@@ -81,18 +82,32 @@ export function validateManageParams(params: unknown): ValidatedManageParams {
 		throw new Error(`subagent_manage action must be one of: ${MANAGE_ACTIONS.join(", ")}`);
 	}
 	if (action === "list") {
-		assertOnlyActionKeys("subagent_manage", action, values, ["action", "includeClosed"]);
 		assertOptionalBoolean("subagent_manage", action, values, "includeClosed");
-		return values as ValidatedManageParams;
+		return {
+			action,
+			...(values.includeClosed === undefined ? {} : { includeClosed: values.includeClosed }),
+		} as ValidatedManageParams;
 	}
-	assertOnlyActionKeys("subagent_manage", action, values, ["action", "agentId", "subtree"]);
 	assertRequiredString("subagent_manage", action, values, "agentId");
 	assertOptionalBoolean("subagent_manage", action, values, "subtree");
-	return values as ValidatedManageParams;
+	return {
+		action,
+		agentId: values.agentId,
+		...(values.subtree === undefined ? {} : { subtree: values.subtree }),
+	} as ValidatedManageParams;
 }
 
 export function validateMailboxParams(params: unknown): ValidatedMailboxParams {
 	const values = parameterRecord(params, "subagent_mailbox");
+	assertKnownKeys("subagent_mailbox", values, [
+		"action",
+		"agentId",
+		"message",
+		"senderId",
+		"deduplicationKey",
+		"acknowledge",
+		"limit",
+	]);
 	const action = values.action;
 	if (
 		typeof action !== "string" ||
@@ -101,13 +116,6 @@ export function validateMailboxParams(params: unknown): ValidatedMailboxParams {
 		throw new Error(`subagent_mailbox action must be one of: ${MAILBOX_ACTIONS.join(", ")}`);
 	}
 	if (action === "send") {
-		assertOnlyActionKeys("subagent_mailbox", action, values, [
-			"action",
-			"agentId",
-			"message",
-			"senderId",
-			"deduplicationKey",
-		]);
 		assertRequiredString("subagent_mailbox", action, values, "agentId");
 		assertRequiredString("subagent_mailbox", action, values, "message");
 		const message = values.message as string;
@@ -123,14 +131,16 @@ export function validateMailboxParams(params: unknown): ValidatedMailboxParams {
 				'subagent_mailbox action "send" requires deduplicationKey at most 256 characters',
 			);
 		}
-		return values as ValidatedMailboxParams;
+		return {
+			action,
+			agentId: values.agentId,
+			message,
+			...(values.senderId === undefined ? {} : { senderId: values.senderId }),
+			...(values.deduplicationKey === undefined
+				? {}
+				: { deduplicationKey: values.deduplicationKey }),
+		} as ValidatedMailboxParams;
 	}
-	assertOnlyActionKeys("subagent_mailbox", action, values, [
-		"action",
-		"agentId",
-		"acknowledge",
-		"limit",
-	]);
 	assertRequiredString("subagent_mailbox", action, values, "agentId");
 	assertOptionalBoolean("subagent_mailbox", action, values, "acknowledge");
 	if (
@@ -142,7 +152,12 @@ export function validateMailboxParams(params: unknown): ValidatedMailboxParams {
 	) {
 		throw new Error('subagent_mailbox action "read" requires limit between 1 and 20');
 	}
-	return values as ValidatedMailboxParams;
+	return {
+		action,
+		agentId: values.agentId,
+		...(values.acknowledge === undefined ? {} : { acknowledge: values.acknowledge }),
+		...(values.limit === undefined ? {} : { limit: values.limit }),
+	} as ValidatedMailboxParams;
 }
 
 function parameterRecord(params: unknown, toolName: string): Record<string, unknown> {
@@ -152,18 +167,15 @@ function parameterRecord(params: unknown, toolName: string): Record<string, unkn
 	return params as Record<string, unknown>;
 }
 
-function assertOnlyActionKeys(
+function assertKnownKeys(
 	toolName: string,
-	action: string,
 	values: Record<string, unknown>,
 	allowed: readonly string[],
 ): void {
 	const unexpected = Object.keys(values).find(
 		(key) => values[key] !== undefined && !allowed.includes(key),
 	);
-	if (unexpected) {
-		throw new Error(`${toolName} action "${action}" does not accept ${unexpected}`);
-	}
+	if (unexpected) throw new Error(`${toolName} does not accept ${unexpected}`);
 }
 
 function assertRequiredString(

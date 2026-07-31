@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-30
+
+### Added
+- Added Gemini API PDF-to-Markdown conversion before local `unpdf` fallback, with inline PDF upload, page-marker validation, configurable `pdf.maxSizeMB`, and streamed size enforcement. Thanks José Antonio Galiano Sandoval (`@jagaliano`) for PR #180.
+- Added Searchinfinity (Byteplus Searchinfinity / 豆包搜索 Global edition) as a search provider with `searchinfinityApiKey` / `SEARCHINFINITY_API_KEY` credentials, native domain and recency filters, model-generated result summaries, HTTP-semantics mapping for business error codes, provider-array/all-provider routing, and curator selection. Thanks `@cyzlmh` for PR #186.
+- Added Querit as a search and hosted content provider with `queritApiKey` / `QUERIT_API_KEY` credentials, native domain and recency filters, optional inline Contents retrieval, provider-array/all-provider routing, curator selection, and a `fetch_content` fallback. Thanks `@MCapricorns` for PR #185.
+
+### Changed
+- The 5MB `fetch_content` response size limit is now enforced while streaming the decoded body, not just via the `Content-Length` header. Chunked or compressed pages whose decoded content exceeds 5MB now fail with `Response too large (5MB)` instead of being buffered unbounded and parsed. Shared config parsing for SSRF and fetch-content domain policy loaders also removes duplicate reads on the fetch hot path.
+
+### Fixed
+- Fixed filtered zero-config Exa search silently losing its request options: the default keyless MCP tool (`web_search_exa`) only accepts `query` and `numResults`, so `type`, `livecrawl`, and `contextMaxCharacters` were dropped server-side and `includeContent` never returned page text. Filtered or content-carrying keyless searches now use `web_search_advanced_exa` — served by the same keyless free tier — which applies `includeDomains`/`excludeDomains`, `startPublishedDate`, highlights, and text limits as real parameters instead of `site:` / "past week" strings appended to the semantic query. Plain searches stay on `web_search_exa`, and the advanced path falls back to it if it is unavailable.
+- Stopped requesting citation text on keyed Exa `/answer` calls, which was fetched and then discarded, and stopped requesting page text on keyed `/search` calls that do not ask for content.
+- Exa MCP rate-limit responses (429) now explain that adding `exaApiKey` to `~/.pi/web-search.json` removes the free-tier limit, instead of surfacing a bare status code. Thanks `@kesku` for PR #187.
+
+## [0.16.0] - 2026-07-30
+
+### Added
+- Added Search1API as a first-class search and extraction provider with `search1apiApiKey` / `SEARCH1API_KEY` credentials, native domain and recency filters, opt-in Deep Search inline content, provider-array/all-provider routing, curator selection, and a hosted `fetch_content` fallback through the Crawl API. Thanks `@fatwang2` for PR #176.
+
+### Fixed
+- Standardized Gemini API defaults on `gemini-3.6-flash` for search, URL context, YouTube, and local video paths, set Gemini Web’s separate browser-cookie default to `gemini-3.1-pro`, and stopped unsupported Web models from silently falling back to 2.5 Flash. Thanks `@jagaliano` for issue #181.
+- Accept explicit provider arrays for `web_search` and `source_check`, running only the selected providers concurrently while preserving `auto`, `all`, and sequential routing behavior. Thanks `@XWIlluDelu` for PR #179.
+- Added `curatorRemote` and `autoOpenBrowser` controls for remote-accessible curator sessions, defaulting remote mode to a printed manual URL unless browser auto-open is explicitly requested. Thanks `@tylerdavis` for PR #178.
+- Resolve the OpenAI search model from Pi’s model registry, with an `openaiSearchModel` override and preserved API-key fallback for partial registries. Thanks `@ahalekelly` for PR #182.
+- Surfaced RFC Link / HTML discovery relations (`service-desc`, `service-doc`, `service-meta`, `api-catalog`, `describedby`) from HTTP `Link` headers and matching `link`/`a[rel]` markup during `fetch_content` HTML extraction, including empty SPA shells, without broad `/docs` URL heuristics. Thanks `@XWIlluDelu` for PR #175.
+- Expand leading `~` and `$HOME`-style environment variables in `githubClone.clonePath` before cloning repositories. Thanks `@unship` for PR #184.
+- Write extracted PDF markdown to a temporary `pi-web-pdf` directory by default instead of `~/Downloads`, while preserving explicit output directories. Thanks `@ahalekelly` for PR #183.
+
 ## [0.15.0] - 2026-07-28
 
 ### Added

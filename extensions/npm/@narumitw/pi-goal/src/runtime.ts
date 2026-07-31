@@ -169,6 +169,9 @@ const CONTRADICTORY_COMPLETION_PATTERNS = [
 // and the cross-cutting invariants used by command and lifecycle orchestration.
 // Keep this state machine cohesive despite its size: prompt ownership, continuation,
 // budget, safety, and tool-policy transitions share ordering-sensitive invariants.
+// Cohesion justification: Goal transitions, continuation ownership, queue state, and budget/retry
+// recovery share one generation-guarded runtime; separating them would duplicate stale-turn and
+// persistence invariants across modules.
 export class GoalRuntime {
 	settings: GoalSettings = DEFAULT_GOAL_SETTINGS;
 	settingsLoadIssue?: GoalSettingsLoadIssue;
@@ -199,11 +202,24 @@ export class GoalRuntime {
 	cancelledContinuationMarkers = new Set<string>();
 	claimedContinuationMarkers = new Set<string>();
 	pendingNonGoalInputs: PendingNonGoalInput[] = [];
+	menuGeneration = 0;
+	menuController = new AbortController();
 
 	readonly pi: ExtensionAPI;
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
+	}
+
+	replaceMenuSession() {
+		this.menuGeneration += 1;
+		this.menuController.abort(new DOMException("Goal session replaced", "AbortError"));
+		this.menuController = new AbortController();
+	}
+
+	closeMenuSession() {
+		this.menuGeneration += 1;
+		this.menuController.abort(new DOMException("Goal session shut down", "AbortError"));
 	}
 
 	canRecordGoalUsage(goalId?: string) {

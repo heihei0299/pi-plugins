@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import type {
   GetPromptResult,
   PromptMessage,
-} from "@modelcontextprotocol/client";
+} from "@modelcontextprotocol/sdk/types.js";
 import type { McpExtensionState } from "./state.ts";
 import { isServerDisabled, type McpConfig, type PromptMetadata } from "./types.ts";
 import { formatPromptCommandName } from "./types.ts";
@@ -27,7 +27,7 @@ export function resolveCachedPrompts(config: McpConfig): PromptMetadata[] {
     const definition = config.mcpServers[serverName];
     if (!definition || isServerDisabled(definition)) continue;
     if (!entry?.prompts?.length || !isServerCacheValid(entry, definition)) continue;
-    specs.push(...reconstructPromptMetadata(serverName, entry.prompts, prefix));
+    specs.push(...reconstructPromptMetadata(serverName, entry.prompts, prefix, definition));
   }
 
   return specs;

@@ -1,21 +1,6 @@
 import { join } from "node:path";
-import {
-	type ExtensionCommandContext,
-	getAgentDir,
-	getSelectListTheme,
-	getSettingsListTheme,
-} from "@earendil-works/pi-coding-agent";
-import {
-	type Component,
-	Container,
-	matchesKey,
-	type SelectItem,
-	SelectList,
-	type SettingItem,
-	SettingsList,
-	Text,
-	truncateToWidth,
-} from "@earendil-works/pi-tui";
+import { type ExtensionCommandContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
 import { checkpointGoalActiveTime } from "./accounting.js";
 import { abortCurrentTurn, type GoalRuntime, STATUS_KEY } from "./runtime.js";
 import {
@@ -37,23 +22,6 @@ interface GoalSettingsApplyOptions {
 
 type LimitField = "automaticTurns" | "noProgressTurns";
 type LimitSelection = "unlimited" | "default" | "custom" | "off";
-type SettingsScreenResult =
-	| {
-			kind: "limit";
-			field: LimitField;
-			selection: LimitSelection;
-			activeGoalId: string | null;
-	  }
-	| { kind: "queue"; enabled: boolean }
-	| undefined;
-
-interface LimitChoiceStyles {
-	title: (text: string) => string;
-	muted: (text: string) => string;
-}
-
-type EnqueueSettingsChange = (operation: () => void | Promise<void>) => Promise<void>;
-
 export async function showGoalSettings(
 	runtime: GoalRuntime,
 	ctx: ExtensionCommandContext,
@@ -64,70 +32,278 @@ export async function showGoalSettings(
 		ctx.ui.notify(`Edit pi-goal settings manually: ${safeTerminalText(settingsPath)}`, "info");
 		return;
 	}
-
-	while (true) {
-		const result = await showSettingsScreen(runtime, ctx, settingsPath, options);
-		if (!result) return;
-		if (result.kind === "queue") {
-			const next = await nextQueueSettings(runtime, ctx, result.enabled);
-			if (!next) continue;
-			const wasFrozen = runtime.queueFrozen;
-			try {
-				applyGoalSettings(runtime, next, ctx, {
-					save: (settings) => (options.save ?? saveGoalSettings)(settings, settingsPath),
-				});
-				if (wasFrozen && !runtime.queueFrozen) {
-					try {
-						await options.onQueueUnfrozen?.(ctx);
-					} catch (error) {
-						ctx.ui.notify(
-							`Goal queue enabled, but automatic resume failed: ${safeTerminalText(formatError(error))}. Reopen /goal to retry.`,
-							"warning",
-						);
-					}
+	const generation = runtime.menuGeneration;
+	const invalid = runtime.settingsLoadIssue?.kind === "invalid";
+	const previewGoalIds = new Map<LimitField, string | null>();
+	type Screen = "settings" | "automatic" | "no-progress" | "invalid";
+	type Action =
+		| "open-automatic"
+		| "open-no-progress"
+		| "choose-automatic"
+		| "choose-no-progress"
+		| "set-visibility"
+		| "set-queue";
+	const menu = defineMenu<undefined, Screen, Action, ExtensionCommandContext>({
+		start: invalid ? "invalid" : "settings",
+		screens: {
+			settings: () => ({
+				kind: "settings",
+				title: "Pi Goal Settings",
+				lines: [`User settings · ${safeTerminalText(settingsPath)}`],
+				items: [
+					{
+						id: "automaticTurns",
+						label: "Automatic work",
+						description: "Choose whether Goal can continue without a response-count cap.",
+						currentValue: formatAutomaticSettingValue(
+							runtime.settings.continuationLimits.automaticTurns,
+						),
+						action: "open-automatic",
+					},
+					{
+						id: "noProgressTurns",
+						label: "No-progress guard",
+						description: "Pause after repeated or empty tool-free automatic runs.",
+						currentValue: formatNoProgressSettingValue(
+							runtime.settings.continuationLimits.noProgressTurns,
+						),
+						action: "open-no-progress",
+					},
+					{
+						id: "toolVisibility",
+						label: "Goal tools",
+						description: "Keep terminal Goal tools visible, or reveal them after the first goal.",
+						currentValue: visibilityLabel(runtime.settings.toolVisibility),
+						values: ["Always", "After first goal"],
+						action: "set-visibility",
+					},
+					{
+						id: "experimentalGoals",
+						label: "Ordered goal queue",
+						description: "Enable experimental add, prioritize, skip, and drop-last workflows.",
+						currentValue: runtime.settings.experimental.goals ? "Experimental" : "Off",
+						values: ["Off", "Experimental"],
+						action: "set-queue",
+					},
+				],
+			}),
+			automatic: () => limitChoiceScreen(runtime, "automaticTurns", "choose-automatic"),
+			"no-progress": () => limitChoiceScreen(runtime, "noProgressTurns", "choose-no-progress"),
+			invalid: () => ({
+				kind: "detail",
+				title: "Pi Goal Settings · Read only",
+				lines: [
+					`Invalid settings file. Pi-goal is using built-in defaults. Fix ${safeTerminalText(settingsPath)} and run /reload. The file will not be overwritten.`,
+					`Automatic work: ${formatAutomaticWork(runtime.settings.continuationLimits.automaticTurns)}`,
+					`No-progress guard: ${formatNoProgressProtection(runtime.settings.continuationLimits.noProgressTurns)}`,
+					`Goal tools: ${visibilityLabel(runtime.settings.toolVisibility)}`,
+					`Ordered goal queue: ${runtime.settings.experimental.goals ? "Experimental" : "Off"}`,
+				],
+				hint: "back",
+			}),
+		},
+		actions: {
+			"open-automatic": async () => {
+				previewGoalIds.set("automaticTurns", runtime.activeGoal?.id ?? null);
+				return { kind: "to", screen: "automatic" };
+			},
+			"open-no-progress": async () => {
+				previewGoalIds.set("noProgressTurns", runtime.activeGoal?.id ?? null);
+				return { kind: "to", screen: "no-progress" };
+			},
+			"choose-automatic": async ({ itemId }) =>
+				applyLimitChoice(
+					runtime,
+					ctx,
+					options,
+					settingsPath,
+					"automaticTurns",
+					itemId,
+					previewGoalIds.get("automaticTurns") ?? null,
+				),
+			"choose-no-progress": async ({ itemId }) =>
+				applyLimitChoice(
+					runtime,
+					ctx,
+					options,
+					settingsPath,
+					"noProgressTurns",
+					itemId,
+					previewGoalIds.get("noProgressTurns") ?? null,
+				),
+			"set-visibility": async ({ value }) => {
+				const nextVisibility = value === "Always" ? "always" : "after-first-goal";
+				if (nextVisibility === runtime.settings.toolVisibility) return { kind: "stay" };
+				try {
+					const next = {
+						...structuredClone(runtime.settings),
+						toolVisibility: nextVisibility,
+					} satisfies GoalSettings;
+					applyGoalSettings(runtime, next, ctx, {
+						save: (settings) => (options.save ?? saveGoalSettings)(settings, settingsPath),
+					});
+					ctx.ui.notify(`Goal tools: ${value}.`, "info");
+					return { kind: "stay" };
+				} catch (error) {
+					notifySettingsFailure(ctx, settingsPath, error);
+					return { kind: "rejected" };
 				}
-				ctx.ui.notify(`Ordered goal queue: ${result.enabled ? "Experimental" : "Off"}.`, "info");
-			} catch (error) {
-				notifySettingsFailure(ctx, settingsPath, error);
-			}
-			return;
-		}
+			},
+			"set-queue": async ({ value }) => {
+				const enabled = value === "Experimental";
+				if (enabled === runtime.settings.experimental.goals) return { kind: "stay" };
+				const next = await nextQueueSettings(runtime, ctx, enabled);
+				if (!next) return { kind: "rejected" };
+				const wasFrozen = runtime.queueFrozen;
+				try {
+					applyGoalSettings(runtime, next, ctx, {
+						save: (settings) => (options.save ?? saveGoalSettings)(settings, settingsPath),
+					});
+					if (wasFrozen && !runtime.queueFrozen) {
+						try {
+							await options.onQueueUnfrozen?.(ctx);
+						} catch (error) {
+							ctx.ui.notify(
+								`Goal queue enabled, but automatic resume failed: ${safeTerminalText(formatError(error))}. Reopen /goal to retry.`,
+								"warning",
+							);
+						}
+					}
+					ctx.ui.notify(`Ordered goal queue: ${enabled ? "Experimental" : "Off"}.`, "info");
+					return { kind: "stay" };
+				} catch (error) {
+					notifySettingsFailure(ctx, settingsPath, error);
+					return { kind: "rejected" };
+				}
+			},
+		},
+	});
+	await runMenu(ctx, menu, {
+		getState: () => undefined,
+		signal: runtime.menuController.signal,
+		isCurrent: () =>
+			generation === runtime.menuGeneration && !runtime.menuController.signal.aborted,
+	});
+}
 
-		if ((runtime.activeGoal?.id ?? null) !== result.activeGoalId) {
-			ctx.ui.notify(
-				"The active goal changed while the safety setting was open. No settings were changed.",
-				"warning",
-			);
-			continue;
-		}
-		const previous = runtime.settings.continuationLimits[result.field];
-		const limit = await resolveLimitSelection(result, previous, ctx);
-		if (limit === undefined || limit === previous) continue;
-		if ((runtime.activeGoal?.id ?? null) !== result.activeGoalId) {
-			ctx.ui.notify(
-				"The active goal changed while editing the safety setting. No settings were changed.",
-				"warning",
-			);
-			continue;
-		}
-		const confirmation = await confirmLowerActiveLimit(runtime, ctx, result.field, limit);
-		if (!confirmation.apply) continue;
-		if (confirmation.goalId !== undefined && runtime.activeGoal?.id !== confirmation.goalId) {
-			ctx.ui.notify(
-				"The active goal changed while confirming the limit. No settings were changed.",
-				"warning",
-			);
-			continue;
-		}
-		const next = withLimit(runtime.settings, result.field, limit);
-		try {
-			applyGoalSettings(runtime, next, ctx, {
-				save: (settings) => (options.save ?? saveGoalSettings)(settings, settingsPath),
-			});
-			ctx.ui.notify(formatLimitSuccess(result.field, limit), "info");
-		} catch (error) {
-			notifySettingsFailure(ctx, settingsPath, error);
-		}
+function limitChoiceScreen(
+	runtime: GoalRuntime,
+	field: LimitField,
+	action: "choose-automatic" | "choose-no-progress",
+) {
+	const value = runtime.settings.continuationLimits[field];
+	const goal = runtime.activeGoal;
+	return {
+		kind: "actions" as const,
+		title: field === "automaticTurns" ? "Automatic work" : "No-progress guard",
+		lines: [
+			field === "automaticTurns"
+				? `Current: ${formatAutomaticWork(value)}`
+				: `Current: ${formatNoProgressProtection(value)}`,
+			...(goal
+				? [
+						field === "automaticTurns"
+							? `Active goal: ${goal.automaticModelTurns} automatic responses used`
+							: `Active goal: ${goal.toolFreeRepeatCount} repeated or empty runs detected`,
+					]
+				: []),
+		],
+		items: limitChoices(field, value, goal?.automaticModelTurns).map((item) => ({
+			id: item.value,
+			label: item.label,
+			description: item.description,
+			action,
+		})),
+		hint: "back" as const,
+	};
+}
+
+function limitChoices(
+	field: LimitField,
+	value: number | null,
+	automaticTurnsUsed: number | undefined,
+): Array<{ value: LimitSelection; label: string; description: string }> {
+	if (field === "automaticTurns") {
+		const unlimitedDescription =
+			value === null
+				? "No response-count cap. Completion, manual pause, blockers, provider limits, and other configured guards still apply."
+				: automaticTurnsUsed === undefined
+					? `Remove the current ${value}-response cap. Goal work will have no response-count cap; other configured stop conditions remain.`
+					: `Remove the current ${value}-response cap. The active goal has used ${automaticTurnsUsed} responses; other configured stop conditions remain.`;
+		return [
+			{ value: "unlimited", label: "Unlimited (default)", description: unlimitedDescription },
+			{
+				value: "custom",
+				label: "Set a maximum…",
+				description: "Pause after a whole number of Goal-owned automatic responses.",
+			},
+		];
+	}
+	const defaultLimit = DEFAULT_GOAL_SETTINGS.continuationLimits.noProgressTurns;
+	return [
+		{
+			value: "default",
+			label: `After ${defaultLimit} repeated runs (default)`,
+			description: "Pause after the default number of repeated or empty tool-free runs.",
+		},
+		{
+			value: "custom",
+			label: "Set threshold…",
+			description: "Choose a whole number of repeated or empty runs before pausing.",
+		},
+		{
+			value: "off",
+			label: "Off",
+			description: "Do not pause based on repeated or empty tool-free runs.",
+		},
+	];
+}
+
+async function applyLimitChoice(
+	runtime: GoalRuntime,
+	ctx: ExtensionCommandContext,
+	options: GoalSettingsUiOptions,
+	settingsPath: string,
+	field: LimitField,
+	itemId: string,
+	activeGoalId: string | null,
+) {
+	if (!isLimitSelection(itemId)) return { kind: "rejected" as const };
+	if ((runtime.activeGoal?.id ?? null) !== activeGoalId) {
+		ctx.ui.notify(
+			"The active goal changed while the safety setting was open. No settings were changed.",
+			"warning",
+		);
+		return { kind: "rejected" as const };
+	}
+	const previous = runtime.settings.continuationLimits[field];
+	const limit = await resolveLimitSelection(field, itemId, previous, ctx);
+	if (limit === undefined || limit === previous) return { kind: "back" as const };
+	if ((runtime.activeGoal?.id ?? null) !== activeGoalId) {
+		ctx.ui.notify(
+			"The active goal changed while editing the safety setting. No settings were changed.",
+			"warning",
+		);
+		return { kind: "rejected" as const };
+	}
+	const confirmation = await confirmLowerActiveLimit(runtime, ctx, field, limit);
+	if (!confirmation.apply) return { kind: "rejected" as const };
+	if (confirmation.goalId !== undefined && runtime.activeGoal?.id !== confirmation.goalId) {
+		ctx.ui.notify(
+			"The active goal changed while confirming the limit. No settings were changed.",
+			"warning",
+		);
+		return { kind: "rejected" as const };
+	}
+	try {
+		applyGoalSettings(runtime, withLimit(runtime.settings, field, limit), ctx, {
+			save: (settings) => (options.save ?? saveGoalSettings)(settings, settingsPath),
+		});
+		ctx.ui.notify(formatLimitSuccess(field, limit), "info");
+		return { kind: "back" as const };
+	} catch (error) {
+		notifySettingsFailure(ctx, settingsPath, error);
+		return { kind: "rejected" as const };
 	}
 }
 
@@ -189,313 +365,19 @@ export function formatGoalLimit(value: number | null) {
 	return value === null ? "Unlimited" : String(value);
 }
 
-async function showSettingsScreen(
-	runtime: GoalRuntime,
-	ctx: ExtensionCommandContext,
-	settingsPath: string,
-	options: GoalSettingsUiOptions,
-): Promise<SettingsScreenResult> {
-	if (runtime.settingsLoadIssue?.kind === "invalid") {
-		return showReadOnlySettingsScreen(runtime, ctx, settingsPath);
-	}
-
-	let saveQueue = Promise.resolve();
-	const enqueueSettingsChange: EnqueueSettingsChange = (operation) => {
-		const queued = saveQueue.then(operation);
-		saveQueue = queued.catch(() => undefined);
-		return queued;
-	};
-	return ctx.ui.custom<SettingsScreenResult>((tui, theme, _keybindings, done) => {
-		const container = new Container();
-		container.addChild(
-			dynamicText("Pi Goal Settings", (text) => theme.fg("accent", theme.bold(text))),
-		);
-		container.addChild(
-			dynamicText(`User settings · ${safeTerminalText(settingsPath)}`, (text) =>
-				theme.fg("muted", text),
-			),
-		);
-		let closing = false;
-		const closeAfterSaves = (result: SettingsScreenResult) => {
-			if (closing) return;
-			closing = true;
-			void saveQueue.then(() => done(result));
-		};
-		const requestRender = () => tui.requestRender();
-		const previewGoalIds = new Map<LimitField, string | null>();
-		const styles: LimitChoiceStyles = {
-			title: (text) => theme.fg("accent", theme.bold(text)),
-			muted: (text) => theme.fg("muted", text),
-		};
-		let limitChoiceOpen = false;
-		const items: SettingItem[] = [
-			limitItem(
-				"automaticTurns",
-				"Automatic work",
-				"Choose whether Goal can continue without a response-count cap.",
-				runtime.settings.continuationLimits.automaticTurns,
-				(doneSelection) => {
-					previewGoalIds.set("automaticTurns", runtime.activeGoal?.id ?? null);
-					limitChoiceOpen = true;
-					return createLimitChoiceComponent(runtime, "automaticTurns", styles, (selection) => {
-						limitChoiceOpen = false;
-						doneSelection(selection);
-					});
-				},
-			),
-			limitItem(
-				"noProgressTurns",
-				"No-progress guard",
-				"Pause after repeated or empty tool-free automatic runs.",
-				runtime.settings.continuationLimits.noProgressTurns,
-				(doneSelection) => {
-					previewGoalIds.set("noProgressTurns", runtime.activeGoal?.id ?? null);
-					limitChoiceOpen = true;
-					return createLimitChoiceComponent(runtime, "noProgressTurns", styles, (selection) => {
-						limitChoiceOpen = false;
-						doneSelection(selection);
-					});
-				},
-			),
-			{
-				id: "toolVisibility",
-				label: "Goal tools",
-				description: "Keep terminal Goal tools visible, or reveal them after the first goal.",
-				currentValue: visibilityLabel(runtime.settings.toolVisibility),
-				values: ["Always", "After first goal"],
-			},
-			{
-				id: "experimentalGoals",
-				label: "Ordered goal queue",
-				description: "Enable experimental add, prioritize, skip, and drop-last workflows.",
-				currentValue: runtime.settings.experimental.goals ? "Experimental" : "Off",
-				values: ["Off", "Experimental"],
-			},
-		];
-		const latestRequested = new Map<string, string>();
-		let settingsList: SettingsList;
-		settingsList = new SettingsList(
-			items,
-			Math.min(items.length + 2, 15),
-			goalSettingsListTheme("Goal menu"),
-			(id, newValue) => {
-				if (closing) return;
-				if (id === "automaticTurns" || id === "noProgressTurns") {
-					if (!isLimitSelection(newValue)) return;
-					closeAfterSaves({
-						kind: "limit",
-						field: id,
-						selection: newValue,
-						activeGoalId: previewGoalIds.get(id) ?? null,
-					});
-					return;
-				}
-				if (id === "experimentalGoals") {
-					closeAfterSaves({ kind: "queue", enabled: newValue === "Experimental" });
-					return;
-				}
-				if (id !== "toolVisibility") return;
-				latestRequested.set(id, newValue);
-				void enqueueSettingsChange(async () => {
-					const previousValue = visibilityLabel(runtime.settings.toolVisibility);
-					try {
-						const next = {
-							...structuredClone(runtime.settings),
-							toolVisibility: newValue === "Always" ? "always" : "after-first-goal",
-						} satisfies GoalSettings;
-						applyGoalSettings(runtime, next, ctx, {
-							save: (value) => (options.save ?? saveGoalSettings)(value, settingsPath),
-						});
-						requestRender();
-						ctx.ui.notify(`Goal tools: ${newValue}.`, "info");
-					} catch (error) {
-						if (latestRequested.get(id) === newValue) {
-							settingsList.updateValue(id, previousValue);
-						}
-						notifySettingsFailure(ctx, settingsPath, error);
-					}
-				});
-			},
-			() => closeAfterSaves(undefined),
-			{ enableSearch: false },
-		);
-		container.addChild(goalSettingsListComponent(settingsList, () => limitChoiceOpen));
-		return {
-			render: (width: number) => container.render(width),
-			invalidate: () => container.invalidate(),
-			handleInput(data: string) {
-				if (closing) return;
-				settingsList.handleInput?.(data);
-				tui.requestRender();
-			},
-		};
-	});
-}
-
-function showReadOnlySettingsScreen(
-	runtime: GoalRuntime,
-	ctx: ExtensionCommandContext,
-	settingsPath: string,
-): Promise<SettingsScreenResult> {
-	return ctx.ui.custom<SettingsScreenResult>((_tui, theme, keybindings, done) => {
-		const container = new Container();
-		container.addChild(
-			dynamicText("Pi Goal Settings · Read only", (text) => theme.fg("accent", theme.bold(text))),
-		);
-		container.addChild(
-			dynamicText(
-				`Invalid settings file. Pi-goal is using built-in defaults. Fix ${safeTerminalText(settingsPath)} and run /reload. The file will not be overwritten.`,
-				(text) => theme.fg("warning", text),
-			),
-		);
-		container.addChild(
-			dynamicText(() =>
-				[
-					`Automatic work: ${formatAutomaticWork(runtime.settings.continuationLimits.automaticTurns)}`,
-					`No-progress guard: ${formatNoProgressProtection(runtime.settings.continuationLimits.noProgressTurns)}`,
-					`Goal tools: ${visibilityLabel(runtime.settings.toolVisibility)}`,
-					`Ordered goal queue: ${runtime.settings.experimental.goals ? "Experimental" : "Off"}`,
-				].join("\n"),
-			),
-		);
-		container.addChild(dynamicText("Esc back to Goal menu", (text) => theme.fg("dim", text)));
-		return {
-			render: (width: number) => container.render(width),
-			invalidate: () => container.invalidate(),
-			handleInput(data: string) {
-				if (
-					keybindings.matches(data, "tui.select.cancel") ||
-					matchesKey(data, "escape") ||
-					matchesKey(data, "ctrl+c")
-				) {
-					done(undefined);
-				}
-			},
-		};
-	});
-}
-
-function createLimitChoiceComponent(
-	runtime: GoalRuntime,
-	field: LimitField,
-	styles: LimitChoiceStyles,
-	done: (selectedValue?: string) => void,
-): Component {
-	const value = runtime.settings.continuationLimits[field];
-	const goal = runtime.activeGoal;
-	const items = limitChoices(field, value, goal?.automaticModelTurns);
-	const selectionItems = items.map(({ value: itemValue, label }) => ({
-		value: itemValue,
-		label,
-	}));
-	const descriptions = new Map(items.map((item) => [item.value, item.description ?? ""]));
-	const container = new Container();
-	container.addChild(
-		dynamicText(field === "automaticTurns" ? "Automatic work" : "No-progress guard", styles.title),
-	);
-	container.addChild(
-		dynamicText(
-			field === "automaticTurns"
-				? `Current: ${formatAutomaticWork(value)}`
-				: `Current: ${formatNoProgressProtection(value)}`,
-			styles.muted,
-		),
-	);
-	if (goal) {
-		container.addChild(
-			dynamicText(
-				field === "automaticTurns"
-					? `Active goal: ${goal.automaticModelTurns} automatic responses used`
-					: `Active goal: ${goal.toolFreeRepeatCount} repeated or empty runs detected`,
-				styles.muted,
-			),
-		);
-	}
-	const selectedIndex = selectedLimitChoiceIndex(field, value);
-	const selectList = new SelectList(
-		selectionItems,
-		Math.min(selectionItems.length, 8),
-		getSelectListTheme(),
-	);
-	selectList.setSelectedIndex(selectedIndex);
-	let selectedDescription = descriptions.get(selectionItems[selectedIndex]?.value ?? "") ?? "";
-	const description = dynamicText(() => selectedDescription, styles.muted);
-	selectList.onSelectionChange = (item) => {
-		selectedDescription = descriptions.get(item.value) ?? "";
-	};
-	selectList.onSelect = (item) => done(item.value);
-	selectList.onCancel = () => done();
-	container.addChild(selectList);
-	container.addChild(description);
-	container.addChild(dynamicText("↑↓ navigate · Enter select · Esc back", styles.muted));
-	return {
-		render: (width: number) => container.render(width),
-		invalidate: () => container.invalidate(),
-		handleInput(data: string) {
-			selectList.handleInput(data);
-		},
-	};
-}
-
-function limitChoices(
-	field: LimitField,
-	value: number | null,
-	automaticTurnsUsed: number | undefined,
-): SelectItem[] {
-	if (field === "automaticTurns") {
-		const unlimitedDescription =
-			value === null
-				? "No response-count cap. Completion, manual pause, blockers, provider limits, and other configured guards still apply."
-				: automaticTurnsUsed === undefined
-					? `Remove the current ${value}-response cap. Goal work will have no response-count cap; other configured stop conditions remain.`
-					: `Remove the current ${value}-response cap. The active goal has used ${automaticTurnsUsed} responses; other configured stop conditions remain.`;
-		return [
-			{ value: "unlimited", label: "Unlimited (default)", description: unlimitedDescription },
-			{
-				value: "custom",
-				label: "Set a maximum…",
-				description: "Pause after a whole number of Goal-owned automatic responses.",
-			},
-		];
-	}
-	const defaultLimit = DEFAULT_GOAL_SETTINGS.continuationLimits.noProgressTurns;
-	return [
-		{
-			value: "default",
-			label: `After ${defaultLimit} repeated runs (default)`,
-			description: "Pause after the default number of repeated or empty tool-free runs.",
-		},
-		{
-			value: "custom",
-			label: "Set threshold…",
-			description: "Choose a whole number of repeated or empty runs before pausing.",
-		},
-		{
-			value: "off",
-			label: "Off",
-			description: "Do not pause based on repeated or empty tool-free runs.",
-		},
-	];
-}
-
-function selectedLimitChoiceIndex(field: LimitField, value: number | null) {
-	if (field === "automaticTurns") return value === null ? 0 : 1;
-	if (value === null) return 2;
-	return value === DEFAULT_GOAL_SETTINGS.continuationLimits.noProgressTurns ? 0 : 1;
-}
-
 async function resolveLimitSelection(
-	result: Extract<SettingsScreenResult, { kind: "limit" }>,
+	field: LimitField,
+	selection: LimitSelection,
 	previous: number | null,
 	ctx: ExtensionCommandContext,
 ): Promise<number | null | undefined> {
-	if (result.selection === "unlimited" || result.selection === "off") return null;
-	if (result.selection === "default") {
+	if (selection === "unlimited" || selection === "off") return null;
+	if (selection === "default") {
 		return DEFAULT_GOAL_SETTINGS.continuationLimits.noProgressTurns;
 	}
 	while (true) {
 		const raw = await ctx.ui.input(
-			result.field === "automaticTurns"
+			field === "automaticTurns"
 				? "Maximum automatic responses (whole number greater than 0)"
 				: "Repeated-run threshold (whole number greater than 0)",
 			previous === null ? "Positive whole number" : String(previous),
@@ -504,7 +386,7 @@ async function resolveLimitSelection(
 		const parsed = parseGoalLimit(raw);
 		if (parsed !== undefined) return parsed;
 		ctx.ui.notify(
-			`Enter a whole number greater than 0. Choose ${result.field === "automaticTurns" ? "Unlimited" : "Off"} from the previous screen if you do not want a limit.`,
+			`Enter a whole number greater than 0. Choose ${field === "automaticTurns" ? "Unlimited" : "Off"} from the previous screen if you do not want a limit.`,
 			"warning",
 		);
 	}
@@ -638,25 +520,6 @@ function withLimit(settings: GoalSettings, field: LimitField, value: number | nu
 	};
 }
 
-function limitItem(
-	id: LimitField,
-	label: string,
-	description: string,
-	value: number | null,
-	submenu: (done: (selectedValue?: string) => void) => Component,
-): SettingItem {
-	return {
-		id,
-		label,
-		description,
-		currentValue:
-			id === "automaticTurns"
-				? formatAutomaticSettingValue(value)
-				: formatNoProgressSettingValue(value),
-		submenu: (_currentValue, done) => submenu(done),
-	};
-}
-
 function formatAutomaticSettingValue(value: number | null) {
 	return value === null ? "Unlimited" : `≤${value}`;
 }
@@ -679,18 +542,6 @@ function formatLimitSuccess(field: LimitField, value: number | null) {
 	return field === "automaticTurns"
 		? `Automatic work: ${formatAutomaticWork(value)}.`
 		: `No-progress guard: ${formatNoProgressProtection(value)}.`;
-}
-
-function goalSettingsListTheme(backTarget: string) {
-	const theme = getSettingsListTheme();
-	return {
-		...theme,
-		hint(text: string) {
-			return text.includes("Enter/Space to change")
-				? theme.hint(`  Enter/Space to select · Esc back to ${backTarget}`)
-				: theme.hint(text);
-		},
-	};
 }
 
 function isLimitSelection(value: string): value is LimitSelection {
@@ -718,33 +569,6 @@ function notifySettingsFailure(ctx: ExtensionCommandContext, settingsPath: strin
 			: `Could not save Goal settings; the previous value remains. Check ${path} and retry: ${detail}`,
 		"error",
 	);
-}
-
-function goalSettingsListComponent(
-	settingsList: SettingsList,
-	isLimitChoiceOpen: () => boolean,
-): Component {
-	return {
-		render(width: number) {
-			// Reclaim one of SettingsList's two trailing cells so a safe 16-digit cap stays exact at 40 columns.
-			const renderWidth = isLimitChoiceOpen() ? width : width + 1;
-			return settingsList.render(renderWidth).map((line) => truncateToWidth(line, width, ""));
-		},
-		invalidate: () => settingsList.invalidate(),
-	};
-}
-
-function dynamicText(
-	content: string | (() => string),
-	style: (text: string) => string = (text) => text,
-): Component {
-	return {
-		render(width: number) {
-			const value = typeof content === "function" ? content() : content;
-			return new Text(style(value), 1, 0).render(width);
-		},
-		invalidate() {},
-	};
 }
 
 function safeTerminalText(value: string) {

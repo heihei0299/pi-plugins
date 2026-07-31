@@ -68,7 +68,7 @@ function normalizeMaxSizeMB(value: unknown, fallback: number): number {
 
 const VIDEO_CONFIG_DEFAULTS: VideoConfig = {
 	enabled: true,
-	preferredModel: "gemini-3-flash-preview",
+	preferredModel: "gemini-3.6-flash",
 	maxSizeMB: 50,
 };
 
@@ -248,7 +248,7 @@ async function tryVideoGeminiWeb(
 
 		const text = await queryWithCookies(prompt, cookies, {
 			files: [info.absolutePath],
-			model,
+			...(model !== "gemini-3.6-flash" ? { model } : {}),
 			signal,
 			timeoutMs: 180000,
 		});

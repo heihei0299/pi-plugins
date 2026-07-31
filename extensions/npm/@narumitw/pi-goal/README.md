@@ -9,7 +9,9 @@ Goal mode uses Codex-like persistence instructions and sends guarded continuatio
 ## ✨ Features
 
 - Adds `/goal <goal_to_complete>` to start goal mode, with confirmation before replacing an existing goal.
-- Bare `/goal` opens a current-state manager in the TUI, with guided start, pause, resume, edit, queue, settings, status, help, and destructive-action confirmation; RPC mode retains observable status notifications.
+- Bare `/goal` opens a standard current-state manager in the TUI, with guided start, pause,
+  resume, edit, queue, settings, status, help, and destructive-action confirmation; RPC mode retains
+  observable status notifications.
 - Keeps direct goal management available through `/goal` subcommands: `status`, `pause`, `resume`, `clear`, and `edit`.
 - Exposes only one top-level command: `/goal`, including when ordered goals are enabled.
 - Optionally adds ordered-goal operations through `/goal add`, `prioritize`, `drop-last`, and `skip`, while accepting `push`, `unshift`, `pop`, and `shift` as hidden compatibility aliases.
@@ -70,7 +72,9 @@ built-in defaults without creating the file:
 }
 ```
 
-Use `/goal` → **Settings…** in the TUI to create or update the file interactively, or create and edit it directly. The screen keeps all four controls on one level in task order:
+Use `/goal` → **Settings…** in the TUI to create or update the file interactively, or create
+and edit it directly. The standard Settings screen keeps all four controls on one level in task
+order; the two safety limits open standard choice screens:
 
 - **Automatic work** shows **Unlimited** or an exact **≤_N_** response cap. Choose **Unlimited** directly, or choose **Set a maximum…** and enter a safe whole number greater than zero.
 - **No-progress guard** shows **_N_ runs** or **Off**. Choose the default threshold, **Off**, or **Set threshold…** and enter a safe whole number greater than zero.
@@ -118,7 +122,12 @@ Tool visibility is a baseline, not ownership of Pi's global active-tool list. Pl
 /goal skip
 ```
 
-- In the TUI, `/goal` opens a state-aware manager. Its first action follows the current state: start when empty, pause when active, resume when stopped, or increase the budget when exhausted. An active goal shows automatic-response state as **_used_ automatic responses · Unlimited** or **_used_/_limit_ automatic responses**. Status, Settings, Help, queue management, Clear, and Close remain shallow, labeled routes. Arrow keys navigate, Enter selects, and Escape cancels or returns without changing state.
+- In the TUI, `/goal` opens a standard state-aware manager. Its first action follows the current
+  state: start when empty, pause when active, resume when stopped, or increase the budget when
+  exhausted. An active goal shows automatic-response state as **_used_ automatic responses ·
+  Unlimited** or **_used_/_limit_ automatic responses**. Status, Settings, Help, queue management,
+  invalid-settings guidance, Clear, and Close remain shallow, labeled routes. Arrow keys navigate,
+  Enter selects, Escape goes Back, and Ctrl+C closes the full flow.
 - In RPC mode, bare `/goal` and `/goal status` report the current summary through an observable notification without opening terminal UI. Pi exposes no extension-command output channel in print or JSON mode, so those routes reject with an explicit unsupported-mode error instead of misreporting stderr as status output.
 - Menu-driven Replace, Clear, Prioritize, Skip, and Drop last actions preview the exact affected goals and require confirmation. Existing direct routes remain immediate for compatibility and automation.
 - `/goal <goal_to_complete>` starts goal mode. If another unfinished goal exists, Pi asks for confirmation before replacing it with a new active goal and resetting its usage counters. Failed kickoff delivery clears a new goal or restores the prior goal; a previously active goal is restored as paused.

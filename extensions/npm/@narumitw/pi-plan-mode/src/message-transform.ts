@@ -1,6 +1,8 @@
 import { PLAN_MODE_COMPLETE_TOOL_NAME } from "./completion-tool.js";
+import type { ActiveImplementationPlan } from "./state.js";
 
 const PLAN_CONTEXT_MESSAGE_TYPE = "plan-mode-context";
+export const PLAN_IMPLEMENTATION_CONTEXT_MESSAGE_TYPE = "plan-mode-implementation-context";
 const PROPOSED_PLAN_MESSAGE_TYPE = "proposed-plan";
 const PLAN_IMPLEMENTATION_HANDOFF_PREFIX =
 	"Plan mode is now disabled. Full tool access is restored. Implement this proposed plan now:";
@@ -46,6 +48,16 @@ export function extractProposedPlan(text: string) {
 	return result.kind === "valid" ? result.plan : undefined;
 }
 
+export function invalidPlanMessage(kind: "empty" | "multiple" | "malformed" | "unclosed") {
+	const detail = {
+		empty: "the block is empty",
+		multiple: "more than one plan block was produced",
+		malformed: "the tags must be on their own lines",
+		unclosed: "the closing tag is missing",
+	}[kind];
+	return `Proposed plan is not ready: ${detail}. Continue Plan mode and produce one complete non-empty <proposed_plan> block.`;
+}
+
 export function latestAssistantText(messages: unknown) {
 	if (!Array.isArray(messages)) return "";
 	for (const entry of [...messages].reverse()) {
@@ -59,6 +71,45 @@ export function latestAssistantText(messages: unknown) {
 
 export function messageContainsLegacyPlanModeContextArtifact(message: unknown) {
 	return unwrapSessionMessage(message).customType === PLAN_CONTEXT_MESSAGE_TYPE;
+}
+
+export function messageContainsPlanModeImplementationContextArtifact(message: unknown) {
+	return unwrapSessionMessage(message).customType === PLAN_IMPLEMENTATION_CONTEXT_MESSAGE_TYPE;
+}
+
+export function injectActiveImplementationContext(
+	messages: unknown[],
+	activeImplementation: ActiveImplementationPlan,
+) {
+	let foundCurrentHandoff = false;
+	const messagesWithoutStaleContext = messages.filter((message) => {
+		if (messageContainsPlanModeImplementationContextArtifact(message)) return false;
+		if (!messageContainsPlanModeImplementationHandoff(message)) return true;
+		if (
+			!foundCurrentHandoff &&
+			messageContainsExactPlanModeImplementationHandoff(message, activeImplementation.plan)
+		) {
+			foundCurrentHandoff = true;
+			return true;
+		}
+		return false;
+	});
+	if (foundCurrentHandoff) return messagesWithoutStaleContext;
+
+	let insertionIndex = 0;
+	while (isSummaryMessage(messagesWithoutStaleContext[insertionIndex])) insertionIndex += 1;
+	const contextMessage = {
+		role: "custom" as const,
+		customType: PLAN_IMPLEMENTATION_CONTEXT_MESSAGE_TYPE,
+		content: `[ACTIVE IMPLEMENTATION PLAN]\n\nThe user approved the exact implementation plan below. Continue following it until the user explicitly clears or supersedes it. The exact plan is the remainder of this message:\n\n${activeImplementation.plan}`,
+		display: false,
+		timestamp: activeImplementation.startedAt,
+	};
+	return [
+		...messagesWithoutStaleContext.slice(0, insertionIndex),
+		contextMessage,
+		...messagesWithoutStaleContext.slice(insertionIndex),
+	];
 }
 
 export function messageContainsInactivePlanModeArtifact(message: unknown) {
@@ -75,6 +126,20 @@ export function messageContainsPlanModeImplementationHandoff(message: unknown) {
 		candidate.role === "user" &&
 		contentText(candidate.content).trimStart().startsWith(PLAN_IMPLEMENTATION_HANDOFF_PREFIX)
 	);
+}
+
+function messageContainsExactPlanModeImplementationHandoff(message: unknown, plan: string) {
+	const candidate = unwrapSessionMessage(message);
+	if (candidate.role !== "user") return false;
+	return (
+		contentText(candidate.content).trim() ===
+		`${PLAN_IMPLEMENTATION_HANDOFF_PREFIX}\n\n${plan}`.trim()
+	);
+}
+
+function isSummaryMessage(message: unknown) {
+	const role = unwrapSessionMessage(message)?.role;
+	return role === "compactionSummary" || role === "branchSummary";
 }
 
 export function stripProposedPlanBlocksFromMessage<T>(message: T): T {
@@ -115,8 +180,8 @@ function replaceAssistantContent<T>(message: T, transform: (content: unknown) =>
 }
 
 function unwrapSessionMessage(message: unknown) {
-	const entry = message as { message?: unknown };
-	return (entry.message ?? message) as {
+	const entry = message as { message?: unknown } | null | undefined;
+	return (entry?.message ?? message ?? {}) as {
 		role?: string;
 		customType?: string;
 		toolName?: string;

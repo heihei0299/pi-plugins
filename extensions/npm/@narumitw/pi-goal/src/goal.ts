@@ -61,6 +61,8 @@ const EXPERIMENTAL_GOALS_WARNING =
 const MAX_BLOCKER_REASON_LENGTH = 1_000;
 const MAX_BLOCKER_EVIDENCE_LENGTH = 4_000;
 
+// Cohesion justification: command, tool, continuation, and lifecycle handlers coordinate one
+// guarded Goal state machine whose ordering and stale-turn invariants share the same closures.
 function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 	const runtime = new GoalRuntime(pi);
 	const commands = new GoalCommandController(runtime);
@@ -471,6 +473,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		runtime.replaceMenuSession();
 		clearCompletionStatusTimer();
 		clearContinuationTracking();
 		clearPendingGoalPrompts();
@@ -589,6 +592,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		runtime.closeMenuSession();
 		if (runtime.activeGoal) {
 			if (!runtime.queueFrozen && runtime.activeGoal.status === "active") {
 				updateGoalUsage(runtime.activeGoal, ctx, false);

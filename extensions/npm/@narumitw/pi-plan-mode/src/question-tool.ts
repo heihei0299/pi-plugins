@@ -148,9 +148,44 @@ export function normalizePlanModeQuestionParams(
 	return { ok: true, questions };
 }
 
+export async function answerPlanModeQuestions(
+	questions: PlanModeQuestion[],
+	ctx: ExtensionContext,
+	lifecycle: { isCurrent(): boolean; isEnabled(): boolean },
+) {
+	const answers = await askPlanModeQuestions(
+		questions,
+		ctx,
+		() => lifecycle.isCurrent() && lifecycle.isEnabled(),
+	);
+	if (!lifecycle.isCurrent()) {
+		return planModeQuestionCancelled(
+			questions,
+			"cancelled",
+			"Plan-mode question cancelled because the session changed.",
+		);
+	}
+	if (!lifecycle.isEnabled()) {
+		return planModeQuestionCancelled(
+			questions,
+			"plan_mode_inactive",
+			"Plan-mode question cancelled because Plan mode is no longer active.",
+		);
+	}
+	if (!answers) {
+		return planModeQuestionCancelled(
+			questions,
+			"cancelled",
+			"User cancelled the Plan-mode question prompt.",
+		);
+	}
+	return planModeQuestionAnswered(questions, answers);
+}
+
 export async function askPlanModeQuestions(
 	questions: PlanModeQuestion[],
 	ctx: ExtensionContext,
+	shouldContinue: () => boolean = () => true,
 ): Promise<PlanModeQuestionAnswer[] | undefined> {
 	const answers: PlanModeQuestionAnswer[] = [];
 	for (const question of questions) {
@@ -160,10 +195,10 @@ export async function askPlanModeQuestions(
 			...choices,
 			otherChoice,
 		]);
-		if (!choice) return undefined;
+		if (!shouldContinue() || !choice) return undefined;
 		if (choice === otherChoice) {
 			const customAnswer = (await ctx.ui.editor(question.question, ""))?.trim();
-			if (!customAnswer) return undefined;
+			if (!shouldContinue() || !customAnswer) return undefined;
 			answers.push({
 				id: question.id,
 				header: question.header,

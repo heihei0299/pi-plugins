@@ -59,7 +59,8 @@ If no supported inhibitor is available, the extension stays loaded and reports t
 /caffeinate
 ```
 
-Opens keep-awake controls. In non-interactive sessions, it prints command usage and status.
+Opens standard keep-awake controls in TUI or RPC mode. Print and JSON modes reject the interactive
+menu observably; use the direct `status`, `sleep`, `display`, `stop`, or `help` routes instead.
 
 ```text
 /caffeinate display
@@ -83,7 +84,7 @@ Shows whether an inhibitor is active, unavailable, disabled, or idle. The status
 /caffeinate mode
 ```
 
-Opens an interactive selector for the keep-awake mode.
+Opens the standard keep-awake mode selector in TUI or RPC mode. Escape closes the selector.
 
 ```text
 /caffeinate stop

@@ -19,7 +19,7 @@
  * correctly after upgrade.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { COLLAPSE_KEY_OFF, resolveCollapseKey } from "./config.js";
 import { I18N_NAMESPACE } from "./state/i18n-bridge.js";
@@ -28,16 +28,70 @@ import {
 	clearActiveRenderSession,
 	evictSession,
 	getActiveRenderSession,
+	getRenderState,
 	replaceState,
 	setActiveRenderSession,
 	sid,
 } from "./state/store.js";
 import { registerTodosCommand, registerTodoTool, TOOL_NAME } from "./todo.js";
-import { TodoOverlay } from "./todo-overlay.js";
+import type { TodoOverlay } from "./todo-overlay.js";
 
 type I18nLoader = {
 	registerLocalesFromDir: (namespace: string, packageUrl: string, options?: { label?: string }) => void;
 };
+
+/** Delay the overlay graph pre-warm until Pi's startup work has settled. */
+export const PREWARM_DELAY_MS = 2000;
+
+type TodoOverlayModule = typeof import("./todo-overlay.js");
+type TodoOverlayImporter = () => Promise<TodoOverlayModule>;
+
+/**
+ * Marker shared by the loader's poisoned-namespace error and the
+ * `isStaleOverlayModuleError` predicate that lets handlers re-throw it while
+ * swallowing transient load failures.
+ */
+const STALE_OVERLAY_MESSAGE = "Todo overlay module cache is stale; restart Pi";
+
+/** True for the loader's latched poisoned-namespace error (see below). */
+export function isStaleOverlayModuleError(e: unknown): boolean {
+	return String(e).includes(STALE_OVERLAY_MESSAGE);
+}
+
+/**
+ * Memoize the overlay graph after a successful load, but drop a rejected
+ * promise so a failed pre-warm does not permanently replay the same rejection.
+ * The export guard turns jiti's poisoned-namespace failure into a useful restart
+ * error instead of a bare "TodoOverlay is not a constructor" TypeError.
+ */
+export function makeTodoOverlayLoader(
+	importOverlay: TodoOverlayImporter = () => import("./todo-overlay.js"),
+): TodoOverlayImporter {
+	let memo: Promise<TodoOverlayModule> | undefined;
+
+	return async (): Promise<TodoOverlayModule> => {
+		memo ??= importOverlay();
+		const current = memo;
+		let mod: TodoOverlayModule;
+		try {
+			mod = await current;
+		} catch (error) {
+			// Clear only OUR rejected promise: a late catch from a concurrent
+			// awaiter must never clobber a fresh retry another caller installed.
+			if (memo === current) memo = undefined;
+			throw error;
+		}
+		if (typeof mod.TodoOverlay !== "function") {
+			// Deliberately latched: the memo keeps this resolved-but-poisoned
+			// namespace, so every subsequent load re-throws instead of retrying.
+			// Re-importing would hand back the same cached jiti namespace — a
+			// retry can never heal this; only the restart the error asks for can.
+			const keys = JSON.stringify(Object.keys(mod));
+			throw new Error(`${STALE_OVERLAY_MESSAGE} (resolved namespace keys: ${keys})`);
+		}
+		return mod;
+	};
+}
 
 // Dynamic import keeps `@juicesharp/rpiv-i18n` a soft optional peer: when the
 // SDK is installed alongside this package the strings register and
@@ -60,9 +114,38 @@ function isStaleCtxError(e: unknown): boolean {
 	return /stale after session replacement/.test(String(e));
 }
 
-export default function (pi: ExtensionAPI) {
-	// Todo overlay widget — constructed lazily at the first session_start with UI.
+/**
+ * Render a caught `unknown` as a human-readable message — the `instanceof Error`
+ * dance collapsed to one place. Local copy of the `formatError` in
+ * packages/rpiv-workflow/internal-utils.ts:56-58 (that module disclaims its
+ * public surface, so the cross-package import is not available). M2 boundary
+ * duplication: tracked as a documented-constant seam.
+ */
+function formatError(e: unknown): string {
+	return e instanceof Error ? e.message : String(e);
+}
+
+export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = () => import("./todo-overlay.js")) {
 	let todoOverlay: TodoOverlay | undefined;
+	const loadTodoOverlay = makeTodoOverlayLoader(importOverlay);
+	let uiCtx: ExtensionUIContext | undefined;
+	let lifecycleGeneration = 0;
+
+	async function updateTodoOverlay(
+		resetCompletedDisplayState = false,
+		generation = lifecycleGeneration,
+	): Promise<void> {
+		const hasVisibleTasks = getRenderState().tasks.some((task) => task.status !== "deleted");
+		if (!uiCtx || (!todoOverlay && !hasVisibleTasks)) return;
+
+		const { TodoOverlay } = await loadTodoOverlay();
+		if (generation !== lifecycleGeneration || !uiCtx) return;
+
+		todoOverlay ??= new TodoOverlay();
+		todoOverlay.setUICtx(uiCtx);
+		if (resetCompletedDisplayState) todoOverlay.resetCompletedDisplayState();
+		todoOverlay.update();
+	}
 
 	registerTodoTool(pi);
 	registerTodosCommand(pi);
@@ -71,10 +154,10 @@ export default function (pi: ExtensionAPI) {
 	// factory scope from config (register-once contract: a config change needs
 	// `/reload` to re-bind, same as lane-switcher's env hotkey) and the binding is
 	// skipped entirely when collapseKey is "off". The handler closes over the
-	// closure-local `todoOverlay` by reference and re-reads it at fire time, so a
-	// session_start that (re)creates the overlay is picked up. No-op in headless
-	// mode, when the overlay hasn't been created yet, or when the widget isn't
-	// currently registered (auto-hidden on an empty list).
+	// closure-local `todoOverlay` by reference and re-reads it at fire time, so an
+	// overlay loaded after shortcut registration is picked up. No-op in headless
+	// mode, before the overlay has loaded, or when the widget isn't currently
+	// registered (auto-hidden on an empty list).
 	const collapseKey = resolveCollapseKey();
 	if (collapseKey !== COLLAPSE_KEY_OFF) {
 		pi.registerShortcut(collapseKey as KeyId, {
@@ -94,7 +177,9 @@ export default function (pi: ExtensionAPI) {
 	// the replacement session's session_start replays it. Other errors are real replay
 	// bugs and must propagate. The render is sid-gated so a child never refreshes the
 	// foreground overlay.
-	const replayAndRefresh = (ctx: Parameters<typeof sid>[0] & Parameters<typeof replayFromBranch>[0]): void => {
+	const replayAndRefresh = async (
+		ctx: Parameters<typeof sid>[0] & Parameters<typeof replayFromBranch>[0],
+	): Promise<void> => {
 		let isForeground = false;
 		try {
 			const id = sid(ctx);
@@ -103,10 +188,7 @@ export default function (pi: ExtensionAPI) {
 		} catch (e) {
 			if (!isStaleCtxError(e)) throw e;
 		}
-		if (isForeground) {
-			todoOverlay?.resetCompletedDisplayState();
-			todoOverlay?.update();
-		}
+		if (isForeground) await updateTodoOverlay(true);
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -124,23 +206,23 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!ctx.hasUI) return;
 		// First UI-bearing session_start claims the foreground (the interactive
-		// launcher, by spawn-ordering). A child hitting a live overlay cannot
-		// clobber the pointer — `todoOverlay` is already set.
-		if (todoOverlay === undefined) {
-			todoOverlay = new TodoOverlay();
-			setActiveRenderSession(id);
-		}
+		// launcher, by spawn-ordering) without eagerly loading the overlay.
+		if (getActiveRenderSession() === "") setActiveRenderSession(id);
 		// Only the foreground re-binds/refreshes the shared overlay. A child
 		// (distinct sid) is skipped — does not rebind to a relay/stale ui.
 		if (id !== getActiveRenderSession()) return;
-		todoOverlay.setUICtx(ctx.ui);
-		todoOverlay.resetCompletedDisplayState();
-		todoOverlay.update();
+		const generation = ++lifecycleGeneration;
+		uiCtx = ctx.ui;
+		await updateTodoOverlay(true, generation);
 	});
 
-	pi.on("session_compact", async (_event, ctx) => replayAndRefresh(ctx));
+	pi.on("session_compact", async (_event, ctx) => {
+		await replayAndRefresh(ctx);
+	});
 
-	pi.on("session_tree", async (_event, ctx) => replayAndRefresh(ctx));
+	pi.on("session_tree", async (_event, ctx) => {
+		await replayAndRefresh(ctx);
+	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		// Best-effort sid: disposal can race a stale ctx (like compact). An
@@ -159,6 +241,10 @@ export default function (pi: ExtensionAPI) {
 		// dispose the foreground's overlay. Only the foreground's own shutdown
 		// (or an unknown/stale sid) tears it down and clears the pointer.
 		if (s === "" || s === getActiveRenderSession()) {
+			// Invalidate pending imports before clearing the foreground binding so a
+			// replaced session cannot inherit the stale overlay or UI context.
+			lifecycleGeneration++;
+			uiCtx = undefined;
 			// `dispose()`'s first act is setWidget(KEY, undefined) on a possibly-stale
 			// ui proxy, which can throw. evictSession(s) above already deleted this
 			// slot, so leaving `activeRenderSession` pointing at it would resolve
@@ -177,8 +263,26 @@ export default function (pi: ExtensionAPI) {
 	// (branch is stale — message_end runs after tool_execution_end).
 	pi.on("tool_execution_end", async (event) => {
 		if (event.toolName !== TOOL_NAME || event.isError) return;
-		todoOverlay?.update();
+		try {
+			await updateTodoOverlay();
+		} catch (e) {
+			// The tool itself succeeded — a transient overlay-load failure only
+			// costs this one refresh, and the loader's cleared memo lets the next
+			// update retry. Don't surface that as an extension error. The latched
+			// stale-namespace error still propagates: it never self-heals, and the
+			// user needs its restart guidance.
+			if (isStaleOverlayModuleError(e)) throw e;
+			console.warn(`[rpiv-todo] overlay refresh failed (will retry on next update): ${formatError(e)}`);
+		}
 	});
+
+	// Evaluate the lazy graph after startup while Pi's boot-time dependency paths
+	// are still stable. This loads no widget and constructs no overlay; those stay
+	// deferred until a foreground session has visible tasks. A rejected pre-warm
+	// is intentionally swallowed after loadTodoOverlay clears its memo, allowing
+	// the first real update to retry. unref avoids holding an embedder open.
+	const prewarmTimer = setTimeout(() => void loadTodoOverlay().catch(() => undefined), PREWARM_DELAY_MS);
+	prewarmTimer.unref?.();
 
 	pi.on("agent_start", async () => {
 		todoOverlay?.hideCompletedTasksFromPreviousTurn();

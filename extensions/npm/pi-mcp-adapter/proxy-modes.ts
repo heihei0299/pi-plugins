@@ -1,5 +1,5 @@
 import type { AgentToolResult, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { UrlElicitationRequiredError } from "@modelcontextprotocol/client";
+import { UrlElicitationRequiredError } from "@modelcontextprotocol/sdk/types.js";
 import { createRequire } from "node:module";
 import type { McpExtensionState } from "./state.ts";
 import type { ToolMetadata, McpContent } from "./types.ts";
@@ -696,7 +696,7 @@ export async function executeConnect(state: McpExtensionState, serverName: strin
     const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
     state.toolMetadata.set(serverName, metadata);
     if (!connection.promptDiscoveryFailed) {
-      state.promptMetadata?.set(serverName, reconstructPromptMetadata(serverName, connection.prompts ?? [], prefix));
+      state.promptMetadata?.set(serverName, reconstructPromptMetadata(serverName, connection.prompts ?? [], prefix, definition));
       state.promptMetadataLive?.add(serverName);
     }
     if (connection.instructions) {
@@ -1078,11 +1078,11 @@ export async function executeCall(
         name: toolMeta.originalName,
         arguments: args ?? {},
         _meta: uiSession?.requestMeta,
-      }, requestOptions), ownedSignal),
+      }, undefined, requestOptions), ownedSignal),
     );
 
     if (toolMeta.uiResourceUri) {
-      uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/client").CallToolResult);
+      uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/sdk/types.js").CallToolResult);
 
       if (result.isError) {
         const mcpContent = (result.content ?? []) as McpContent[];

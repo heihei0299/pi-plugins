@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.0] - 2026-07-30
+
+### Added
+- Added an optional per-server `toolPrefix` override for direct MCP tools, prompts, and proxy summaries, falling back to the global prefix when unset. Thanks @FurryWolfX for issue #229.
+- Added an advisory warning when resolved direct tools pass the documented 75-tool threshold, with no cap or enforcement. Thanks @JasonLandbridge for issue #240.
+
+### Changed
+- Restored the MCP SDK v1 client for compatibility with deployed MCP servers and OAuth providers. This rollback temporarily removes SDK v2-only protocol negotiation while retaining OAuth issuer binding and callback issuer validation. Thanks @hyknerf for PR #237 and issue #236, @leonfox28 for issue #227, and @JorelLatraille for issue #241.
+
+### Fixed
+- Avoided a double-close race when disconnecting MCP connections by letting the SDK client own transport shutdown. Thanks Szymon Wiszczuk (@golota60) for PR #235.
+- Prevented `/mcp` and `/mcp-auth` from crashing when the OS OAuth credential store is unavailable.
+- Stored oversized OAuth credential payloads as secure-store manifests plus chunks, so Windows Credential Manager value limits no longer block OAuth completion for large token records. Thanks @LysanderdeJong for issue #223.
+- Stored OAuth credential payloads as compact JSON, so multiline secrets no longer corrupt gnome-keyring plaintext keyrings. Thanks @hank-warren for issue #239.
+- Kept collapsed MCP tool results from re-wrapping full multi-10KB payloads on repeated TUI renders, avoiding composer keystroke lag after large MCP dumps. Thanks @hyknerf for PR #233 and @chapmanb for the held-Text follow-up fix.
+
 ## [2.15.0] - 2026-07-25
 
 ### Added

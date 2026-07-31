@@ -5,6 +5,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
 import { startInhibitorProcess, stopInhibitorProcess } from "./inhibitor-process.js";
 import { formatMode, getInhibitorCommand, type InhibitorCommand } from "./inhibitors.js";
 import {
@@ -56,6 +57,7 @@ interface CaffeinateState {
 	settingsNotice?: string;
 	iconWarningShown: boolean;
 	sessionGeneration: number;
+	menuController: AbortController;
 }
 
 const state: CaffeinateState = {
@@ -67,11 +69,13 @@ const state: CaffeinateState = {
 	settingsLoaded: false,
 	iconWarningShown: false,
 	sessionGeneration: 0,
+	menuController: new AbortController(),
 };
 
 export default function caffeinate(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const generation = ++state.sessionGeneration;
+		replaceMenuController("Caffeinate session replaced");
 		state.iconWarningShown = false;
 		state.settingsNotice = undefined;
 		warnDeprecatedIcon(ctx);
@@ -98,6 +102,7 @@ export default function caffeinate(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		state.sessionGeneration += 1;
+		state.menuController.abort(new DOMException("Caffeinate session shut down", "AbortError"));
 		state.activeTurns = 0;
 		stopInhibitor(ctx, "session shutdown", { notify: false });
 		ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -151,55 +156,81 @@ async function handleCaffeinateCommand(args: string, ctx: CommandContext, genera
 }
 
 async function showMenu(ctx: CommandContext, generation: number) {
-	if (!ctx.hasUI) {
-		ctx.ui.notify(`${buildCommandGuide()}\n\n${describeState()}`, statusLevel());
-		updateStatus(ctx);
-		return;
-	}
-
-	const choice = await ctx.ui.select("pi-caffeinate controls", Object.values(MENU_OPTIONS));
-	if (generation !== state.sessionGeneration) return;
-	switch (choice) {
-		case MENU_OPTIONS.status:
-			showStatus(ctx);
-			return;
-		case MENU_OPTIONS.sleep:
-			await setMode(ctx, "sleep", generation);
-			return;
-		case MENU_OPTIONS.display:
-			await setMode(ctx, "display", generation);
-			return;
-		case MENU_OPTIONS.stop:
-			stopCaffeinate(ctx, "manual stop");
-			return;
-		case MENU_OPTIONS.help:
-			ctx.ui.notify(buildCommandGuide(), "info");
-			return;
-	}
+	await runCaffeinateMenu(ctx, generation, "main");
 }
 
 async function showModeSelector(ctx: CommandContext, generation: number) {
-	if (!ctx.hasUI) {
-		ctx.ui.notify(
-			`Mode selection needs an interactive UI. Run /caffeinate sleep or /caffeinate display.\n\n${describeState()}`,
-			statusLevel(),
-		);
-		updateStatus(ctx);
-		return;
-	}
+	await runCaffeinateMenu(ctx, generation, "mode");
+}
 
-	const choice = await ctx.ui.select(
-		`pi-caffeinate mode (current: ${formatMode(state.mode)})`,
-		Object.values(MODE_OPTIONS),
-	);
-	if (generation !== state.sessionGeneration) return;
-	if (choice === MODE_OPTIONS.sleep) {
-		await setMode(ctx, "sleep", generation);
-		return;
+async function runCaffeinateMenu(ctx: CommandContext, generation: number, start: "main" | "mode") {
+	if (!ctx.hasUI) {
+		throw new Error(
+			start === "mode"
+				? "Mode selection requires TUI or RPC mode. Use /caffeinate sleep or /caffeinate display."
+				: `The pi-caffeinate menu requires TUI or RPC mode.\n\n${buildCommandGuide()}\n\n${describeState()}`,
+		);
 	}
-	if (choice === MODE_OPTIONS.display) {
-		await setMode(ctx, "display", generation);
-	}
+	type Screen = "main" | "mode";
+	type Action = "display" | "sleep" | "status" | "stop" | "help";
+	const menu = defineMenu<undefined, Screen, Action>({
+		start,
+		screens: {
+			main: () => ({
+				kind: "actions",
+				title: "pi-caffeinate controls",
+				lines: describeState().split("\n"),
+				items: Object.entries(MENU_OPTIONS).map(([id, label]) => ({
+					id,
+					label,
+					action: id as Action,
+				})),
+				hint: "close",
+			}),
+			mode: () => ({
+				kind: "actions",
+				title: `pi-caffeinate mode (current: ${formatMode(state.mode)})`,
+				items: Object.entries(MODE_OPTIONS).map(([id, label]) => ({
+					id,
+					label,
+					action: id as Action,
+				})),
+				hint: "close",
+			}),
+		},
+		actions: {
+			display: async () => {
+				await setMode(ctx, "display", generation);
+				return { kind: "close" };
+			},
+			sleep: async () => {
+				await setMode(ctx, "sleep", generation);
+				return { kind: "close" };
+			},
+			status: async () => {
+				showStatus(ctx);
+				return { kind: "close" };
+			},
+			stop: async () => {
+				stopCaffeinate(ctx, "manual stop");
+				return { kind: "close" };
+			},
+			help: async () => {
+				ctx.ui.notify(buildCommandGuide(), "info");
+				return { kind: "close" };
+			},
+		},
+	});
+	await runMenu(ctx, menu, {
+		getState: () => undefined,
+		signal: state.menuController.signal,
+		isCurrent: () => generation === state.sessionGeneration,
+	});
+}
+
+function replaceMenuController(reason: string) {
+	state.menuController.abort(new DOMException(reason, "AbortError"));
+	state.menuController = new AbortController();
 }
 
 let modeOperationQueue = Promise.resolve();

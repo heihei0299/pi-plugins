@@ -2,10 +2,9 @@ import { existsSync } from "fs";
 import { readFile, rename, mkdir, stat } from "fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { hashStorePath, hashStoreDir, legacyHashStorePath } from "./paths";
-import { errCode } from "./utils";
+import { errCode, splitLines } from "./utils";
 import { initHasher, contentChecksum } from "./hashline/hasher";
 import { HASH_STORE_VERSION, HASH_STORE_BUSY_TIMEOUT } from "./constants";
-
 type SqlParams = (string | number)[];
 
 interface Prepared {
@@ -37,7 +36,7 @@ function isValidSnapshot(value: unknown): value is LegacySnapshot {
 }
 
 let cachedDb: { path: string; db: DatabaseSync; stmts: Prepared } | null = null;
-
+let exitHandlerRegistered = false;
 function openDb(storePath: string): { db: DatabaseSync; stmts: Prepared } {
   const db = new DatabaseSync(storePath, {
     timeout: HASH_STORE_BUSY_TIMEOUT,
@@ -92,11 +91,27 @@ export async function loadHashStore(): Promise<HashStore> {
   }
 
   cachedDb = { path: storePath, db, stmts };
+
+  if (!exitHandlerRegistered) {
+    exitHandlerRegistered = true;
+    process.once("exit", () => shutdownHashStore());
+    for (const sig of ["SIGINT", "SIGTERM"] as const) {
+      process.once(sig, () => {
+        shutdownHashStore();
+        process.kill(process.pid, sig);
+      });
+    }
+  }
+
   return { stmts, engine: "node:sqlite" };
 }
 
 export function shutdownHashStore(): void {
   if (cachedDb) {
+    try {
+      cachedDb.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } catch {
+    }
     cachedDb.db.close();
     cachedDb = null;
   }
@@ -145,12 +160,11 @@ async function migrateLegacy(db: DatabaseSync): Promise<void> {
     rows.push([
       key,
       contentChecksum(value.content),
-      value.content.split("\n").length,
+      splitLines(value.content).length,
       JSON.stringify(value.hashes),
       Date.now(),
     ]);
   }
-
   if (rows.length > 0) {
     db.exec("BEGIN IMMEDIATE");
     try {
@@ -178,7 +192,7 @@ export function getSnapshot(
   content: string,
 ): string[] | undefined {
   const checksum = contentChecksum(content);
-  const lineCount = content.split("\n").length;
+  const lineCount = splitLines(content).length;
   const row = store.stmts.get(path, checksum, lineCount);
   return row ? (JSON.parse(row.hashes as string) as string[]) : undefined;
 }

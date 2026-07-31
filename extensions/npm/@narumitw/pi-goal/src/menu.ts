@@ -1,10 +1,11 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { type ActionMenuItem, defineMenu, runMenu } from "@narumitw/pi-tui-kit";
 import { formatDuration } from "./accounting.js";
 import { parseTokenBudget } from "./command.js";
 import type { GoalCommandController } from "./commands.js";
 import type { ActiveGoal, PendingQueueAction } from "./persistence.js";
 import { goalQueueIdentity } from "./queue.js";
-import type { GoalRuntime } from "./runtime.js";
+import { type GoalRuntime, goalSummary } from "./runtime.js";
 
 export const GOAL_MENU_ACTIONS = {
 	start: "Start a goal…",
@@ -47,6 +48,22 @@ export interface GoalMenuState {
 }
 
 type ShowSettings = (ctx: ExtensionCommandContext) => Promise<void>;
+type GoalMenuScreen = "main" | "queue" | "status" | "help";
+type GoalMenuAction =
+	| "start"
+	| "start-budget"
+	| "pause"
+	| "resume"
+	| "increase-budget"
+	| "edit"
+	| "replace"
+	| "settings"
+	| "clear"
+	| "queue-add"
+	| "queue-prioritize"
+	| "queue-skip"
+	| "queue-drop"
+	| "back";
 
 export function buildGoalMenuState(runtime: GoalMenuRuntimeView): GoalMenuState {
 	const goal = runtime.activeGoal;
@@ -120,57 +137,132 @@ export async function showGoalManager(
 		commands.showGoal(ctx);
 		return;
 	}
-	while (true) {
-		refreshGoalMenuState(runtime, ctx);
-		const state = buildGoalMenuState(runtime);
-		const displayedGoal = runtime.activeGoal;
-		const selected = await ctx.ui.select(state.title, state.actions);
-		if (!selected || selected === GOAL_MENU_ACTIONS.close) return;
-		switch (selected) {
-			case GOAL_MENU_ACTIONS.start:
+	const owner = runtime as GoalRuntime;
+	const generation = owner.menuGeneration;
+	const ownerSignal = owner.menuController?.signal;
+	let displayedGoal: ActiveGoal | undefined;
+	let displayedQueueHead: ActiveGoal | undefined;
+	let displayedQueueFirst: ActiveGoal | undefined;
+	let displayedQueueLast: ActiveGoal | undefined;
+	const menu = defineMenu<undefined, GoalMenuScreen, GoalMenuAction, ExtensionCommandContext>({
+		start: "main",
+		screens: {
+			main: () => {
+				refreshGoalMenuState(runtime, ctx);
+				const state = buildGoalMenuState(runtime);
+				displayedGoal = runtime.activeGoal;
+				return {
+					kind: "actions",
+					title: "Goal",
+					lines: state.title.split("\n").slice(1),
+					items: state.actions.map(goalMainMenuItem),
+					hint: "close",
+				};
+			},
+			queue: () => {
+				displayedQueueHead = runtime.activeGoal;
+				displayedQueueFirst = runtime.queuedGoals[0];
+				displayedQueueLast = runtime.queuedGoals.at(-1) ?? runtime.activeGoal;
+				return {
+					kind: "actions",
+					title: "Goal queue",
+					lines: [
+						`${runtime.queuedGoals.length + (runtime.activeGoal ? 1 : 0)} total`,
+						...(runtime.activeGoal
+							? [`Current: ${safeGoalMenuText(runtime.activeGoal.text)}`]
+							: []),
+					],
+					items: [
+						{ id: "add", label: QUEUE_ACTIONS.add, action: "queue-add" },
+						{ id: "prioritize", label: QUEUE_ACTIONS.prioritize, action: "queue-prioritize" },
+						...(runtime.queuedGoals.length > 0
+							? [
+									{ id: "skip", label: QUEUE_ACTIONS.skip, action: "queue-skip" as const },
+									{
+										id: "drop-last",
+										label: QUEUE_ACTIONS.dropLast,
+										action: "queue-drop" as const,
+									},
+								]
+							: []),
+						{ id: "back", label: QUEUE_ACTIONS.back, action: "back" },
+					],
+					hint: "back",
+				};
+			},
+			status: () => ({
+				kind: "detail",
+				title: "Goal status",
+				lines: runtime.activeGoal
+					? goalSummary(
+							runtime.activeGoal,
+							runtime.queuedGoals,
+							runtime.settings.experimental.goals,
+							runtime.queueFrozen,
+							runtime.pendingQueueAction,
+						).split("\n")
+					: ["No goal is currently set."],
+				hint: "back",
+			}),
+			help: () => ({
+				kind: "detail",
+				title: "Goal help",
+				lines: goalHelp().split("\n").slice(1),
+				hint: "back",
+			}),
+		},
+		actions: {
+			start: async () => {
 				await startFromMenu(commands, ctx);
-				return;
-			case GOAL_MENU_ACTIONS.startBudget:
+				return { kind: "close" };
+			},
+			"start-budget": async () => {
 				await startFromMenu(commands, ctx, true);
-				return;
-			case GOAL_MENU_ACTIONS.pause:
-				if (!displayedGoal || !requireCurrentMenuGoal(runtime, displayedGoal, ctx)) continue;
+				return { kind: "close" };
+			},
+			pause: async () => {
+				if (!displayedGoal || !requireCurrentMenuGoal(runtime, displayedGoal, ctx)) {
+					return { kind: "stay" };
+				}
 				commands.pauseGoal(ctx);
-				return;
-			case GOAL_MENU_ACTIONS.resume:
-				if (!displayedGoal || !requireCurrentMenuGoal(runtime, displayedGoal, ctx)) continue;
+				return { kind: "close" };
+			},
+			resume: async () => {
+				if (!displayedGoal || !requireCurrentMenuGoal(runtime, displayedGoal, ctx)) {
+					return { kind: "stay" };
+				}
 				await commands.resumeGoal(ctx);
-				return;
-			case GOAL_MENU_ACTIONS.increaseBudget:
-				if (!displayedGoal || !requireCurrentMenuGoal(runtime, displayedGoal, ctx)) continue;
+				return { kind: "close" };
+			},
+			"increase-budget": async () => {
+				if (!displayedGoal || !requireCurrentMenuGoal(runtime, displayedGoal, ctx)) {
+					return { kind: "stay" };
+				}
 				await increaseBudget(runtime, commands, ctx);
-				return;
-			case GOAL_MENU_ACTIONS.edit:
-				if (!displayedGoal || !requireCurrentMenuGoal(runtime, displayedGoal, ctx)) continue;
+				return { kind: "close" };
+			},
+			edit: async () => {
+				if (!displayedGoal || !requireCurrentMenuGoal(runtime, displayedGoal, ctx)) {
+					return { kind: "stay" };
+				}
 				await editFromMenu(runtime, commands, ctx);
-				return;
-			case GOAL_MENU_ACTIONS.replace:
+				return { kind: "close" };
+			},
+			replace: async () => {
 				await startFromMenu(commands, ctx);
-				return;
-			case GOAL_MENU_ACTIONS.status:
-				commands.showGoal(ctx);
-				return;
-			case GOAL_MENU_ACTIONS.queue:
-				if ((await showQueueMenu(runtime, commands, ctx)) === "back") continue;
-				return;
-			case GOAL_MENU_ACTIONS.settings:
+				return { kind: "close" };
+			},
+			settings: async () => {
 				await showSettings(ctx);
-				continue;
-			case GOAL_MENU_ACTIONS.help:
-				ctx.ui.notify(goalHelp(), "info");
-				return;
-			case GOAL_MENU_ACTIONS.clear: {
+				return { kind: "stay" };
+			},
+			clear: async () => {
 				const previewedQueue = goalQueueIdentity(
 					runtime.activeGoal,
 					runtime.queuedGoals,
 					runtime.pendingQueueAction,
 				);
-				if (!(await confirmClear(runtime, ctx))) continue;
+				if (!(await confirmClear(runtime, ctx))) return { kind: "stay" };
 				if (
 					goalQueueIdentity(runtime.activeGoal, runtime.queuedGoals, runtime.pendingQueueAction) !==
 					previewedQueue
@@ -179,13 +271,90 @@ export async function showGoalManager(
 						"The goal queue changed while the dialog was open. Reopen /goal and try again.",
 						"warning",
 					);
-					continue;
+					return { kind: "stay" };
 				}
 				commands.clearGoal(ctx);
-				return;
-			}
-		}
-	}
+				return { kind: "close" };
+			},
+			"queue-add": async () => {
+				const objective = (await ctx.ui.editor("Add goal to queue", ""))?.trim();
+				if (objective) await commands.addGoal(objective, undefined, ctx);
+				return { kind: "close" };
+			},
+			"queue-prioritize": async () => {
+				const goal = displayedQueueHead;
+				if (!goal) return { kind: "stay" };
+				const objective = (await ctx.ui.editor("Prioritize goal", ""))?.trim();
+				if (!objective || !requireCurrentQueueHead(runtime, goal, ctx)) return { kind: "stay" };
+				const confirmed = await ctx.ui.confirm(
+					"Prioritize goal?",
+					`New priority goal:\n${safeGoalMenuText(objective, 4_000)}\n\nCurrent goal moved to the queue:\n${safeGoalMenuText(goal.text, 4_000)}`,
+				);
+				if (confirmed && requireCurrentQueueHead(runtime, goal, ctx)) {
+					await commands.prioritizeGoal(objective, undefined, ctx);
+				}
+				return { kind: "close" };
+			},
+			"queue-skip": async () => {
+				const goal = displayedQueueHead;
+				if (!goal) return { kind: "stay" };
+				const next = displayedQueueFirst;
+				const nextEffect = !next
+					? "No goal remains"
+					: next.status === "queued"
+						? `Start next goal:\n${safeGoalMenuText(next.text, 4_000)}`
+						: `Next goal remains ${displayStatus(next.status).toLowerCase()}:\n${safeGoalMenuText(next.text, 4_000)}`;
+				const confirmed = await ctx.ui.confirm(
+					"Skip current goal?",
+					`Remove current goal:\n${safeGoalMenuText(goal.text, 4_000)}\n\n${nextEffect}`,
+				);
+				if (confirmed && requireCurrentQueueSelection(runtime, goal, next, "first", ctx)) {
+					await commands.skipGoal(ctx);
+				}
+				return { kind: "close" };
+			},
+			"queue-drop": async () => {
+				const goal = displayedQueueHead;
+				const last = displayedQueueLast;
+				if (!goal || !last) return { kind: "stay" };
+				const confirmed = await ctx.ui.confirm(
+					"Drop last goal?",
+					`Remove from queue:\n${safeGoalMenuText(last.text, 4_000)}`,
+				);
+				if (confirmed && requireCurrentQueueSelection(runtime, goal, last, "last", ctx)) {
+					commands.dropLastGoal(ctx);
+				}
+				return { kind: "close" };
+			},
+			back: async () => ({ kind: "back" }),
+		},
+	});
+	await runMenu(ctx, menu, {
+		getState: () => undefined,
+		signal: ownerSignal,
+		isCurrent: () =>
+			owner.menuController === undefined ||
+			(generation === owner.menuGeneration && !owner.menuController.signal.aborted),
+	});
+}
+
+function goalMainMenuItem(label: string): ActionMenuItem<GoalMenuScreen, GoalMenuAction> {
+	if (label === GOAL_MENU_ACTIONS.status) return { id: "status", label, to: "status" as const };
+	if (label === GOAL_MENU_ACTIONS.queue) return { id: "queue", label, to: "queue" as const };
+	if (label === GOAL_MENU_ACTIONS.help) return { id: "help", label, to: "help" as const };
+	if (label === GOAL_MENU_ACTIONS.close) return { id: "close", label, close: true as const };
+	const actions = new Map<string, GoalMenuAction>([
+		[GOAL_MENU_ACTIONS.start, "start"],
+		[GOAL_MENU_ACTIONS.startBudget, "start-budget"],
+		[GOAL_MENU_ACTIONS.pause, "pause"],
+		[GOAL_MENU_ACTIONS.resume, "resume"],
+		[GOAL_MENU_ACTIONS.increaseBudget, "increase-budget"],
+		[GOAL_MENU_ACTIONS.edit, "edit"],
+		[GOAL_MENU_ACTIONS.replace, "replace"],
+		[GOAL_MENU_ACTIONS.settings, "settings"],
+		[GOAL_MENU_ACTIONS.clear, "clear"],
+	]);
+	return { id: actions.get(label) ?? label, label, action: actions.get(label) ?? "settings" };
 }
 
 function refreshGoalMenuState(runtime: GoalMenuRuntimeView, ctx: ExtensionCommandContext) {
@@ -274,66 +443,6 @@ async function askTokenBudget(ctx: ExtensionCommandContext, current?: number) {
 	if (budget === undefined)
 		ctx.ui.notify(`Invalid token budget: ${safeGoalMenuText(raw)}`, "warning");
 	return budget;
-}
-
-async function showQueueMenu(
-	runtime: GoalMenuRuntimeView,
-	commands: GoalCommandController,
-	ctx: ExtensionCommandContext,
-) {
-	const goal = runtime.activeGoal;
-	if (!goal) return;
-	const actions: string[] = [QUEUE_ACTIONS.add, QUEUE_ACTIONS.prioritize];
-	if (runtime.queuedGoals.length > 0) actions.push(QUEUE_ACTIONS.skip, QUEUE_ACTIONS.dropLast);
-	actions.push(QUEUE_ACTIONS.back);
-	const selected = await ctx.ui.select(
-		`Goal queue · ${runtime.queuedGoals.length + 1} total\nCurrent: ${safeGoalMenuText(goal.text)}`,
-		actions,
-	);
-	if (!selected || selected === QUEUE_ACTIONS.back) return "back" as const;
-	if (selected === QUEUE_ACTIONS.add) {
-		const objective = (await ctx.ui.editor("Add goal to queue", ""))?.trim();
-		if (objective) await commands.addGoal(objective, undefined, ctx);
-		return;
-	}
-	if (selected === QUEUE_ACTIONS.prioritize) {
-		const objective = (await ctx.ui.editor("Prioritize goal", ""))?.trim();
-		if (!objective || !requireCurrentQueueHead(runtime, goal, ctx)) return;
-		const confirmed = await ctx.ui.confirm(
-			"Prioritize goal?",
-			`New priority goal:\n${safeGoalMenuText(objective, 4_000)}\n\nCurrent goal moved to the queue:\n${safeGoalMenuText(goal.text, 4_000)}`,
-		);
-		if (confirmed && requireCurrentQueueHead(runtime, goal, ctx)) {
-			await commands.prioritizeGoal(objective, undefined, ctx);
-		}
-		return;
-	}
-	if (selected === QUEUE_ACTIONS.skip) {
-		const next = runtime.queuedGoals[0];
-		const nextEffect = !next
-			? "No goal remains"
-			: next.status === "queued"
-				? `Start next goal:\n${safeGoalMenuText(next.text, 4_000)}`
-				: `Next goal remains ${displayStatus(next.status).toLowerCase()}:\n${safeGoalMenuText(next.text, 4_000)}`;
-		const confirmed = await ctx.ui.confirm(
-			"Skip current goal?",
-			`Remove current goal:\n${safeGoalMenuText(goal.text, 4_000)}\n\n${nextEffect}`,
-		);
-		if (confirmed && requireCurrentQueueSelection(runtime, goal, next, "first", ctx)) {
-			await commands.skipGoal(ctx);
-		}
-		return;
-	}
-	if (selected === QUEUE_ACTIONS.dropLast) {
-		const last = runtime.queuedGoals.at(-1) ?? goal;
-		const confirmed = await ctx.ui.confirm(
-			"Drop last goal?",
-			`Remove from queue:\n${safeGoalMenuText(last.text, 4_000)}`,
-		);
-		if (confirmed && requireCurrentQueueSelection(runtime, goal, last, "last", ctx)) {
-			commands.dropLastGoal(ctx);
-		}
-	}
 }
 
 async function confirmClear(runtime: GoalMenuRuntimeView, ctx: ExtensionCommandContext) {

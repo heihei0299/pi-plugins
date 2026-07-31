@@ -10,14 +10,21 @@ import { isBraveAvailable, searchWithBrave } from "./brave.ts";
 import { isOpenAISearchAvailable, searchWithOpenAI } from "./openai-search.ts";
 import { isParallelAvailable, searchWithParallel } from "./parallel.ts";
 import { isTinyFishAvailable, searchWithTinyFish } from "./tinyfish.ts";
+import { isSearch1APIAvailable, searchWithSearch1API } from "./search1api.ts";
+import { isSearchinfinityAvailable, searchWithSearchinfinity } from "./searchinfinity.ts";
+import { isQueritAvailable, searchWithQuerit } from "./querit.ts";
 import { isTavilyAvailable, searchWithTavily } from "./tavily.ts";
 import { isSerpdiveAvailable, searchWithSerpdive } from "./serpdive.ts";
 import { isSearXNGAvailable, searchWithSearXNG } from "./searxng.ts";
 import { isAnySearchAvailable, searchWithAnySearch } from "./anysearch.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
-export type SearchProvider = "auto" | "all" | "openai" | "brave" | "parallel" | "tinyfish" | "tavily" | "searxng" | "perplexity" | "gemini" | "exa" | "serpdive" | "anysearch";
-export type ResolvedSearchProvider = Exclude<SearchProvider, "auto" | "all">;
+export const RESOLVED_SEARCH_PROVIDERS = ["openai", "brave", "parallel", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "searxng", "perplexity", "gemini", "exa", "serpdive", "anysearch"] as const;
+export const SEARCH_PROVIDERS = ["auto", "all", ...RESOLVED_SEARCH_PROVIDERS] as const;
+
+export type ResolvedSearchProvider = typeof RESOLVED_SEARCH_PROVIDERS[number];
+export type SearchProvider = typeof SEARCH_PROVIDERS[number];
+export type SearchProviderSelection = SearchProvider | ResolvedSearchProvider[];
 export type SearchProviderErrorKind =
 	| "transient"
 	| "quota"
@@ -73,13 +80,12 @@ export interface AttributedSearchResponse extends SearchResponse {
 }
 
 const CONFIG_PATH = getWebSearchConfigPath();
-const DEFAULT_SEARCH_MODEL = "gemini-2.5-flash";
-const VALID_SEARCH_PROVIDERS: SearchProvider[] = ["auto", "all", "openai", "brave", "parallel", "tinyfish", "tavily", "searxng", "perplexity", "gemini", "exa", "serpdive", "anysearch"];
-const ALL_SEARCH_PROVIDERS: ResolvedSearchProvider[] = ["searxng", "openai", "exa", "brave", "parallel", "tinyfish", "tavily", "serpdive", "perplexity", "gemini"];
+const DEFAULT_SEARCH_MODEL = "gemini-3.6-flash";
+const ALL_SEARCH_PROVIDERS: ResolvedSearchProvider[] = ["searxng", "openai", "exa", "brave", "parallel", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "serpdive", "perplexity", "gemini"];
 const VALID_ROUTING_KINDS = ["transient", "quota", "network"] as const;
 
 type SearchConfig = {
-	searchProvider: SearchProvider;
+	searchProvider: SearchProviderSelection;
 	searchProviderConfigured: boolean;
 	searchRouting?: SearchRoutingConfig;
 	searchModel?: string;
@@ -110,7 +116,7 @@ function getSearchConfig(): SearchConfig {
 	const searchModel = normalizeSearchModel(raw.searchModel);
 	const searchProviderConfigured = Object.hasOwn(raw, "searchProvider") || Object.hasOwn(raw, "provider");
 	cachedSearchConfig = {
-		searchProvider: normalizeSearchProvider(raw.searchProvider ?? raw.provider),
+		searchProvider: normalizeSearchProviderSelection(raw.searchProvider ?? raw.provider, `provider in ${CONFIG_PATH}`),
 		searchProviderConfigured,
 		...(Object.hasOwn(raw, "searchRouting") ? { searchRouting: normalizeSearchRouting(raw.searchRouting) } : {}),
 		...(searchModel ? { searchModel } : {}),
@@ -123,20 +129,7 @@ function normalizeSearchRouting(value: unknown): SearchRoutingConfig {
 		throw new Error(`searchRouting in ${CONFIG_PATH} must be an object`);
 	}
 	const raw = value as Record<string, unknown>;
-	if (!Array.isArray(raw.providers) || raw.providers.length === 0) {
-		throw new Error(`searchRouting.providers in ${CONFIG_PATH} must be a non-empty array`);
-	}
-	const providers: ResolvedSearchProvider[] = [];
-	for (const provider of raw.providers) {
-		const normalized = typeof provider === "string" ? provider.trim().toLowerCase() : "";
-		if (!VALID_SEARCH_PROVIDERS.includes(normalized as SearchProvider) || normalized === "auto" || normalized === "all") {
-			throw new Error(`searchRouting.providers in ${CONFIG_PATH} contains an invalid provider: ${String(provider)}`);
-		}
-		if (providers.includes(normalized as ResolvedSearchProvider)) {
-			throw new Error(`searchRouting.providers in ${CONFIG_PATH} must not contain duplicates: ${normalized}`);
-		}
-		providers.push(normalized as ResolvedSearchProvider);
-	}
+	const providers = normalizeResolvedProviderList(raw.providers, `searchRouting.providers in ${CONFIG_PATH}`);
 	if (!Array.isArray(raw.fallbackOn) || raw.fallbackOn.length === 0) {
 		throw new Error(`searchRouting.fallbackOn in ${CONFIG_PATH} must be a non-empty array`);
 	}
@@ -163,13 +156,32 @@ function normalizeSearchModel(value: unknown): string | undefined {
 	return normalized.length > 0 ? normalized : undefined;
 }
 
-function normalizeSearchProvider(value: unknown): SearchProvider {
+function normalizeResolvedProviderList(value: unknown, label: string): ResolvedSearchProvider[] {
+	if (!Array.isArray(value) || value.length === 0) {
+		throw new Error(`${label} must be a non-empty array`);
+	}
+	const providers: ResolvedSearchProvider[] = [];
+	for (const provider of value) {
+		const normalized = typeof provider === "string" ? provider.trim().toLowerCase() : "";
+		if (!RESOLVED_SEARCH_PROVIDERS.includes(normalized as ResolvedSearchProvider)) {
+			throw new Error(`${label} contains an invalid provider: ${String(provider)}`);
+		}
+		if (providers.includes(normalized as ResolvedSearchProvider)) {
+			throw new Error(`${label} must not contain duplicates: ${normalized}`);
+		}
+		providers.push(normalized as ResolvedSearchProvider);
+	}
+	return providers;
+}
+
+export function normalizeSearchProviderSelection(value: unknown, label = "provider"): SearchProviderSelection {
+	if (Array.isArray(value)) return normalizeResolvedProviderList(value, label);
 	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
-	return VALID_SEARCH_PROVIDERS.includes(normalized as SearchProvider) ? normalized as SearchProvider : "auto";
+	return SEARCH_PROVIDERS.includes(normalized as SearchProvider) ? normalized as SearchProvider : "auto";
 }
 
 export interface FullSearchOptions extends SearchOptions {
-	provider?: SearchProvider;
+	provider?: SearchProviderSelection;
 	includeContent?: boolean;
 	extensionContext?: ExtensionContext;
 }
@@ -276,6 +288,9 @@ async function searchWithResolvedProvider(
 	if (provider === "brave") return { ...(await searchWithBrave(query, options)), provider };
 	if (provider === "parallel") return { ...(await searchWithParallel(query, options)), provider };
 	if (provider === "tinyfish") return { ...(await searchWithTinyFish(query, options)), provider };
+	if (provider === "search1api") return { ...(await searchWithSearch1API(query, options)), provider };
+	if (provider === "searchinfinity") return { ...(await searchWithSearchinfinity(query, options)), provider };
+	if (provider === "querit") return { ...(await searchWithQuerit(query, options)), provider };
 	if (provider === "tavily") return { ...(await searchWithTavily(query, options)), provider };
 	if (provider === "serpdive") return { ...(await searchWithSerpdive(query, options)), provider };
 	if (provider === "anysearch") return { ...(await searchWithAnySearch(query, options)), provider };
@@ -301,6 +316,9 @@ async function isResolvedProviderAvailable(provider: ResolvedSearchProvider, opt
 	if (provider === "brave") return isBraveAvailable();
 	if (provider === "parallel") return isParallelAvailable();
 	if (provider === "tinyfish") return isTinyFishAvailable();
+	if (provider === "search1api") return isSearch1APIAvailable();
+	if (provider === "searchinfinity") return isSearchinfinityAvailable();
+	if (provider === "querit") return isQueritAvailable();
 	if (provider === "tavily") return isTavilyAvailable();
 	if (provider === "serpdive") return isSerpdiveAvailable();
 	if (provider === "anysearch") return isAnySearchAvailable();
@@ -313,6 +331,9 @@ async function isResolvedProviderAvailable(provider: ResolvedSearchProvider, opt
 function providerLabel(provider: ResolvedSearchProvider): string {
 	if (provider === "openai") return "OpenAI";
 	if (provider === "tinyfish") return "TinyFish";
+	if (provider === "search1api") return "Search1API";
+	if (provider === "searchinfinity") return "Searchinfinity";
+	if (provider === "querit") return "Querit";
 	if (provider === "serpdive") return "SERPdive";
 	if (provider === "searxng") return "SearXNG";
 	return provider.charAt(0).toUpperCase() + provider.slice(1);
@@ -329,23 +350,25 @@ async function searchWithAllProvider(
 	throw new Error("Gemini API search returned no results.");
 }
 
-async function searchWithAllProviders(
+async function searchWithProviders(
 	query: string,
 	options: FullSearchOptions,
+	selectedProviders?: ResolvedSearchProvider[],
 ): Promise<AttributedSearchResponse> {
-	const availability = await Promise.all(ALL_SEARCH_PROVIDERS.map(async (provider) => ({
+	const providers = selectedProviders ?? (await Promise.all(ALL_SEARCH_PROVIDERS.map(async (provider) => ({
 		provider,
 		available: provider === "gemini"
 			? isGeminiApiAvailable()
 			: await isResolvedProviderAvailable(provider, options),
-	})));
-	const providers = availability.filter((entry) => entry.available).map((entry) => entry.provider);
+	})))).filter((entry) => entry.available).map((entry) => entry.provider);
 	if (providers.length === 0) {
 		throw new Error("No configured search provider available for provider \"all\". AnySearch is excluded.");
 	}
 
 	const settled = await Promise.allSettled(
-		providers.map((provider) => searchWithAllProvider(provider, query, options)),
+		providers.map((provider) => selectedProviders
+			? searchWithResolvedProvider(provider, query, options)
+			: searchWithAllProvider(provider, query, options)),
 	);
 	if (options.signal?.aborted) throw new Error("Aborted");
 
@@ -360,7 +383,8 @@ async function searchWithAllProviders(
 		}
 	}
 	if (successes.length === 0) {
-		throw new Error(`All-provider search failed:\n  - ${failures.map(({ provider, error }) => `${providerLabel(provider)}: ${error}`).join("\n  - ")}`);
+		const label = selectedProviders ? "Selected-provider" : "All-provider";
+		throw new Error(`${label} search failed:\n  - ${failures.map(({ provider, error }) => `${providerLabel(provider)}: ${error}`).join("\n  - ")}`);
 	}
 
 	const results: SearchResult[] = [];
@@ -428,7 +452,10 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	const provider = options.provider === undefined || options.provider === "auto"
 		? config.searchProvider
 		: options.provider;
-	if (provider === "all") return searchWithAllProviders(query, options);
+	if (Array.isArray(provider)) {
+		return searchWithProviders(query, options, normalizeResolvedProviderList(provider, "provider"));
+	}
+	if (provider === "all") return searchWithProviders(query, options);
 	if (provider !== "auto") return searchWithResolvedProvider(provider, query, options);
 	if (!config.searchProviderConfigured && config.searchRouting) {
 		return searchWithConfiguredRouting(query, options, config.searchRouting);
@@ -498,6 +525,36 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
+	if (isSearch1APIAvailable()) {
+		try {
+			const result = await searchWithSearch1API(query, options);
+			return { ...result, provider: "search1api" };
+		} catch (err) {
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`Search1API: ${errorMessage(err)}`);
+		}
+	}
+
+	if (isSearchinfinityAvailable()) {
+		try {
+			const result = await searchWithSearchinfinity(query, options);
+			return { ...result, provider: "searchinfinity" };
+		} catch (err) {
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`Searchinfinity: ${errorMessage(err)}`);
+		}
+	}
+
+	if (isQueritAvailable()) {
+		try {
+			const result = await searchWithQuerit(query, options);
+			return { ...result, provider: "querit" };
+		} catch (err) {
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`Querit: ${errorMessage(err)}`);
+		}
+	}
+
 	if (isTavilyAvailable()) {
 		try {
 			const result = await searchWithTavily(query, options);
@@ -543,8 +600,8 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	throw new Error(
 		"No search provider available. Either:\n" +
 		"  1. Use /login to sign in with a Codex subscription for OpenAI web search\n" +
-		`  2. Set openaiApiKey, braveApiKey, parallelApiKey, tinyfishApiKey, tavilyApiKey, serpdiveApiKey, searxngBaseUrl, perplexityApiKey, exaApiKey, geminiApiKey, or cloudflareApiKey in ${CONFIG_PATH}\n` +
-		"  3. Set OPENAI_API_KEY, BRAVE_API_KEY, PARALLEL_API_KEY, TINYFISH_API_KEY, TAVILY_API_KEY, SERPDIVE_API_KEY, SEARXNG_BASE_URL, EXA_API_KEY, PERPLEXITY_API_KEY, GEMINI_API_KEY, or CLOUDFLARE_API_KEY env vars\n" +
+		`  2. Set openaiApiKey, braveApiKey, parallelApiKey, tinyfishApiKey, search1apiApiKey, searchinfinityApiKey, queritApiKey, tavilyApiKey, serpdiveApiKey, searxngBaseUrl, perplexityApiKey, exaApiKey, geminiApiKey, or cloudflareApiKey in ${CONFIG_PATH}\n` +
+		"  3. Set OPENAI_API_KEY, BRAVE_API_KEY, PARALLEL_API_KEY, TINYFISH_API_KEY, SEARCH1API_KEY, SEARCHINFINITY_API_KEY, QUERIT_API_KEY, TAVILY_API_KEY, SERPDIVE_API_KEY, SEARXNG_BASE_URL, EXA_API_KEY, PERPLEXITY_API_KEY, GEMINI_API_KEY, or CLOUDFLARE_API_KEY env vars\n" +
 		"  4. Set GOOGLE_GEMINI_BASE_URL with CLOUDFLARE_API_KEY for Cloudflare AI Gateway routing\n" +
 		"  5. Sign into gemini.google.com in a supported Chromium-based browser\n" +
 		"  6. Explicitly select provider: \"anysearch\" for anonymous AnySearch"
@@ -611,7 +668,6 @@ async function searchWithGeminiWeb(query: string, options: SearchOptions = {}): 
 
 	try {
 		const text = await queryWithCookies(prompt, cookies, {
-			model: "gemini-3-flash-preview",
 			signal: options.signal,
 			timeoutMs: 60000,
 		});

@@ -20,6 +20,8 @@ import { resolveConfiguredOAuthDir } from './config.ts';
 const require = createRequire(import.meta.url);
 const AUTH_SECRET_SERVICE = 'pi-mcp-adapter.oauth';
 const TEST_AUTH_STORE_ENV = 'PI_MCP_ADAPTER_TEST_AUTH_STORE';
+const AUTH_SECRET_CHUNK_SIZE = 1800;
+const AUTH_CHUNK_MANIFEST_KEY = '__piMcpAdapterOAuthChunked';
 
 /** OAuth token storage format */
 export interface StoredTokens {
@@ -27,7 +29,7 @@ export interface StoredTokens {
   refreshToken?: string;
   expiresAt?: number; // Unix timestamp in seconds
   scope?: string;
-  /** SEP-2352 authorization-server issuer stamp from the SDK */
+  /** SEP-2352 authorization-server issuer binding */
   issuer?: string;
 }
 
@@ -38,7 +40,7 @@ export interface StoredClientInfo {
   clientIdIssuedAt?: number;
   clientSecretExpiresAt?: number;
   redirectUris?: string[];
-  /** SEP-2352 authorization-server issuer stamp from the SDK */
+  /** SEP-2352 authorization-server issuer binding */
   issuer?: string;
   /**
    * True when this entry is a secretless SEP-2352 issuer stub persisted for a
@@ -64,6 +66,46 @@ export interface AuthStorageOptions {
   baseDir?: string;
 }
 
+export class OAuthCredentialStoreError extends Error {
+  readonly code = 'OAUTH_CREDENTIAL_STORE_UNAVAILABLE';
+
+  constructor(
+    message: string,
+    readonly operation: 'read' | 'write' | 'remove',
+    cause: unknown,
+  ) {
+    super(message, { cause });
+    this.name = 'OAuthCredentialStoreError';
+  }
+}
+
+export type OAuthCredentialStatus =
+  | { status: 'present'; entry: AuthEntry }
+  | { status: 'absent' }
+  | { status: 'unavailable'; message: string };
+
+function causeChainContains(error: unknown, pattern: RegExp): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while ((typeof current === 'object' && current !== null) || typeof current === 'function') {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const candidate = current as { name?: unknown; message?: unknown; code?: unknown; cause?: unknown };
+    if ([candidate.name, candidate.message, candidate.code].some(value => typeof value === 'string' && pattern.test(value))) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
+}
+
+export function formatOAuthCredentialStoreUnavailable(error: OAuthCredentialStoreError): string {
+  if (process.platform === 'linux' && causeChainContains(error, /key\s*(?:has been\s*)?revoked|keyrevoked/i)) {
+    return 'OAuth credential store unavailable: the Linux session keyring may be revoked. Start Pi from a fresh login/keyring session and retry.';
+  }
+  return 'OAuth credential store unavailable. Configure or unlock the OS credential store and retry.';
+}
+
 interface KeyringEntry {
   getPassword(): string | null;
   setPassword(password: string): void;
@@ -76,6 +118,12 @@ interface AuthSecretStore {
   read(account: string): string | undefined;
   write(account: string, payload: string): void;
   remove(account: string): void;
+}
+
+interface AuthEntryChunkManifest {
+  [AUTH_CHUNK_MANIFEST_KEY]: 1;
+  chunkCount: number;
+  chunkDigest: string;
 }
 
 let KeyringEntryClass: KeyringEntryConstructor | undefined;
@@ -119,6 +167,14 @@ const unavailableAuthSecretStore: AuthSecretStore = {
 
 export function resetTestAuthSecretStore(): void {
   memoryAuthEntries.clear();
+}
+
+export function getTestAuthSecretStoreEntries(): [string, string][] {
+  return [...memoryAuthEntries.entries()];
+}
+
+export function removeTestAuthSecretStoreEntry(account: string): void {
+  memoryAuthEntries.delete(account);
 }
 
 function getAuthSecretStore(): AuthSecretStore {
@@ -172,12 +228,92 @@ export function getAuthEntryFilePath(serverName: string, options?: AuthStorageOp
   return join(getServerDir(serverName, options), 'tokens.json');
 }
 
-function parseAuthEntryPayload(serverName: string, payload: string, source: string): AuthEntry {
+function parseJsonPayload(serverName: string, payload: string, source: string): unknown {
   try {
-    return JSON.parse(payload) as AuthEntry;
+    return JSON.parse(payload) as unknown;
   } catch (error) {
     throw new Error(`Failed to parse OAuth credentials for ${serverName} from ${source}`, { cause: error });
   }
+}
+
+function parseAuthEntryPayload(serverName: string, payload: string, source: string): AuthEntry {
+  return parseJsonPayload(serverName, payload, source) as AuthEntry;
+}
+
+function isAuthEntryChunkManifest(value: unknown): value is AuthEntryChunkManifest {
+  if (typeof value !== 'object' || value === null) return false;
+  const manifest = value as Partial<AuthEntryChunkManifest>;
+  return manifest[AUTH_CHUNK_MANIFEST_KEY] === 1
+    && typeof manifest.chunkCount === 'number'
+    && Number.isInteger(manifest.chunkCount)
+    && manifest.chunkCount > 0
+    && typeof manifest.chunkDigest === 'string'
+    && /^[a-f0-9]{16}$/.test(manifest.chunkDigest);
+}
+
+function getAuthEntryChunkAccount(account: string, manifest: AuthEntryChunkManifest, index: number): string {
+  return `${account}.chunk.${manifest.chunkDigest}.${index}`;
+}
+
+function getAuthEntryChunkAccounts(account: string, manifest: AuthEntryChunkManifest): string[] {
+  return Array.from({ length: manifest.chunkCount }, (_, index) => getAuthEntryChunkAccount(account, manifest, index));
+}
+
+function readChunkManifestFromPayload(serverName: string, payload: string, source: string): AuthEntryChunkManifest | undefined {
+  const parsed = parseJsonPayload(serverName, payload, source);
+  return isAuthEntryChunkManifest(parsed) ? parsed : undefined;
+}
+
+function readExistingChunkManifest(store: AuthSecretStore, serverName: string, account: string): AuthEntryChunkManifest | undefined {
+  try {
+    const payload = store.read(account);
+    return payload === undefined ? undefined : readChunkManifestFromPayload(serverName, payload, 'OS secure credential store');
+  } catch {
+    return undefined;
+  }
+}
+
+function removeChunkPayloads(store: AuthSecretStore, account: string, manifest: AuthEntryChunkManifest): void {
+  for (const chunkAccount of getAuthEntryChunkAccounts(account, manifest)) {
+    store.remove(chunkAccount);
+  }
+}
+
+function tryRemoveChunkPayloads(store: AuthSecretStore, account: string, manifest: AuthEntryChunkManifest | undefined): void {
+  if (!manifest) return;
+  try {
+    removeChunkPayloads(store, account, manifest);
+  } catch {
+    // Stale chunk cleanup must not hide a successful credential write.
+  }
+}
+
+function createChunkManifest(payload: string): AuthEntryChunkManifest {
+  return {
+    [AUTH_CHUNK_MANIFEST_KEY]: 1,
+    chunkCount: Math.ceil(payload.length / AUTH_SECRET_CHUNK_SIZE),
+    chunkDigest: createHash('sha256').update(payload, 'utf8').digest('hex').slice(0, 16),
+  };
+}
+
+function readChunkedAuthEntry(serverName: string, account: string, manifest: AuthEntryChunkManifest): AuthEntry {
+  const store = getAuthSecretStore();
+  const chunks = getAuthEntryChunkAccounts(account, manifest).map((chunkAccount) => {
+    try {
+      const chunk = store.read(chunkAccount);
+      if (chunk === undefined) {
+        throw new Error(`Missing OAuth credential chunk ${chunkAccount} for ${serverName}`);
+      }
+      return chunk;
+    } catch (error) {
+      throw new OAuthCredentialStoreError(
+        `Failed to read OAuth credentials for ${serverName} from the OS secure credential store`,
+        'read',
+        error,
+      );
+    }
+  });
+  return parseAuthEntryPayload(serverName, chunks.join(''), 'OS secure credential store chunks');
 }
 
 function readLegacyAuthEntry(serverName: string, options?: AuthStorageOptions): AuthEntry | undefined {
@@ -206,10 +342,32 @@ function removeLegacyAuthEntry(serverName: string, options?: AuthStorageOptions)
 
 function writeSecureAuthEntry(serverName: string, entry: AuthEntry): void {
   const account = getAuthEntryAccount(serverName);
+  const store = getAuthSecretStore();
+  const payload = JSON.stringify(entry);
+  const previousManifest = readExistingChunkManifest(store, serverName, account);
+  const manifest = payload.length > AUTH_SECRET_CHUNK_SIZE ? createChunkManifest(payload) : undefined;
+
   try {
-    getAuthSecretStore().write(account, JSON.stringify(entry, null, 2));
+    if (manifest) {
+      for (let index = 0; index < manifest.chunkCount; index++) {
+        const chunk = payload.slice(index * AUTH_SECRET_CHUNK_SIZE, (index + 1) * AUTH_SECRET_CHUNK_SIZE);
+        store.write(getAuthEntryChunkAccount(account, manifest, index), chunk);
+      }
+      store.write(account, JSON.stringify(manifest));
+    } else {
+      // Compact: multiline secrets corrupt gnome-keyring plaintext (GKeyFile) collections.
+      store.write(account, payload);
+    }
+    if (previousManifest?.chunkDigest !== manifest?.chunkDigest) {
+      tryRemoveChunkPayloads(store, account, previousManifest);
+    }
   } catch (error) {
-    throw new Error(`Failed to write OAuth credentials for ${serverName} to the OS secure credential store`, { cause: error });
+    tryRemoveChunkPayloads(store, account, manifest);
+    throw new OAuthCredentialStoreError(
+      `Failed to write OAuth credentials for ${serverName} to the OS secure credential store`,
+      'write',
+      error,
+    );
   }
 }
 
@@ -217,23 +375,35 @@ function writeSecureAuthEntry(serverName: string, entry: AuthEntry): void {
  * Read the auth entry for a server from the OS secure store, importing and
  * deleting a legacy plaintext entry when present.
  */
-function readAuthEntry(serverName: string, options?: AuthStorageOptions): AuthEntry | undefined {
+function readAuthEntry(
+  serverName: string,
+  options?: AuthStorageOptions,
+  behavior: { migrateLegacy?: boolean } = {},
+): AuthEntry | undefined {
   const account = getAuthEntryAccount(serverName);
   let payload: string | undefined;
   try {
     payload = getAuthSecretStore().read(account);
   } catch (error) {
-    throw new Error(`Failed to read OAuth credentials for ${serverName} from the OS secure credential store`, { cause: error });
+    throw new OAuthCredentialStoreError(
+      `Failed to read OAuth credentials for ${serverName} from the OS secure credential store`,
+      'read',
+      error,
+    );
   }
 
   if (payload !== undefined) {
-    const entry = parseAuthEntryPayload(serverName, payload, 'OS secure credential store');
+    const manifest = readChunkManifestFromPayload(serverName, payload, 'OS secure credential store');
+    const entry = manifest
+      ? readChunkedAuthEntry(serverName, account, manifest)
+      : parseAuthEntryPayload(serverName, payload, 'OS secure credential store');
     removeLegacyAuthEntry(serverName, options);
     return entry;
   }
 
   const legacyEntry = readLegacyAuthEntry(serverName, options);
   if (!legacyEntry) return undefined;
+  if (behavior.migrateLegacy === false) return legacyEntry;
   writeSecureAuthEntry(serverName, legacyEntry);
   removeLegacyAuthEntry(serverName, options);
   return legacyEntry;
@@ -264,6 +434,26 @@ export function getAuthForUrl(serverName: string, serverUrl: string, options?: A
 }
 
 /**
+ * Inspect credentials for status-only UI paths without treating an unavailable
+ * secure store as missing credentials. Authentication operations continue to
+ * use getAuthForUrl() directly and therefore remain fail-closed.
+ */
+export function inspectAuthForUrl(
+  serverName: string,
+  serverUrl: string,
+  options?: AuthStorageOptions,
+): OAuthCredentialStatus {
+  try {
+    const entry = readAuthEntry(serverName, options, { migrateLegacy: false });
+    if (!entry?.serverUrl || entry.serverUrl !== serverUrl) return { status: 'absent' };
+    return { status: 'present', entry };
+  } catch (error) {
+    if (!(error instanceof OAuthCredentialStoreError)) throw error;
+    return { status: 'unavailable', message: formatOAuthCredentialStoreUnavailable(error) };
+  }
+}
+
+/**
  * Save auth entry for a server.
  */
 export function saveAuthEntry(serverName: string, entry: AuthEntry, serverUrl?: string, options?: AuthStorageOptions): void {
@@ -280,10 +470,18 @@ export function saveAuthEntry(serverName: string, entry: AuthEntry, serverUrl?: 
  */
 export function removeAuthEntry(serverName: string, options?: AuthStorageOptions): void {
   const account = getAuthEntryAccount(serverName);
+  const store = getAuthSecretStore();
   try {
-    getAuthSecretStore().remove(account);
+    const payload = store.read(account);
+    const manifest = payload === undefined ? undefined : readChunkManifestFromPayload(serverName, payload, 'OS secure credential store');
+    if (manifest) removeChunkPayloads(store, account, manifest);
+    store.remove(account);
   } catch (error) {
-    throw new Error(`Failed to remove OAuth credentials for ${serverName} from the OS secure credential store`, { cause: error });
+    throw new OAuthCredentialStoreError(
+      `Failed to remove OAuth credentials for ${serverName} from the OS secure credential store`,
+      'remove',
+      error,
+    );
   }
   removeLegacyAuthEntry(serverName, options);
 }

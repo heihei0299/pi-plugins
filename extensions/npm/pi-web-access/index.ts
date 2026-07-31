@@ -5,9 +5,9 @@ import { StringEnum, complete, type Api, type ImageContent, type Model, type Tex
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import { normalizeFetchContentParams } from "./fetch-params.ts";
 import { clearCloneCache } from "./github-extract.ts";
-import { getConfiguredSearchRouting, search, type AttributedSearchResponse, type SearchProvider, type ResolvedSearchProvider } from "./gemini-search.ts";
+import { getConfiguredSearchRouting, normalizeSearchProviderSelection, RESOLVED_SEARCH_PROVIDERS, SEARCH_PROVIDERS, search, type AttributedSearchResponse, type SearchProvider, type SearchProviderSelection, type ResolvedSearchProvider } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
-import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath } from "./utils.ts";
+import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath, resolveCuratorNetworkConfig } from "./utils.ts";
 import {
 	clearResults,
 	deleteResult,
@@ -42,6 +42,9 @@ import { isBraveAvailable } from "./brave.ts";
 import { isOpenAISearchAvailable } from "./openai-search.ts";
 import { isParallelAvailable } from "./parallel.ts";
 import { isTinyFishAvailable } from "./tinyfish.ts";
+import { isSearch1APIAvailable } from "./search1api.ts";
+import { isSearchinfinityAvailable } from "./searchinfinity.ts";
+import { isQueritAvailable } from "./querit.ts";
 import { isTavilyAvailable } from "./tavily.ts";
 import { isSerpdiveAvailable } from "./serpdive.ts";
 import { isSearXNGAvailable } from "./searxng.ts";
@@ -96,10 +99,12 @@ function renderSearchErrorPlan(plan: SearchErrorPlan, expanded: boolean, theme: 
 interface WebSearchConfig {
 	anysearchApiKey?: unknown;
 	tinyfishApiKey?: unknown;
-	provider?: string;
-	searchProvider?: string;
+	provider?: unknown;
+	searchProvider?: unknown;
 	workflow?: string;
 	curatorTimeoutSeconds?: unknown;
+	autoOpenBrowser?: unknown;
+	curatorRemote?: unknown;
 	summaryModel?: string;
 	webSearch?: {
 		enabled?: boolean;
@@ -123,6 +128,9 @@ interface ProviderAvailability {
 	brave: boolean;
 	parallel: boolean;
 	tinyfish: boolean;
+	search1api: boolean;
+	searchinfinity: boolean;
+	querit: boolean;
 	tavily: boolean;
 	serpdive: boolean;
 	searxng: boolean;
@@ -190,7 +198,15 @@ const DEFAULT_TOOL_NAMES: ToolNames = {
 const TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const DEFAULT_SHORTCUTS = { curate: "ctrl+shift+s", activity: "ctrl+shift+w" } satisfies Record<string, KeyId>;
 const DEFAULT_CURATOR_TIMEOUT_SECONDS = 20;
+const DEFAULT_REMOTE_CURATOR_TIMEOUT_SECONDS = 60;
 const MAX_CURATOR_TIMEOUT_SECONDS = 600;
+
+function searchProviderSchema(description: string) {
+	return Type.Union([
+		StringEnum([...SEARCH_PROVIDERS]),
+		Type.Array(StringEnum([...RESOLVED_SEARCH_PROVIDERS]), { minItems: 1, uniqueItems: true }),
+	], { description });
+}
 
 function resolveToolNames(config: WebSearchConfig): ToolNames {
 	if (config.toolNames !== undefined && (!config.toolNames || typeof config.toolNames !== "object" || Array.isArray(config.toolNames))) {
@@ -230,19 +246,28 @@ function loadConfigForExtensionInit(): WebSearchConfig {
 	}
 }
 
-function normalizeProviderInput(value: unknown): SearchProvider | undefined {
+function normalizeProviderInput(value: unknown, label = "provider"): SearchProviderSelection | undefined {
 	if (value === undefined) return undefined;
-	if (typeof value !== "string") return "auto";
-	const normalized = value.trim().toLowerCase();
-	const valid: SearchProvider[] = ["auto", "all", "openai", "brave", "parallel", "tinyfish", "tavily", "searxng", "exa", "perplexity", "gemini", "serpdive", "anysearch"];
-	return valid.includes(normalized as SearchProvider) ? normalized as SearchProvider : "auto";
+	return normalizeSearchProviderSelection(value, label);
 }
 
-function resolveRequestedProvider(requested: unknown): SearchProvider {
+function resolveRequestedProvider(requested: unknown): SearchProviderSelection {
 	const normalizedRequested = normalizeProviderInput(requested);
 	if (normalizedRequested && normalizedRequested !== "auto") return normalizedRequested;
 	const config = loadConfig();
-	return normalizeProviderInput(config.searchProvider ?? config.provider) ?? "auto";
+	return normalizeProviderInput(config.searchProvider ?? config.provider, `provider in ${WEB_SEARCH_CONFIG_PATH}`) ?? "auto";
+}
+
+function toCuratorProvider(provider: SearchProviderSelection): CuratorProvider | undefined {
+	if (Array.isArray(provider)) return "all";
+	return provider === "auto" ? undefined : provider;
+}
+
+function resolveCuratorSearchProvider(requested: unknown, current: SearchProviderSelection): SearchProviderSelection {
+	const normalized = normalizeProviderInput(requested);
+	if (!normalized || normalized === "auto") return current;
+	if (normalized === "all" && Array.isArray(current)) return current;
+	return normalized;
 }
 
 function normalizeRecencyFilter(value: unknown): RecencyFilter | undefined {
@@ -278,7 +303,16 @@ function normalizeQueryList(queryList: unknown[]): string[] {
 
 function getCuratorTimeoutSeconds(): number {
 	const source = loadConfig();
-	return normalizeCuratorTimeoutSeconds(source.curatorTimeoutSeconds) ?? DEFAULT_CURATOR_TIMEOUT_SECONDS;
+	const explicit = normalizeCuratorTimeoutSeconds(source.curatorTimeoutSeconds);
+	if (explicit !== undefined) return explicit;
+	// Remote users must notice and click a printed link, so allow more idle time.
+	return resolveCuratorNetworkConfig().enabled ? DEFAULT_REMOTE_CURATOR_TIMEOUT_SECONDS : DEFAULT_CURATOR_TIMEOUT_SECONDS;
+}
+
+function shouldAutoOpenCuratorBrowser(config: WebSearchConfig): boolean {
+	if (config.autoOpenBrowser === false) return false;
+	if (resolveCuratorNetworkConfig().enabled && config.autoOpenBrowser !== true) return false;
+	return true;
 }
 
 async function getProviderAvailability(ctx: ExtensionContext): Promise<ProviderAvailability> {
@@ -289,6 +323,9 @@ async function getProviderAvailability(ctx: ExtensionContext): Promise<ProviderA
 		brave: isBraveAvailable(),
 		parallel: isParallelAvailable(),
 		tinyfish: isTinyFishAvailable(),
+		search1api: isSearch1APIAvailable(),
+		searchinfinity: isSearchinfinityAvailable(),
+		querit: isQueritAvailable(),
 		tavily: isTavilyAvailable(),
 		serpdive: isSerpdiveAvailable(),
 		searxng: isSearXNGAvailable(),
@@ -317,10 +354,12 @@ async function loadCuratorBootstrap(
 	ctx: ExtensionContext,
 	options?: Pick<PendingCurate, "numResults" | "recencyFilter">,
 ): Promise<CuratorBootstrap> {
+	const provider = resolveRequestedProvider(requestedProvider);
 	const availableProviders = await getProviderAvailability(ctx);
+	if (Array.isArray(provider)) availableProviders.all = true;
 	return {
 		availableProviders,
-		defaultProvider: resolveProvider(requestedProvider, availableProviders, options),
+		defaultProvider: resolveProvider(provider, availableProviders, options),
 		timeoutSeconds: getCuratorTimeoutSeconds(),
 	};
 }
@@ -332,6 +371,9 @@ function firstAvailableProvider(available: ProviderAvailability, preferOpenAI: b
 	if (available.brave) return "brave";
 	if (available.parallel) return "parallel";
 	if (available.tinyfish) return "tinyfish";
+	if (available.search1api) return "search1api";
+	if (available.searchinfinity) return "searchinfinity";
+	if (available.querit) return "querit";
 	if (available.tavily) return "tavily";
 	if (available.serpdive) return "serpdive";
 	if (available.perplexity) return "perplexity";
@@ -340,11 +382,11 @@ function firstAvailableProvider(available: ProviderAvailability, preferOpenAI: b
 }
 
 function resolveProvider(
-	requested: unknown,
+	provider: SearchProviderSelection,
 	available: ProviderAvailability,
 	options?: Pick<PendingCurate, "numResults" | "recencyFilter">,
 ): CuratorProvider {
-	const provider = resolveRequestedProvider(requested);
+	if (Array.isArray(provider)) return "all";
 	const preferOpenAI = shouldPreferOpenAI(options);
 
 	if (provider === "auto") {
@@ -371,6 +413,15 @@ function resolveProvider(
 	}
 	if (provider === "tinyfish" && !available.tinyfish) {
 		return firstAvailableProvider(available, preferOpenAI, "tinyfish");
+	}
+	if (provider === "search1api" && !available.search1api) {
+		return firstAvailableProvider(available, preferOpenAI, "search1api");
+	}
+	if (provider === "searchinfinity" && !available.searchinfinity) {
+		return firstAvailableProvider(available, preferOpenAI, "searchinfinity");
+	}
+	if (provider === "querit" && !available.querit) {
+		return firstAvailableProvider(available, preferOpenAI, "querit");
 	}
 	if (provider === "tavily" && !available.tavily) {
 		return firstAvailableProvider(available, preferOpenAI, "tavily");
@@ -415,7 +466,7 @@ interface PendingCurate {
 	domainFilter?: string[];
 	availableProviders: ProviderAvailability;
 	defaultProvider: CuratorProvider;
-	searchProvider: SearchProvider;
+	searchProvider: SearchProviderSelection;
 	summaryModels: Array<{ value: string; label: string }>;
 	defaultSummaryModel: string | null;
 	timeoutSeconds: number;
@@ -900,7 +951,7 @@ export default function (pi: ExtensionAPI) {
 	async function rewriteSearchQuery(query: string, ctx: SummaryGenerationContext, signal: AbortSignal): Promise<string> {
 		const { model, apiKey, headers } = await resolveFirstAvailableModel(ctx, [
 			{ provider: "anthropic", id: "claude-haiku-4-5" },
-			{ provider: "google", id: "gemini-2.5-flash" },
+			{ provider: "google", id: "gemini-3.6-flash" },
 			{ provider: "openai", id: "gpt-4.1-mini" },
 		]);
 		const response = await complete(
@@ -1186,7 +1237,7 @@ export default function (pi: ExtensionAPI) {
 					timeout: pc.timeoutSeconds,
 					availableProviders: pc.availableProviders,
 					defaultProvider: pc.defaultProvider,
-					searchProvider: pc.searchProvider,
+					searchProvider: toCuratorProvider(pc.searchProvider) ?? "auto",
 					summaryModels: pc.summaryModels,
 					defaultSummaryModel: pc.defaultSummaryModel,
 				},
@@ -1272,7 +1323,7 @@ export default function (pi: ExtensionAPI) {
 					onProviderChange(provider) {
 						if (pendingCurates.get(callId) !== pc) return;
 						const normalized = normalizeProviderInput(provider);
-						if (!normalized || normalized === "auto") return;
+						if (!normalized || normalized === "auto" || Array.isArray(normalized)) return;
 						pc.defaultProvider = normalized;
 						pc.searchProvider = normalized;
 						try {
@@ -1284,10 +1335,7 @@ export default function (pi: ExtensionAPI) {
 					},
 					async onAddSearch(query, provider) {
 						if (pendingCurates.get(callId) !== pc) throw new Error("Curator session is no longer active.");
-						const normalizedProvider = normalizeProviderInput(provider);
-						const requestedProvider = !normalizedProvider || normalizedProvider === "auto"
-							? pc.searchProvider
-							: normalizedProvider;
+						const requestedProvider = resolveCuratorSearchProvider(provider, pc.searchProvider);
 						const response = await search(query, {
 							provider: requestedProvider,
 							numResults: pc.numResults,
@@ -1348,6 +1396,11 @@ export default function (pi: ExtensionAPI) {
 					shortcut: curateKey,
 				},
 			});
+
+			if (!shouldAutoOpenCuratorBrowser(loadConfig())) {
+				sendCuratorFallbackUpdate("Search curator is running. Open the curator URL manually.");
+				return;
+			}
 
 			const open = platform() === "darwin" ? await getGlimpseOpen() : null;
 			if (open) {
@@ -1430,7 +1483,7 @@ export default function (pi: ExtensionAPI) {
 		name: toolNames.webSearch,
 		label: "Web Search",
 		description:
-			`Search the web using OpenAI, Brave, Parallel, TinyFish, Tavily, SearXNG, Exa, Perplexity, Gemini, or AnySearch. Use provider "all" to search every eligible provider except AnySearch simultaneously and combine their responses. Returns an AI-synthesized answer with source citations. OpenAI search uses a Codex subscription or OpenAI API key. AnySearch is available only when explicitly selected. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. The configured provider is used when provider is omitted or set to auto; omit provider unless explicitly overriding it. Without a configured provider, auto-selects OpenAI when suitable and available, then Exa, Brave, Parallel, TinyFish, Tavily, Perplexity, Gemini API, or Gemini Web. When SearXNG is configured, it is preferred first for local/private search.`,
+			`Search the web using OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, SERPdive, SearXNG, Exa, Perplexity, Gemini, or AnySearch. Pass a provider array to search only those providers simultaneously, or use provider "all" to search every eligible provider except AnySearch. Returns an AI-synthesized answer with source citations. OpenAI search uses a Codex subscription or OpenAI API key. AnySearch is available only when explicitly selected. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. The configured provider is used when provider is omitted or set to auto; omit provider unless explicitly overriding it. Without a configured provider, auto-selects OpenAI when suitable and available, then Exa, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, SERPdive, Perplexity, Gemini API, or Gemini Web. When SearXNG is configured, it is preferred first for local/private search.`,
 		promptSnippet:
 			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage. Omit provider unless explicitly overriding the configured default.",
 		parameters: Type.Object({
@@ -1442,9 +1495,7 @@ export default function (pi: ExtensionAPI) {
 				StringEnum(["day", "week", "month", "year"], { description: "Filter by recency" }),
 			),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
-			provider: Type.Optional(
-				StringEnum(["auto", "all", "openai", "brave", "parallel", "tinyfish", "tavily", "searxng", "exa", "perplexity", "gemini", "serpdive", "anysearch"], { description: "Search provider; use all to search every eligible provider except AnySearch simultaneously, omit this field (preferred) to use the configured provider, or use auto when none is configured" }),
-			),
+			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; use all to search every eligible provider except AnySearch, omit this field to use the configured provider, or use auto when none is configured")),
 			workflow: Type.Optional(
 				StringEnum(["none", "summary-review", "auto-summary"], {
 					description: "Search workflow mode: none = no curator, summary-review = open curator with auto summary draft (default), auto-summary = generate summary without opening curator",
@@ -1612,11 +1663,12 @@ export default function (pi: ExtensionAPI) {
 					} catch (err) {
 						if (signal?.aborted || cancelled || searchAbort.signal.aborted) break;
 						const message = err instanceof Error ? err.message : String(err);
-						searchResults.set(qi, { query: queryList[qi], answer: "", results: [], error: message, provider: requestedProvider });
+						const failedProvider = toCuratorProvider(requestedProvider);
+						searchResults.set(qi, { query: queryList[qi], answer: "", results: [], error: message, provider: failedProvider });
 						resultSlots.set(qi, qi);
 						const curator = activeCurators.get(callId);
 						if (curator) {
-							curator.pushError(qi, message, requestedProvider, { query: queryList[qi], slotIndex: qi });
+							curator.pushError(qi, message, failedProvider, { query: queryList[qi], slotIndex: qi });
 						}
 					}
 				}
@@ -1693,9 +1745,7 @@ export default function (pi: ExtensionAPI) {
 				} catch (err) {
 					if (signal?.aborted || isAbortError(err)) throw err;
 					const message = err instanceof Error ? err.message : String(err);
-					const requestedProvider = typeof resolvedProvider === "string" && resolvedProvider !== "auto"
-						? resolvedProvider
-						: undefined;
+					const requestedProvider = toCuratorProvider(resolvedProvider);
 					searchResults.push({ query, answer: "", results: [], error: message, provider: requestedProvider });
 				}
 			}
@@ -2005,7 +2055,7 @@ export default function (pi: ExtensionAPI) {
 			fetchContent: Type.Optional(Type.Boolean({ description: "Fetch up to 5 result pages for exact passage extraction." })),
 			recencyFilter: Type.Optional(StringEnum(["day", "week", "month", "year"], { description: "Filter by recency." })),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains; prefix with - to exclude." })),
-			provider: Type.Optional(StringEnum(["auto", "all", "openai", "brave", "parallel", "tinyfish", "tavily", "searxng", "exa", "perplexity", "gemini", "serpdive", "anysearch"], { description: "Search provider; all searches every eligible provider except AnySearch simultaneously." })),
+			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; all searches every eligible provider except AnySearch")),
 		}),
 		async execute(_callId, params, signal, _onUpdate, ctx) {
 			const claim = typeof params.claim === "string" ? params.claim.trim() : "";
@@ -2056,15 +2106,12 @@ export default function (pi: ExtensionAPI) {
 			let fetched: ExtractedContent[] = [];
 			if (params.fetchContent && results.length > 0) {
 				const urls = results.slice(0, 5).map((result) => result.url);
-				fetched = (await Promise.all(urls.map(async (url) => {
-					try {
-						const [page] = await fetchAllContent([url], signal);
-						return page;
-					} catch (err) {
-						if (signal?.aborted || isAbortError(err)) throw err;
-						return { url, title: "", content: "", error: err instanceof Error ? err.message : String(err) };
-					}
-				}))).filter((page): page is ExtractedContent => Boolean(page));
+				try {
+					fetched = await fetchAllContent(urls, signal);
+				} catch (err) {
+					if (signal?.aborted || isAbortError(err)) throw err;
+					fetched = urls.map((url) => ({ url, title: "", content: "", error: err instanceof Error ? err.message : String(err) }));
+				}
 			}
 			const artifact = withClaimAssessment(buildResearchArtifact({
 				query: claim,
@@ -2114,7 +2161,7 @@ export default function (pi: ExtensionAPI) {
 				description: "Number of frames to extract. Use with timestamp range for custom density, with single timestamp to get N frames at 5s intervals, or alone to sample across the entire video. Requires yt-dlp + ffmpeg for YouTube, ffmpeg for local video.",
 			})),
 			model: Type.Optional(Type.String({
-				description: "Override the Gemini model for video/YouTube analysis (e.g. 'gemini-2.5-flash', 'gemini-3-flash-preview'). Defaults to config or gemini-3-flash-preview.",
+				description: "Override the Gemini model for video/YouTube analysis (e.g. 'gemini-3.6-flash'). Defaults to config or gemini-3.6-flash.",
 			})),
 		}),
 
@@ -2615,8 +2662,14 @@ export default function (pi: ExtensionAPI) {
 			const initialProvider = bootstrap.defaultProvider;
 			const curatorTimeoutSeconds = bootstrap.timeoutSeconds;
 			let currentProvider: CuratorProvider = initialProvider;
-			const rawSearchProvider = normalizeProviderInput(loadConfig().provider ?? "auto") ?? "auto";
-			let currentSearchProvider: SearchProvider = rawSearchProvider === "auto" ? "auto" : initialProvider;
+			const commandConfig = loadConfig();
+			const rawSearchProvider = normalizeProviderInput(
+				commandConfig.searchProvider ?? commandConfig.provider ?? "auto",
+				`provider in ${WEB_SEARCH_CONFIG_PATH}`,
+			) ?? "auto";
+			let currentSearchProvider: SearchProviderSelection = Array.isArray(rawSearchProvider)
+				? rawSearchProvider
+				: rawSearchProvider === "auto" ? "auto" : initialProvider;
 			const summaryContext: SummaryGenerationContext = {
 				model: ctx.model,
 				modelRegistry: ctx.modelRegistry,
@@ -2650,7 +2703,7 @@ export default function (pi: ExtensionAPI) {
 						timeout: curatorTimeoutSeconds,
 						availableProviders,
 						defaultProvider: initialProvider,
-						searchProvider: currentSearchProvider,
+						searchProvider: toCuratorProvider(currentSearchProvider) ?? "auto",
 						summaryModels: summaryModelChoices.summaryModels,
 						defaultSummaryModel: summaryModelChoices.defaultSummaryModel,
 					},
@@ -2716,7 +2769,7 @@ export default function (pi: ExtensionAPI) {
 						onProviderChange(provider) {
 							if (commandHandle && !isCommandActive()) return;
 							const normalized = normalizeProviderInput(provider);
-							if (!normalized || normalized === "auto") return;
+							if (!normalized || normalized === "auto" || Array.isArray(normalized)) return;
 							currentProvider = normalized;
 							currentSearchProvider = normalized;
 							try {
@@ -2730,10 +2783,7 @@ export default function (pi: ExtensionAPI) {
 							if (commandHandle && !isCommandActive()) {
 								throw new Error("Curator session is no longer active.");
 							}
-							const normalizedProvider = normalizeProviderInput(provider);
-							const requestedProvider = !normalizedProvider || normalizedProvider === "auto"
-								? currentSearchProvider
-								: normalizedProvider;
+							const requestedProvider = resolveCuratorSearchProvider(provider, currentSearchProvider);
 							const response = await search(query, {
 								provider: requestedProvider,
 								signal: searchAbort.signal,
@@ -2761,38 +2811,42 @@ export default function (pi: ExtensionAPI) {
 
 				commandHandle = handle;
 				activeCurators.set(commandCallId, handle);
-				const open = platform() === "darwin" ? await getGlimpseOpen() : null;
 				let browserOpenError: string | null = null;
-				if (open) {
-					try {
-						const win = openInGlimpse(open, handle.url, "Search Curator");
-						glimpseWins.set(commandCallId, win);
-						win.on("closed", () => {
-							if (glimpseWins.get(commandCallId) === win) {
-								glimpseWins.delete(commandCallId);
-								closeCurator(commandCallId);
+				if (!shouldAutoOpenCuratorBrowser(loadConfig())) {
+					ctx.ui.notify(`Search curator is running. Open manually: ${handle.url}`, "info");
+				} else {
+					const open = platform() === "darwin" ? await getGlimpseOpen() : null;
+					if (open) {
+						try {
+							const win = openInGlimpse(open, handle.url, "Search Curator");
+							glimpseWins.set(commandCallId, win);
+							win.on("closed", () => {
+								if (glimpseWins.get(commandCallId) === win) {
+									glimpseWins.delete(commandCallId);
+									closeCurator(commandCallId);
+								}
+							});
+						} catch (err) {
+							const message = err instanceof Error ? err.message : String(err);
+							console.error(`Failed to open Glimpse curator window: ${message}`);
+							glimpseWins.delete(commandCallId);
+							try {
+								await openInBrowser(pi, handle.url);
+							} catch (browserErr) {
+								browserOpenError = browserErr instanceof Error ? browserErr.message : String(browserErr);
 							}
-						});
-					} catch (err) {
-						const message = err instanceof Error ? err.message : String(err);
-						console.error(`Failed to open Glimpse curator window: ${message}`);
-						glimpseWins.delete(commandCallId);
+						}
+					} else {
 						try {
 							await openInBrowser(pi, handle.url);
 						} catch (browserErr) {
 							browserOpenError = browserErr instanceof Error ? browserErr.message : String(browserErr);
 						}
 					}
-				} else {
-					try {
-						await openInBrowser(pi, handle.url);
-					} catch (browserErr) {
-						browserOpenError = browserErr instanceof Error ? browserErr.message : String(browserErr);
+					if (browserOpenError) {
+						console.error(`Failed to open curator UI: ${browserOpenError}`);
+						ctx.ui.notify(`Search curator is running, but the browser did not open automatically. Open manually: ${handle.url}`, "info");
 					}
-				}
-				if (browserOpenError) {
-					console.error(`Failed to open curator UI: ${browserOpenError}`);
-					ctx.ui.notify(`Search curator is running, but the browser did not open automatically. Open manually: ${handle.url}`, "info");
 				}
 
 				if (queries.length > 0) {
@@ -2827,8 +2881,9 @@ export default function (pi: ExtensionAPI) {
 							} catch (err) {
 								if (aborted || !isCommandActive()) break;
 								const message = err instanceof Error ? err.message : String(err);
-								handle.pushError(qi, message, requestedProvider, { query: queries[qi], slotIndex: qi });
-								collected.set(qi, { query: queries[qi], answer: "", results: [], error: message, provider: requestedProvider });
+								const failedProvider = toCuratorProvider(requestedProvider);
+								handle.pushError(qi, message, failedProvider, { query: queries[qi], slotIndex: qi });
+								collected.set(qi, { query: queries[qi], answer: "", results: [], error: message, provider: failedProvider });
 							}
 						}
 						if (!aborted && isCommandActive()) handle.searchesDone();
