@@ -13,12 +13,11 @@ import {
 import { readNormFile } from "./file-reader";
 import { normReq, normalizeFilePath, tryParseContentLines } from "./replace-normalize";
 import { isRec, has, rejectUnknownFields, abortIf } from "./utils";
-import { MAX_HASH_LINES } from "./constants";
 import { resolveTarget, writeAtomic } from "./fs-write";
-import {
-  applyEdits,
+import { applyEdits,
   lineHashes,
   resEdits,
+  MAX_HASH_LINES,
   type HTEdit,
 } from "./hashline";
 import { toCwd } from "./paths";
@@ -68,7 +67,7 @@ const changeItemSchema = Type.Object(
 
 export const editToolSchema = Type.Object(
   {
-    changes: Type.Array(changeItemSchema, { description: "Array of edits. Each edit pairs content_lines (literal file content, one string per line) with hash_range_inclusive (inclusive [start_hash, end_hash] — pair of 3-char hashes from read output)." }),
+    changes: Type.Array(changeItemSchema, { description: "Array of edits applied atomically against the same pre-edit snapshot." }),
     path: Type.String({ description: "Path to edit" }),
   },
   { additionalProperties: false },
@@ -117,6 +116,19 @@ interface PipelineResult {
 
 const ROOT_KS = new Set(["path", "changes", "content_lines", "hash_range_inclusive"]);
 
+const LEGACY_KS = ["oldText", "newText", "old_text", "new_text", "old_range", "start", "end", "lines"];
+
+export function assertNoLegacyKeys(request: unknown): void {
+  if (!isRec(request)) return;
+  for (const legacyKey of LEGACY_KS) {
+    if (has(request, legacyKey)) {
+      throw new Error(
+        `[E_LEGACY_SHAPE] "${legacyKey}" is not supported. Use {content_lines: [...], hash_range_inclusive: ["<START>", "<END>"]}.`
+      );
+    }
+  }
+}
+
 export function assertReq(
   request: unknown,
   flat?: boolean
@@ -125,13 +137,7 @@ export function assertReq(
     throw new Error("[E_BAD_SHAPE] Edit request must be an object.");
   }
 
-  for (const legacyKey of ["oldText", "newText", "old_text", "new_text", "old_range", "start", "end", "lines"]) {
-    if (has(request, legacyKey)) {
-      throw new Error(
-        `[E_LEGACY_SHAPE] "${legacyKey}" is not supported. Use {content_lines: [...], hash_range_inclusive: ["<START>", "<END>"]}.`
-      );
-    }
-  }
+  assertNoLegacyKeys(request);
 
   rejectUnknownFields(request, ROOT_KS, "Edit request");
 
@@ -159,9 +165,11 @@ export interface ExecPipelineOptions {
 function collectRemovedHashes(
   resolved: { hash_range_inclusive: [{ hash: string }, { hash: string }] }[],
   originalHashes: string[],
+  skipIndices?: Set<number>,
 ): Set<string> {
   const removedHashes = new Set<string>();
-  for (const edit of resolved) {
+  for (const [index, edit] of resolved.entries()) {
+    if (skipIndices?.has(index)) continue;
     const startHash = edit.hash_range_inclusive[0].hash;
     const endHash = edit.hash_range_inclusive[1].hash;
     const startLine = originalHashes.indexOf(startHash);
@@ -227,16 +235,20 @@ export async function execPipeline(
   );
 
   const result = anchorResult.content;
-
-  const removedHashes = collectRemovedHashes(resolved, originalHashes);
+  const isNoop = result === originalNormalized;
 
   const noPersist = options?.noPersist;
-  const resultHashes = await lineHashes(result, absolutePath, {
-    content: originalNormalized,
-    hashes: originalHashes,
-    removedHashes,
-  }, hashStore, noPersist !== true);
-
+  const noopIndices = new Set(anchorResult.noopEdits?.map((n) => n.editIndex) ?? []);
+  const removedHashes = isNoop
+    ? undefined
+    : collectRemovedHashes(resolved, originalHashes, noopIndices);
+  const resultHashes = isNoop
+    ? originalHashes
+    : await lineHashes(result, absolutePath, {
+        content: originalNormalized,
+        hashes: originalHashes,
+        removedHashes,
+      }, hashStore, noPersist !== true);
   const warnings = [...(anchorResult.warnings ?? [])];
 
   const { totalAddedLines, totalRemovedLines } = countLineChanges(
@@ -269,6 +281,11 @@ export async function compPreview(
 ): Promise<RPreview> {
   try {
     const normalized = normReq(request);
+    if (flat && isRec(request) && Array.isArray(request.changes)) {
+      return {
+        error: `[E_BAD_SHAPE] Flat mode does not accept a "changes" array. Send content_lines and hash_range_inclusive at the top level (one edit per call), or use bulk mode for multiple edits per call.`
+      };
+    }
     assertReq(normalized, flat);
     const { path, originalNormalized, originalHashes, result, resultHashes } = await execPipeline(
       normalized,
@@ -312,25 +329,9 @@ export function reuseMarkdown(context: any, content: string, theme: any): Markdo
 
 const MODE_CFG = {
   flat: {
-    desc: " Only one edit per call. The `hash_range_inclusive` and `content_lines` fields sit at the top level of the request object.",
-    examples: [
-      "", "Single line:", "{ \"content_lines\": [\"const x = 1;\"], \"hash_range_inclusive\": [\"MQX\", \"MQX\"], \"path\": \"src/main.ts\" }", "", "Range replace:", "{ \"content_lines\": [\"function greet() {\", \"  return 1;\", \"}\"], \"hash_range_inclusive\": [\"ZPM\", \"VRW\"], \"path\": \"src/main.ts\" }",
-    ].join("\n"),
-    rules: "",
-    requestStructure: [
-      "Flat mode:", "```json", "{ \"content_lines\": [...], \"hash_range_inclusive\": [\"aB3\", \"xY7\"], \"path\": \"...\" }", "```",
-    ].join("\n"),
     prefix: "performing one edit per call",
   },
   bulk: {
-    desc: "\n\nPut all operations on one file in a single `replace` call. Stack every region into the `changes` array, even when they are far apart. Anchors within one call must all come from the same pre-edit read; the runtime applies them atomically against that one snapshot.",
-    examples: [
-      "", "Single line:", "{ \"changes\": [{ \"content_lines\": [\"const x = 1;\"], \"hash_range_inclusive\": [\"MQX\", \"MQX\"] }], \"path\": \"src/main.ts\" }", "", "Range replace:", "{ \"changes\": [{ \"content_lines\": [\"function greet() {\", \"  return 1;\", \"}\"], \"hash_range_inclusive\": [\"ZPM\", \"VRW\"] }], \"path\": \"src/main.ts\" }",
-    ].join("\n"),
-    rules: "- Multiple edits in one call must not overlap. Overlapping ranges are rejected with [E_EDIT_CONFLICT].",
-    requestStructure: [
-      "Bulk mode (default):", "```json", "{ \"changes\": [{ \"content_lines\": [...], \"hash_range_inclusive\": [\"aB3\", \"xY7\"] }], \"path\": \"...\" }", "```",
-    ].join("\n"),
     prefix: "batching all changes to a file in one call",
   },
 } as const;
@@ -355,6 +356,7 @@ export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolD
     promptGuidelines: E_GUIDE,
     prepareArguments: opts.flat
       ? (args: unknown) => {
+          assertNoLegacyKeys(args);
           if (!isRec(args)) return args as any;
           const record = { ...args };
           normalizeFilePath(record);
@@ -363,8 +365,10 @@ export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolD
           }
           return record;
         }
-      : (args: unknown) =>
-          normReq(args) as ReqParams,
+      : (args: unknown) => {
+          assertNoLegacyKeys(args);
+          return normReq(args) as ReqParams;
+        },
     renderShell: "default",
     renderCall(args, theme, context) {
       const previewInput = getPreviewInput(args);

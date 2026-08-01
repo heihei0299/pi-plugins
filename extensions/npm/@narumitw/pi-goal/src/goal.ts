@@ -7,7 +7,7 @@ import { showGoalManager } from "./menu.js";
 import { type ActiveGoal, loadGoalStateFromSession } from "./persistence.js";
 import { buildGoalPrompt, buildGoalSystemPrompt } from "./prompts.js";
 import { activateQueuedGoal } from "./queue.js";
-import { GoalRpcController } from "./rpc.js";
+import { GoalRunController } from "./run-protocol.js";
 import {
 	type AssistantMessageLike,
 	abortCurrentTurn,
@@ -66,8 +66,8 @@ const MAX_BLOCKER_EVIDENCE_LENGTH = 4_000;
 function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 	const runtime = new GoalRuntime(pi);
 	const commands = new GoalCommandController(runtime);
-	const rpc = new GoalRpcController(runtime, commands);
-	rpc.register(pi);
+	const runController = new GoalRunController(runtime, commands);
+	runController.register(pi);
 
 	// Bind per-factory runtime operations once so event orchestration stays concise
 	// without reintroducing module-global mutable state.
@@ -487,7 +487,6 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 		runtime.queueFrozen = false;
 		runtime.queueFreezeAwaitingSettle = false;
 		runtime.clearTerminalDetails();
-		rpc.bindSession(ctx);
 		const previousToolVisibility = runtime.settings.toolVisibility;
 		const settingsResult = readGoalSettings(options.settingsPath);
 		runtime.settings =
@@ -527,6 +526,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 		runtime.queuedGoals = loaded.queue;
 		runtime.pendingQueueAction = loaded.pendingAction;
 		runtime.queueFrozen = loaded.hasExperimentalQueueState && !runtime.settings.experimental.goals;
+		runController.bindSession(ctx);
 		if (runtime.queueFrozen) {
 			if (runtime.activeGoal) persistGoal(runtime.activeGoal);
 			ctx.ui.setStatus(STATUS_KEY, "queue off");
@@ -592,6 +592,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		runController.unbindSession();
 		runtime.closeMenuSession();
 		if (runtime.activeGoal) {
 			if (!runtime.queueFrozen && runtime.activeGoal.status === "active") {
@@ -614,7 +615,6 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		clearCompletionStatusTimer();
 		runtime.clearTerminalDetails();
-		rpc.unbindSession();
 	});
 
 	pi.on("session_before_compact", (event, ctx) => {

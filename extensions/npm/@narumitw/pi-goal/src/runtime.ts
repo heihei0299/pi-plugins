@@ -85,40 +85,32 @@ export const GOAL_COMPLETE_TOOL = "goal_complete";
 export const GOAL_BLOCKED_TOOL = "goal_blocked";
 export const GOAL_TOOL_NAMES = [GOAL_COMPLETE_TOOL, GOAL_BLOCKED_TOOL] as const;
 
-/** Cross-extension event channel carrying the canonical persisted goal state. */
-export const GOAL_STATE_EVENT_CHANNEL = "pi-goal:state";
+/** Canonical Goal state passed to the in-process managed-run publisher. */
+export type GoalStateSnapshotStatus = GoalStatus | "cleared";
 
-/** State values broadcast to cross-extension listeners. */
-export type GoalStateEventStatus = GoalStatus | "cleared";
-
-/** Payload emitted on {@link GOAL_STATE_EVENT_CHANNEL} whenever goal state persists. */
-export interface GoalStateEventPayload {
+export interface GoalStateSnapshot {
 	goalId: string;
-	status: GoalStateEventStatus;
+	status: GoalStateSnapshotStatus;
 	summary?: string;
 	reason?: string;
 }
 
-/** Terminal statuses broadcast to cross-extension listeners. */
-export function isTerminalGoalStatus(status: GoalStateEventStatus): boolean {
+/** Terminal statuses for Goal persistence and managed-run lifecycle publication. */
+export function isTerminalGoalStatus(status: GoalStateSnapshotStatus): boolean {
 	return status !== "active" && status !== "queued";
 }
 
-/**
- * Build the cross-extension state payload from the canonical goal plus the most
- * recent completion summary or blocked/failure reason, without re-deriving state.
- */
-export function buildGoalStateEvent(
+function buildGoalStateSnapshot(
 	goal: ActiveGoal,
 	summary: string | undefined,
 	reason: string | undefined,
-): GoalStateEventPayload {
-	const payload: GoalStateEventPayload = { goalId: goal.id, status: goal.status };
-	if (goal.status === "complete" && summary) payload.summary = summary;
+): GoalStateSnapshot {
+	const snapshot: GoalStateSnapshot = { goalId: goal.id, status: goal.status };
+	if (goal.status === "complete" && summary) snapshot.summary = summary;
 	else if (goal.status !== "complete" && isTerminalGoalStatus(goal.status) && reason) {
-		payload.reason = reason;
+		snapshot.reason = reason;
 	}
-	return payload;
+	return snapshot;
 }
 
 interface GoalTerminalDetails {
@@ -176,8 +168,9 @@ export class GoalRuntime {
 	settings: GoalSettings = DEFAULT_GOAL_SETTINGS;
 	settingsLoadIssue?: GoalSettingsLoadIssue;
 	activeGoal?: ActiveGoal;
-	/** Terminal details captured for the matching cross-extension state event. */
+	/** Terminal details captured for the matching persisted-state snapshot. */
 	private terminalDetails?: GoalTerminalDetails;
+	private goalStateSink?: (snapshot: GoalStateSnapshot) => void;
 	queuedGoals: ActiveGoal[] = [];
 	pendingQueueAction?: PendingQueueAction;
 	queueFrozen = false;
@@ -209,6 +202,18 @@ export class GoalRuntime {
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
+	}
+
+	setGoalStateSink(sink: ((snapshot: GoalStateSnapshot) => void) | undefined) {
+		this.goalStateSink = sink;
+	}
+
+	private publishGoalState(snapshot: GoalStateSnapshot) {
+		try {
+			this.goalStateSink?.(snapshot);
+		} catch {
+			// Protocol publication must not interrupt canonical Goal persistence.
+		}
 	}
 
 	replaceMenuSession() {
@@ -611,11 +616,15 @@ export class GoalRuntime {
 		goalId: string,
 		prompt: string,
 		resetSafetyEpoch = true,
+		isCurrent?: () => boolean,
 	) {
 		const pending = this.rememberPendingGoalPrompt(goalId, prompt, resetSafetyEpoch);
-		const sent = await sendPrompt(this.pi, ctx, pending.prompt);
-		if (!sent) this.pendingGoalPromptMarkers.delete(pending.marker);
-		return sent;
+		const sent = await sendPrompt(this.pi, ctx, pending.prompt, isCurrent);
+		if (!sent || (isCurrent && !isCurrent())) {
+			this.pendingGoalPromptMarkers.delete(pending.marker);
+			return false;
+		}
+		return true;
 	}
 
 	cancelContinuationWork() {
@@ -746,20 +755,19 @@ export class GoalRuntime {
 			GOAL_STATE_ENTRY_TYPE,
 			serializeGoalState(goal, this.queuedGoals, this.pendingQueueAction),
 		);
-		this.pi.events.emit(
-			GOAL_STATE_EVENT_CHANNEL,
-			buildGoalStateEvent(goal, this.terminalDetails?.summary, this.terminalDetails?.reason),
+		this.publishGoalState(
+			buildGoalStateSnapshot(goal, this.terminalDetails?.summary, this.terminalDetails?.reason),
 		);
 	}
 
 	clearPersistedGoal(cwd: string, clearedGoal?: ActiveGoal, reason = "goal cleared") {
 		this.pi.appendEntry(GOAL_STATE_ENTRY_TYPE, serializeGoalState(undefined, [], undefined));
 		if (clearedGoal) {
-			this.pi.events.emit(GOAL_STATE_EVENT_CHANNEL, {
+			this.publishGoalState({
 				goalId: clearedGoal.id,
 				status: "cleared",
 				reason,
-			} satisfies GoalStateEventPayload);
+			});
 		}
 		this.clearTerminalDetails();
 		clearLegacyPersistedGoal(cwd);
@@ -1166,12 +1174,19 @@ function inputFingerprint(prompt: string) {
 	return createHash("sha256").update(prompt, "utf8").digest("hex");
 }
 
-async function sendPrompt(pi: ExtensionAPI, ctx: StatusContext, prompt: string) {
+async function sendPrompt(
+	pi: ExtensionAPI,
+	ctx: StatusContext,
+	prompt: string,
+	isCurrent?: () => boolean,
+) {
 	try {
 		await pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 		return true;
 	} catch (error) {
-		ctx.ui.notify(`Goal prompt failed: ${formatError(error)}`, "error");
+		if (!isCurrent || isCurrent()) {
+			ctx.ui.notify(`Goal prompt failed: ${formatError(error)}`, "error");
+		}
 		return false;
 	}
 }

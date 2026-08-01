@@ -106,6 +106,7 @@ export interface StatefulSubagentRuntimeStatus {
 export interface StatefulSubagentController {
 	getCompletionDelivery(): CompletionDelivery;
 	setCompletionDelivery(value: CompletionDelivery): void;
+	setAgentCatalog(value: string): void;
 	getRuntimeStatus(): StatefulSubagentRuntimeStatus;
 	listAgents(includeClosed?: boolean): ManagedAgent[];
 	clearAgents(): Promise<number>;
@@ -127,6 +128,7 @@ export function registerStatefulSubagents(
 	const enabled = settings.enabled !== false;
 	const transportKind = resolveStatefulTransportKind(settings.transport);
 	let completionDelivery = resolveCompletionDelivery(settings.completionDelivery);
+	let agentCatalog = "";
 	let completionBroker: CompletionDeliveryBroker | undefined;
 	let refreshSpawnToolRegistration: (() => void) | undefined;
 	let registry: AgentRegistry | undefined;
@@ -159,6 +161,10 @@ export function registerStatefulSubagents(
 		setCompletionDelivery(value) {
 			completionDelivery = value;
 			completionBroker?.setDelivery(value);
+			refreshSpawnToolRegistration?.();
+		},
+		setAgentCatalog(value) {
+			agentCatalog = value;
 			refreshSpawnToolRegistration?.();
 		},
 		getRuntimeStatus() {
@@ -315,11 +321,12 @@ export function registerStatefulSubagents(
 		}
 	});
 
+	const baseSpawnDescription =
+		"Start an addressable background subagent with an optional thinking level chosen for the task difficulty, return immediately with an agentId, and receive its completion asynchronously.";
 	const spawnTool = defineTool({
 		name: "subagent_spawn",
 		label: "Spawn Subagent",
-		description:
-			"Start an addressable background subagent with an optional thinking level chosen for the task difficulty, return immediately with an agentId, and receive its completion asynchronously.",
+		description: appendAgentCatalog(baseSpawnDescription, agentCatalog),
 		promptSnippet: "Start a reusable detached subagent; completion is delivered asynchronously",
 		promptGuidelines: createSpawnPromptGuidelines(completionDelivery, blockingEnabled),
 		parameters: Type.Object({
@@ -399,6 +406,7 @@ export function registerStatefulSubagents(
 		},
 	});
 	refreshSpawnToolRegistration = () => {
+		spawnTool.description = appendAgentCatalog(baseSpawnDescription, agentCatalog);
 		spawnTool.promptGuidelines = createSpawnPromptGuidelines(completionDelivery, blockingEnabled);
 		pi.registerTool(spawnTool);
 	};
@@ -915,6 +923,10 @@ async function cleanupClosedWorkspaces(
 		await workspaceManager.cleanup(owner);
 		isolatedAgents.delete(agentId);
 	}
+}
+
+function appendAgentCatalog(baseDescription: string, catalog: string): string {
+	return catalog ? `${baseDescription}\n\n${catalog}` : baseDescription;
 }
 
 function result(agent: ManagedAgent, text: string) {

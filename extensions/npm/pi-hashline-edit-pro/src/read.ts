@@ -2,15 +2,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	createReadTool,
 	formatSize,
-	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
 	truncateHead,
 	type TruncationResult,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadFileKindAndText } from "./file-kind";
 import { readNormFile } from "./file-reader";
-import { lineHashes, fmtRegion, HASH_SEP } from "./hashline";
+import { lineHashes, fmtRegion, HASH_SEP, MAX_HASH_LINES } from "./hashline";
 import { toCwd } from "./paths";
 import { abortIf } from "./utils";
 import { fileSnap } from "./file-reader";
@@ -18,10 +16,7 @@ import { visLines } from "./utils";
 import { loadP, loadGuide } from "./prompts";
 import { valAccess } from "./validation";
 
-const R_DESC = loadP("../prompts/read.md", {
-	DEFAULT_MAX_LINES: String(DEFAULT_MAX_LINES),
-	DEFAULT_MAX_BYTES: formatSize(DEFAULT_MAX_BYTES),
-});
+const R_DESC = loadP("../prompts/read.md");
 
 const R_SNIPPET = loadP("../prompts/read-snippet.md");
 const R_GUIDE = loadGuide("../prompts/read-guidelines.md");
@@ -164,7 +159,7 @@ export function regRead(pi: ExtensionAPI): void {
 				return executeBuiltinRead(_toolCallId, params, signal, _onUpdate, ctx);
 			}
       const { normalized, fileHashes, hadUtf8DecodeErrors } = await readNormFile(
-        rawPath, ctx.cwd, { signal, preloadedFile: file },
+        rawPath, ctx.cwd, { signal, preloadedFile: file, maxLines: MAX_HASH_LINES },
       );
 			const preview = await fmtReadPreview(
 				normalized,

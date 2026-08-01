@@ -57,6 +57,10 @@ type AuthDiscovery = {
   scope?: string
 }
 
+function applyConfiguredScope(discovery: AuthDiscovery, config: McpOAuthConfig): AuthDiscovery {
+  return config.scope !== undefined ? { ...discovery, scope: config.scope } : discovery
+}
+
 type PendingAuth = {
   serverName: string
   authProvider: McpOAuthProvider
@@ -161,6 +165,18 @@ export function extractOAuthConfig(definition: ServerEntry): McpOAuthConfig {
   if (definition.oauth?.scope !== undefined) {
     if (typeof definition.oauth.scope !== "string") throw new Error("OAuth scope must be a string")
     config.scope = interpolateEnvVars(definition.oauth.scope)
+  }
+  if (definition.oauth?.authorizationParams !== undefined) {
+    const params = definition.oauth.authorizationParams
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      throw new Error("OAuth authorizationParams must be an object")
+    }
+    config.authorizationParams = {}
+    for (const [key, value] of Object.entries(params)) {
+      if (!key) throw new Error("OAuth authorizationParams keys must not be empty")
+      if (typeof value !== "string") throw new Error(`OAuth authorizationParams.${key} must be a string`)
+      config.authorizationParams[key] = interpolateEnvVars(value)
+    }
   }
   if (definition.oauth?.redirectUri !== undefined) {
     if (typeof definition.oauth.redirectUri !== "string") {
@@ -304,7 +320,7 @@ export async function startAuth(
       },
     }, authStorageOptions, runtime.signal)
     try {
-      const discovery = await probeAuthDiscovery(serverUrl, definition, signal)
+      const discovery = applyConfiguredScope(await probeAuthDiscovery(serverUrl, definition, signal), config)
       throwIfAborted(signal)
       const result = await abortable(runSdkAuth(authProvider, { serverUrl, ...discovery }), signal)
       throwIfAborted(signal)
@@ -370,7 +386,7 @@ export async function startAuth(
 
     throwIfAborted(signal)
 
-    const discovery = await probeAuthDiscovery(serverUrl, definition, signal)
+    const discovery = applyConfiguredScope(await probeAuthDiscovery(serverUrl, definition, signal), config)
     throwIfAborted(signal)
     const result = await abortable(runSdkAuth(authProvider, { serverUrl, ...discovery }), signal)
     throwIfAborted(signal)

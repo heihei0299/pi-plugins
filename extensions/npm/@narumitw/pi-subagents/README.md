@@ -58,6 +58,12 @@ The available tools are:
 - `subagent` — delegate blocking single, parallel, fan-in, or chained batch work. The main agent cannot process queued steering until the call returns.
 - `subagent_spawn` and related lifecycle tools — when enabled, start reusable detached work, return immediately, and receive bounded completion messages automatically.
 
+After each session starts, both delegation tools include a bounded parent-facing catalog of the agents
+available in that session. Entries show the source (`built-in`, `user`, or `project`) and the
+`agentScope` needed to invoke them; the `agent` parameters remain unconstrained strings for cwd and
+scope flexibility. The catalog is rebuilt on `/reload` or the next session start, and omitted entries
+are reported explicitly when the catalog exceeds its metadata bounds.
+
 Choose the API by lifecycle:
 
 | Need | Use |
@@ -88,6 +94,17 @@ For `subagent_spawn`, the root agent selects the lowest thinking level sufficien
 When registered, the blocking `subagent` tool advertises only blocking guidance. When stateful lifecycle tools
 are registered, `subagent_spawn` adds detached guidance for the active completion-delivery policy.
 Changing the policy through `/subagents settings` refreshes that guidance immediately.
+
+The same descriptions also advertise the current agent catalog automatically; no preliminary list call is
+needed. Built-ins and user agents appear under the default `agentScope: "user"`. Trusted project
+agents appear separately and explicitly require `agentScope: "project"` or `"both"`; project-authored
+names and descriptions are not read into metadata for untrusted projects. If a project definition
+shares a name with a user or built-in definition, the user version is the default and the project
+version is used only for `"project"`/`"both"`. A user override of a built-in also shows the
+built-in fallback available with `agentScope: "project"`; `"both"` keeps the user definition. The
+catalog is bounded and reports its omission count; metadata discovery also caps files and bytes read
+per scope. Refreshed metadata replaces the previous session's catalog rather than accumulating stale
+entries.
 
 Count-selection guidance:
 
@@ -429,8 +446,10 @@ test coverage, and migration risks. Report PASS/FAIL/PARTIAL with evidence.
 ```
 
 `agentScope` is a top-level tool argument supplied per invocation. It is not a setting in
-`~/.pi/agent/pi-subagents.json` and does not belong in agent frontmatter. The scope selects which
-custom agent directories are loaded; built-in agents remain available in every scope:
+`~/.pi/agent/pi-subagents.json` and does not belong in agent frontmatter. The parent-facing tool
+metadata discovers these definitions after session start and labels their source and required scope.
+Edit agent files and run `/reload` (or start a new session) to refresh the catalog; there is no live
+filesystem watcher. The scope selects which custom agent directories are loaded; built-in agents remain available in every scope:
 
 | `agentScope` | Custom agents loaded |
 | --- | --- |

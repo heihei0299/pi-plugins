@@ -12,7 +12,8 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { discoverAgentCatalog, formatAgentCatalog } from "./agents.js";
 import { registerSubagentConfigCommand } from "./config-ui.js";
 import { executeSubagent } from "./execution.js";
 import { SubagentParams } from "./params.js";
@@ -23,43 +24,53 @@ import { registerStatefulSubagents } from "./stateful.js";
 
 export default function (pi: ExtensionAPI) {
 	const settings = readSubagentSettings();
-	if (settings?.blocking?.enabled !== false) registerBlockingSubagent(pi);
+	const blockingEnabled = settings?.blocking?.enabled !== false;
+	const refreshBlockingCatalog = blockingEnabled ? registerBlockingSubagent(pi) : () => undefined;
+	let refreshStatefulCatalog: (catalog: string) => void = () => undefined;
 
 	pi.on("session_start", (_event, ctx) => {
 		// Preserve a one-shot migration notice from extension load while refreshing
 		// validation against settings that may have changed before this session.
 		const loadNotice = consumeSubagentSettingsNotice();
-		readSubagentSettings();
+		const refreshedSettings = readSubagentSettings();
 		const refreshedNotice = consumeSubagentSettingsNotice();
 		const notice = [
 			...new Set([loadNotice, refreshedNotice].filter((value) => value !== undefined)),
 		].join("\n");
 		if (notice) ctx.ui.notify(notice, "warning");
+
+		const catalog = formatAgentCatalog(
+			discoverAgentCatalog(ctx.cwd, ctx.isProjectTrusted(), refreshedSettings),
+		).text;
+		refreshBlockingCatalog(catalog);
+		refreshStatefulCatalog(catalog);
 	});
 
-	const blockingEnabled = settings?.blocking?.enabled !== false;
 	const statefulRuntime = registerStatefulSubagents(pi, {
 		blockingEnabled,
 		settings: settings?.stateful,
 	});
+	refreshStatefulCatalog = statefulRuntime.setAgentCatalog;
 	registerSubagentConfigCommand(pi, {
 		...statefulRuntime,
 		getBlockingEnabled: () => blockingEnabled,
 	});
 }
 
-function registerBlockingSubagent(pi: ExtensionAPI) {
-	pi.registerTool<typeof SubagentParams, SubagentDetails>({
+function registerBlockingSubagent(pi: ExtensionAPI): (catalog: string) => void {
+	let catalog = "";
+	const baseDescription = [
+		"Run specialized subagents as a blocking operation with isolated contexts.",
+		"The call blocks the main agent until every worker and optional aggregator finishes, so queued steering waits.",
+		"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+		"Parallel mode may include an aggregator fan-in step that receives all task outputs.",
+		'Default agent scope is "user" (from ~/.pi/agent/agents).',
+		'To enable project-local agents in .pi/agents, pass agentScope: "both" (or "project") as a top-level argument for that call.',
+	].join(" ");
+	const definition: ToolDefinition<typeof SubagentParams, SubagentDetails> = {
 		name: "subagent",
 		label: "Blocking Subagent",
-		description: [
-			"Run specialized subagents as a blocking operation with isolated contexts.",
-			"The call blocks the main agent until every worker and optional aggregator finishes, so queued steering waits.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			"Parallel mode may include an aggregator fan-in step that receives all task outputs.",
-			'Default agent scope is "user" (from ~/.pi/agent/agents).',
-			'To enable project-local agents in .pi/agents, pass agentScope: "both" (or "project") as a top-level argument for that call.',
-		].join(" "),
+		description: appendAgentCatalog(baseDescription, catalog),
 		promptSnippet:
 			"Run blocking isolated subagents only when their outputs are required before the main agent can continue.",
 		promptGuidelines: [
@@ -85,13 +96,22 @@ function registerBlockingSubagent(pi: ExtensionAPI) {
 		renderResult(result, options, theme) {
 			return renderSubagentResult(result, options, theme);
 		},
-	});
-
+	};
+	pi.registerTool<typeof SubagentParams, SubagentDetails>(definition);
 	pi.on("tool_result", (event) => {
 		if (event.toolName !== "subagent") return;
 		if ((event.details as (SubagentDetails & { isError?: boolean }) | undefined)?.isError)
 			return { isError: true };
 	});
+	return (nextCatalog: string) => {
+		catalog = nextCatalog;
+		definition.description = appendAgentCatalog(baseDescription, catalog);
+		pi.registerTool<typeof SubagentParams, SubagentDetails>(definition);
+	};
+}
+
+function appendAgentCatalog(baseDescription: string, catalog: string): string {
+	return catalog ? `${baseDescription}\n\n${catalog}` : baseDescription;
 }
 
 export { parsePositiveInteger } from "./execution.js";

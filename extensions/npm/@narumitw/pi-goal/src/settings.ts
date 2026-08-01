@@ -14,6 +14,9 @@ export interface GoalSettings {
 	experimental: {
 		goals: boolean;
 	};
+	rpc: {
+		enabled: boolean;
+	};
 	continuationLimits: {
 		automaticTurns: ContinuationLimit;
 		noProgressTurns: ContinuationLimit;
@@ -23,6 +26,7 @@ export interface GoalSettings {
 export const DEFAULT_GOAL_SETTINGS: GoalSettings = {
 	toolVisibility: "always",
 	experimental: { goals: false },
+	rpc: { enabled: false },
 	continuationLimits: { automaticTurns: null, noProgressTurns: 3 },
 };
 
@@ -64,6 +68,19 @@ export function normalizeGoalSettings(value: unknown): GoalSettings | undefined 
 			: DEFAULT_GOAL_SETTINGS.experimental.goals;
 	if (typeof goals !== "boolean") return undefined;
 
+	const rpcValue = Object.hasOwn(value, "rpc") ? Reflect.get(value, "rpc") : undefined;
+	if (
+		rpcValue !== undefined &&
+		(typeof rpcValue !== "object" || rpcValue === null || Array.isArray(rpcValue))
+	) {
+		return undefined;
+	}
+	const rpcEnabled =
+		rpcValue && Object.hasOwn(rpcValue, "enabled")
+			? Reflect.get(rpcValue, "enabled")
+			: DEFAULT_GOAL_SETTINGS.rpc.enabled;
+	if (typeof rpcEnabled !== "boolean") return undefined;
+
 	const continuationLimitsValue = Object.hasOwn(value, "continuationLimits")
 		? Reflect.get(value, "continuationLimits")
 		: undefined;
@@ -92,6 +109,7 @@ export function normalizeGoalSettings(value: unknown): GoalSettings | undefined 
 	return {
 		toolVisibility: toolVisibility as GoalToolVisibility,
 		experimental: { goals },
+		rpc: { enabled: rpcEnabled },
 		continuationLimits: { automaticTurns, noProgressTurns },
 	};
 }
@@ -128,12 +146,14 @@ export function saveGoalSettings(
 	}
 
 	const experimental = ownRecord(raw.experimental) ?? {};
+	const rpc = ownRecord(raw.rpc) ?? {};
 	const continuationLimits = ownRecord(raw.continuationLimits) ?? {};
 	const document = `${JSON.stringify(
 		{
 			...raw,
 			toolVisibility: normalized.toolVisibility,
 			experimental: { ...experimental, goals: normalized.experimental.goals },
+			rpc: { ...rpc, enabled: normalized.rpc.enabled },
 			continuationLimits: {
 				...continuationLimits,
 				automaticTurns: normalized.continuationLimits.automaticTurns,

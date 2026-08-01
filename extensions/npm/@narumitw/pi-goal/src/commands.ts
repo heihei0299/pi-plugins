@@ -45,6 +45,7 @@ export class GoalCommandController {
 		tokenBudget: number | undefined,
 		ctx: StatusContext,
 		onActivated?: (goal: ActiveGoal) => void,
+		isActivationCurrent?: (goal: ActiveGoal) => boolean,
 	) {
 		const validationError = validateObjective(objective);
 		if (validationError) {
@@ -108,12 +109,21 @@ export class GoalCommandController {
 		const startedGoal = this.runtime.activeGoal;
 		onActivated?.(startedGoal);
 		this.runtime.persistGoal(startedGoal);
+		if (
+			this.runtime.activeGoal?.id !== startedGoal.id ||
+			this.runtime.activeGoal.status !== "active"
+		) {
+			return;
+		}
 		this.runtime.updateStatus(ctx, startedGoal);
 		const sent = await this.runtime.sendOwnedGoalPrompt(
 			ctx,
 			startedGoal.id,
 			buildGoalPrompt(startedGoal),
+			true,
+			() => isActivationCurrent?.(startedGoal) ?? true,
 		);
+		if (isActivationCurrent && !isActivationCurrent(startedGoal)) return;
 		if (!sent) {
 			let rolledBackStartedGoal = false;
 			if (this.runtime.activeGoal?.id === startedGoal.id) {
@@ -142,6 +152,12 @@ export class GoalCommandController {
 			if (rolledBackStartedGoal) {
 				this.runtime.restoreGoalToolVisibility(goalToolVisibilityBeforeActivation);
 			}
+			return;
+		}
+		if (
+			this.runtime.activeGoal?.id !== startedGoal.id ||
+			this.runtime.activeGoal.status !== "active"
+		) {
 			return;
 		}
 		ctx.ui.notify(

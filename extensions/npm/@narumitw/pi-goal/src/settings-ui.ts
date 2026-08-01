@@ -42,7 +42,8 @@ export async function showGoalSettings(
 		| "choose-automatic"
 		| "choose-no-progress"
 		| "set-visibility"
-		| "set-queue";
+		| "set-queue"
+		| "set-rpc";
 	const menu = defineMenu<undefined, Screen, Action, ExtensionCommandContext>({
 		start: invalid ? "invalid" : "settings",
 		screens: {
@@ -85,6 +86,15 @@ export async function showGoalSettings(
 						values: ["Off", "Experimental"],
 						action: "set-queue",
 					},
+					{
+						id: "rpcEnabled",
+						label: "Managed run RPC",
+						description:
+							"Allow trusted installed extensions to start and cancel Goal runs; this is not an extension sandbox.",
+						currentValue: runtime.settings.rpc.enabled ? "On" : "Off",
+						values: ["Off", "On"],
+						action: "set-rpc",
+					},
 				],
 			}),
 			automatic: () => limitChoiceScreen(runtime, "automaticTurns", "choose-automatic"),
@@ -98,6 +108,7 @@ export async function showGoalSettings(
 					`No-progress guard: ${formatNoProgressProtection(runtime.settings.continuationLimits.noProgressTurns)}`,
 					`Goal tools: ${visibilityLabel(runtime.settings.toolVisibility)}`,
 					`Ordered goal queue: ${runtime.settings.experimental.goals ? "Experimental" : "Off"}`,
+					`Managed run RPC: ${runtime.settings.rpc.enabled ? "On" : "Off"}`,
 				],
 				hint: "back",
 			}),
@@ -170,6 +181,24 @@ export async function showGoalSettings(
 						}
 					}
 					ctx.ui.notify(`Ordered goal queue: ${enabled ? "Experimental" : "Off"}.`, "info");
+					return { kind: "stay" };
+				} catch (error) {
+					notifySettingsFailure(ctx, settingsPath, error);
+					return { kind: "rejected" };
+				}
+			},
+			"set-rpc": async ({ value }) => {
+				const enabled = value === "On";
+				if (enabled === runtime.settings.rpc.enabled) return { kind: "stay" };
+				try {
+					const next = {
+						...structuredClone(runtime.settings),
+						rpc: { enabled },
+					} satisfies GoalSettings;
+					applyGoalSettings(runtime, next, ctx, {
+						save: (settings) => (options.save ?? saveGoalSettings)(settings, settingsPath),
+					});
+					ctx.ui.notify(`Managed run RPC: ${enabled ? "On" : "Off"}.`, "info");
 					return { kind: "stay" };
 				} catch (error) {
 					notifySettingsFailure(ctx, settingsPath, error);

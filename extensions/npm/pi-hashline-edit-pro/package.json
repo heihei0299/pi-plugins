@@ -1,6 +1,6 @@
 {
   "name": "pi-hashline-edit-pro",
-  "version": "0.18.1",
+  "version": "0.18.4",
   "type": "module",
   "description": "Strict hashline read/replace tool for pi-coding-agent with hash-anchored edits (3-char, 18-bit, perfect hashing)",
   "main": "index.ts",
@@ -39,6 +39,9 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.74.0",
     "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=22.13.0"
   },
   "scripts": {
     "test": "vitest run",

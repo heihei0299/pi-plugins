@@ -1,10 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { initHasher } from "./src/hashline";
 import { regReplace, regReplaceFlat } from "./src/replace";
-import { regReplaceUndo } from "./src/replace-undo";
+import { regReplaceUndo, clearUndo } from "./src/replace-undo";
 import { regRead, fmtReadPreview } from "./src/read";
 import { visLines } from "./src/utils";
 import { AUTO_READ_MAX } from "./src/constants";
+import { MAX_HASH_LINES } from "./src/hashline";
 import {
   readConfig,
   toggleReplaceMode,
@@ -12,7 +13,8 @@ import {
 } from "./src/config";
 import { loadHashStore, pruneMissing } from "./src/hash-store";
 import { readNormFile } from "./src/file-reader";
-
+import { toCwd } from "./src/paths";
+import { resolveTarget } from "./src/fs-write";
 function registerReplaceTool(pi: ExtensionAPI, mode: string, autoRead?: boolean): void {
   if (mode === "flat") {
     regReplaceFlat(pi, autoRead);
@@ -73,16 +75,27 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("tool_result", async (event, ctx) => {
-    if (!autoRead) return;
     if (event.isError) return;
+    if (event.toolName === "write") {
+      const writtenPath = (event.input as Record<string, unknown>)?.path;
+      if (typeof writtenPath === "string") {
+        try {
+          clearUndo(await resolveTarget(toCwd(writtenPath, ctx.cwd)));
+        } catch (error) {
+          console.error("Failed to clear undo after write:", error);
+        }
+      }
+    }
+    if (!autoRead) return;
     if (event.toolName !== "write" && event.toolName !== "replace") return;
 
     const filePath = (event.input as Record<string, unknown>)?.path;
     if (typeof filePath !== "string") return;
 
     try {
-      const { normalized, fileHashes, absolutePath } = await readNormFile(filePath, ctx.cwd);
-
+      const { normalized, fileHashes, absolutePath } = await readNormFile(
+        filePath, ctx.cwd, { maxLines: MAX_HASH_LINES },
+      );
       if (visLines(normalized).length === 0) return;
 
       const preview = await fmtReadPreview(normalized, { limit: AUTO_READ_MAX }, fileHashes, absolutePath);

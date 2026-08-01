@@ -33,6 +33,7 @@ Goal mode uses Codex-like persistence instructions and sends guarded continuatio
 - Rotates the completion guard id when a goal is resumed or edited so delayed old turns cannot complete the newer goal instance.
 - Blocks stale tool calls after in-flight work pauses, blocks, or reaches a usage limit, until fresh non-goal user work, successful reactivation/replacement, or clear.
 - Applies one evidence-based completion audit across kickoff, resume, edit, system, continuation, and budget-wrap-up prompts.
+- Optionally exposes a default-off, run-scoped `pi.events` protocol for trusted sibling extensions to start, observe, and cancel one Goal lifecycle without emulating `/goal` input.
 
 ## 📦 Install
 
@@ -65,6 +66,9 @@ built-in defaults without creating the file:
   "experimental": {
     "goals": false
   },
+  "rpc": {
+    "enabled": false
+  },
   "continuationLimits": {
     "automaticTurns": null,
     "noProgressTurns": 3
@@ -73,13 +77,14 @@ built-in defaults without creating the file:
 ```
 
 Use `/goal` → **Settings…** in the TUI to create or update the file interactively, or create
-and edit it directly. The standard Settings screen keeps all four controls on one level in task
+and edit it directly. The standard Settings screen keeps all five controls on one level in task
 order; the two safety limits open standard choice screens:
 
 - **Automatic work** shows **Unlimited** or an exact **≤_N_** response cap. Choose **Unlimited** directly, or choose **Set a maximum…** and enter a safe whole number greater than zero.
 - **No-progress guard** shows **_N_ runs** or **Off**. Choose the default threshold, **Off**, or **Set threshold…** and enter a safe whole number greater than zero.
 - **Goal tools** controls whether terminal Goal tools are always visible or appear after the first goal.
 - **Ordered goal queue** controls the experimental ordered-goal workflows.
+- **Managed run RPC** controls whether trusted installed extensions may start and cancel managed Goal runs. It defaults to **Off** and is a cooperation setting, not an extension security sandbox.
 
 Custom number inputs reject zero, negative numbers, decimals, text, and unsafe integers without saving; use the explicit **Unlimited** or **Off** choice instead. Interactive changes are serialized, written atomically, preserve unknown fields, and apply to the current runtime. A successful change updates the visible state immediately. A failed save restores the prior value and reports the settings path so it can be retried. Tool-visibility changes that would alter the active tool schema are rejected while Pi is busy; retry after Pi settles. Escape returns to the previous screen without reverting changes that were already saved.
 
@@ -89,6 +94,8 @@ Custom number inputs reject zero, negative numbers, decimals, text, and unsafe i
 - `"after-first-goal"` — hides both tools at fresh runtime startup, reveals them for the first accepted Goal activation, and treats an unfinished-goal restore as unlocked for the remainder of that extension runtime. On restore, pi-goal uses the active tools already established by earlier lifecycle handlers; it does not re-add missing terminal tools over a restrictive policy. Failed kickoff, replacement, resume, or reactivating-edit delivery restores the exact pre-activation tool set, including terminal tools exposed by another extension. If revealing the tools would widen an already-running turn, wait for Pi to become idle and retry `/goal`.
 
 `experimental.goals` accepts a boolean and defaults to `false`. Set it to `true` to enable the ordered-goal subcommands and automatic queue advancement described below. Enabled sessions show one warning because command behavior and persisted queue state remain experimental.
+
+`rpc.enabled` accepts a boolean and defaults to `false`. When disabled, a valid managed-run start receives `RPC_DISABLED`; manual and restored Goals remain unchanged. A Settings-menu change applies immediately after its atomic save. Disabling rejects new starts but lets an already accepted run continue publishing its exact state and accept its exact cancellation until terminal, avoiding stranded work. Reload, replacement, and shutdown clear that in-memory ownership.
 
 `continuationLimits` controls the runaway guards:
 
@@ -205,37 +212,75 @@ Do not use `goal_blocked` merely because work is difficult, incomplete, uncertai
 
 A user pause or aborted turn produces `paused`; a terminal provider/account quota error produces `usage_limited`; another non-retryable agent error produces `blocked`. Each stopped transition cancels pending continuation intent or delivery, aborts stale work when applicable, and blocks stale tool calls until the next non-goal user prompt, successful reactivation/replacement, or `/goal clear`. On `/goal clear`, the extension clears goal state, continuation markers, and any stale tool-call block without aborting an unrelated in-flight turn. Retryable provider interruptions and overflow compaction retries stay `active` while Pi retries; no extra continuation is queued, and automatic ownership remains charged through retry `agent_start` events. If matching recovery still exists at `agent_settled`, retries are exhausted and the goal becomes `blocked` before any pending queue transition dispatches. Stale recovery cannot block a replacement goal. User and extension work that starts before settlement supersedes the older continuation intent, and pending messages always take priority.
 
-## 🤝 Cross-extension RPC and events
+## 🤝 Managed run RPC
 
-pi-goal exposes a session-local, dependency-free integration contract over Pi's shared `pi.events` bus so sibling extensions (such as `@tintinweb/pi-subagents`) can start, pause, and observe goals programmatically without driving the `/goal` slash command. The contract is bound only while a Pi session is active: it is established on `session_start` and the captured session context is unbound on `session_shutdown`. All channels are plain JSON-shaped payloads; this extension never adds a runtime dependency for them.
+With `rpc.enabled: true`, pi-goal exposes a session-local, dependency-free protocol over Pi's shared `pi.events` bus. It is intended for trusted sibling extensions that need to start, observe, and cancel one Goal lifecycle without driving the `/goal` command. Installed Pi extensions remain fully privileged: this setting controls only whether pi-goal cooperates with these channels and is not authentication or sandboxing.
 
-### Starting a goal: `pi-goal:rpc:start`
+The public channels are:
 
-Emit `pi-goal:rpc:start` with `{ requestId: string, objective: string, tokenBudget?: number }`. `tokenBudget` is an absolute positive integer token count (for example `100000`), not a `k`/`m` string. The request reuses the same `startGoal()` transition as the slash command, so it never implements goal transitions twice.
-
-pi-goal replies on `pi-goal:rpc:start:reply:${requestId}` with one of:
-
-```jsonc
-// success
-{ "success": true, "data": { "goalId": "<uuid>", "status": "active" } }
-// failure (validation, no session, pre-existing goal, or failed activation)
-{ "success": false, "error": "<human-readable reason>" }
+```text
+pi-goal:start
+pi-goal:cancel
+pi-goal:event:${runId}
 ```
 
-Behavior notes:
+The protocol intentionally has no separate version field or versioned channel namespace. Before starting, the caller must generate a session-unique `runId`, subscribe to its event channel, and then emit:
 
-- Malformed payloads (missing/empty/non-string `objective`, or a non-positive-integer `tokenBudget`) fail fast with a descriptive `error`.
-- If no session context is bound (before `session_start` or after `session_shutdown`), the reply is a failure rather than starting a goal.
-- RPC starts run in a fresh child context, so a **pre-existing goal fails** instead of prompting, replacing, or reusing stale state. Clear the existing goal first.
-- The reply `status` is read from the authoritative goal state, so an immediate terminal outcome during start is represented rather than assumed to be `active`.
+```ts
+pi.events.emit("pi-goal:start", {
+  runId: "consumer-generated-run-id",
+  objective: "Ship and verify the feature",
+  tokenBudget: 100000, // optional positive integer
+});
+```
 
-### Pausing a goal: `pi-goal:rpc:pause`
+`runId` must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; UUIDs are recommended. It is a correlation identifier, not a secret or authenticated caller identity. The objective uses the same 4,000-character validation as `/goal`, and `tokenBudget` is an absolute positive integer rather than a `k`/`m` string.
 
-Emit `pi-goal:rpc:pause` with `{ goalId?: string, requestId?: string, reason?: string }` to stop an active RPC-owned goal safely. After a successful start reply, pass its `goalId`. To cancel while the start reply is still pending, omit `goalId` and pass the originating start `requestId`. Uncorrelated requests, stale request IDs, mismatched goal IDs, and goals not created through RPC are ignored. A successful pause uses the normal Goal pause transition and emits the authoritative `pi-goal:state` event described below.
+A successful start produces canonical state on `pi-goal:event:${runId}`:
 
-### Observing goal state: `pi-goal:state`
+```json
+{
+  "type": "state",
+  "runId": "consumer-generated-run-id",
+  "goalId": "<pi-goal-instance-id>",
+  "status": "active"
+}
+```
 
-Whenever pi-goal persists canonical goal state, it emits `pi-goal:state` with `{ goalId, status, summary?, reason? }`. `goalId` and `status` are always authoritative. Terminal statuses are `complete`, `blocked`, `paused`, `usage_limited`, `budget_limited`, and `cleared`. Explicit clears and failed activation rollbacks emit `cleared` for the removed goal so observers cannot retain stale active state. `summary` is populated from the matching `goal_complete` summary when available, and `reason` is populated from the same goal instance's blocked/usage/budget/clear state where available; an `active` or `queued` event carries only `goalId` and `status`. Listeners must treat any non-terminal status as in-progress and should key follow-up behavior on `goalId` plus a terminal `status`.
+Subsequent state events use `active`, `complete`, `blocked`, `paused`, `usage_limited`, `budget_limited`, or `cleared`. `complete` is the only successful terminal outcome. A matching completion may include `summary`; other terminal outcomes may include `reason`. Events come only from canonical Goal persistence and only for the matching managed run. Manual and restored Goals are not adopted or broadcast, unchanged persistence does not duplicate a status, and each run emits at most one terminal event.
+
+Terminal events are dispatched after the underlying Goal transition settles, so a listener can start the next managed run directly after `complete` without re-entering completion cleanup. Other terminal statuses leave a stopped Goal that must be resolved or cleared first. If a manual edit, replacement, skip, or priority transition rotates the Goal id, the prior managed run ends as `cleared` with a superseded reason; the replacement remains outside that run.
+
+To cancel before or after activation, emit the same `runId`:
+
+```ts
+pi.events.emit("pi-goal:cancel", {
+  runId: "consumer-generated-run-id",
+  reason: "Parent work was cancelled", // optional, at most 1,000 characters
+});
+```
+
+Cancellation uses the normal Goal pause transition. It cannot affect a manual, restored, stale, or different run. The resulting `paused` state is the cancellation result; there is no separate reply envelope. A caller must not reopen a terminal `runId`, and a later manual `/goal resume` is outside that completed managed run.
+
+Rejected operations emit a structured error on the same run event channel:
+
+```json
+{
+  "type": "error",
+  "runId": "consumer-generated-run-id",
+  "operation": "start",
+  "error": {
+    "code": "RPC_DISABLED",
+    "message": "Managed run RPC is disabled."
+  }
+}
+```
+
+Stable codes are `RPC_DISABLED`, `INVALID_REQUEST`, `NO_ACTIVE_SESSION`, `RUN_ID_IN_USE`, `RUN_NOT_FOUND`, `GOAL_ALREADY_EXISTS`, `ACTIVATION_FAILED`, and `SUPERSEDED`. Consumers branch on `code`; `message` is diagnostic. An unsafe or missing `runId` is ignored because there is no safe response channel.
+
+Start never prompts for replacement: any pre-existing Goal is rejected. The protocol binds only after current settings and restored Goal state load, and unbinds before session shutdown. A caller must not assume that `emit()` waits for Goal completion; it should wait for a terminal run event and participate in its own session-shutdown cleanup.
+
+This breaking contract replaces and removes `pi-goal:rpc:start`, `pi-goal:rpc:pause`, request-scoped start replies, and the global `pi-goal:state` broadcast. No compatibility aliases are registered.
 
 ## 🧠 Use cases
 
@@ -257,7 +302,7 @@ extensions/pi-goal/
 │   ├── safety.ts     # Output normalization and no-progress fingerprint state
 │   ├── errors.ts     # Pi-aligned provider error and retry classification
 │   ├── markers.ts    # Bounded Goal prompt marker parsing and formatting
-│   ├── rpc.ts        # Session-local cross-extension request ownership and replies
+│   ├── run-protocol.ts # Default-off managed-run protocol and session ownership
 │   ├── queue.ts      # Pure ordered-goal transitions
 │   └── *.ts          # Package-local parsing, settings, prompts, accounting, and persistence
 ├── README.md

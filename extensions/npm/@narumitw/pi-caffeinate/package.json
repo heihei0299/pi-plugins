@@ -1,6 +1,6 @@
 {
 	"name": "@narumitw/pi-caffeinate",
-	"version": "0.39.0",
+	"version": "0.41.0",
 	"description": "Pi extension that keeps the computer awake while the agent is running.",
 	"type": "module",
 	"license": "MIT",
@@ -40,6 +40,6 @@
 		"directory": "extensions/pi-caffeinate"
 	},
 	"dependencies": {
-		"@narumitw/pi-tui-kit": "<1"
+		"@narumitw/pi-tui-kit": "^0.40.0"
 	}
 }
