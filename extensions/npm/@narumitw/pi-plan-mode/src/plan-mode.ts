@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { showActiveImplementationMenu } from "./active-implementation-menu.js";
 import { completePlanArguments } from "./command.js";
 import {
@@ -16,21 +19,21 @@ import {
 	setPlanThinkingLevel,
 } from "./extension-runtime.js";
 import {
-	injectActiveImplementationContext,
-	invalidPlanMessage,
-	isEmptyAssistantMessage,
-	latestAssistantText,
-	messageContainsInactivePlanModeArtifact,
-	messageContainsLegacyPlanModeContextArtifact,
-	messageContainsPlanModeImplementationContextArtifact,
-	messageContainsPlanModeImplementationHandoff,
-	parseProposedPlan,
-	stripPlanModeCompletionCallsFromMessage,
-	stripProposedPlanBlocksFromMessage,
-} from "./message-transform.js";
+	formatImplementationHandoff,
+	startFreshImplementationFromState,
+} from "./fresh-implementation.js";
+import {
+	createImplementationRetentionCoordinator,
+	implementationRetentionPreview,
+} from "./implementation-retention.js";
+import { invalidPlanMessage, latestAssistantText, parseProposedPlan } from "./message-transform.js";
+import { createPlanActionController } from "./plan-action-controller.js";
+import { createPlanExportController } from "./plan-export-controller.js";
+import { showPlanLaunchMenu } from "./plan-launch-menu.js";
 import {
 	clearPlanModeUi,
 	planModeStatusText as formatPlanModeStatusText,
+	showStoredPlan,
 	updatePlanModeUi,
 } from "./presentation.js";
 import { buildPlanModePrompt } from "./prompt.js";
@@ -43,46 +46,86 @@ import {
 } from "./question-tool.js";
 import { withoutRequiredPlanModeTools, withRequiredPlanModeTools } from "./required-tools.js";
 import {
+	preflightSavedPlanImplementation,
+	savedPlanBlocksNewWorkflow,
+} from "./saved-plan-preflight.js";
+import {
+	awaitPlanModeSettingsWrites,
+	configuredImplementationPlanRetention,
 	configuredThinkingLevel,
 	type PlanModeSettings,
 	readPlanModeSettings,
 } from "./settings.js";
+import { showPlanModeSettings } from "./settings-menu.js";
 import { type PlanCompletionSource, type PlanModeState, restorePlanModeState } from "./state.js";
-import { enforcePlanSubagentAllowlist } from "./subagent-policy.js";
 import {
 	canSelectToolInPlanMode,
 	classifyPlanModeTool,
-	isBuiltinTool,
-	isSafeCommand,
+	findBlockedCommandSegment,
 	readCommand,
-	SAFE_BUILTIN_PLAN_TOOLS,
 } from "./tool-policy.js";
-import { compareTools, toolNameFromLegacyKey, toolPolicyLabel, unique } from "./tool-selection.js";
+import {
+	compareTools,
+	filterAvailableSelectedToolNames,
+	snapshotPlanModeSelectedNames,
+	snapshotPlanModeToolNames,
+	toolPolicyLabel,
+} from "./tool-selection.js";
 
 const STATE_ENTRY_TYPE = "plan-mode-state";
 const PROPOSED_PLAN_MESSAGE_TYPE = "proposed-plan";
 const BLOCKED_BUILTIN_TOOLS = new Set(["edit", "write"]);
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
-const TOOL_SELECTOR_VIEWPORT_SIZE = 10;
-
 interface ReadyPresentationIntent {
 	nonce: number;
 	plan: string;
 	source: PlanCompletionSource;
 }
-
-export default function planMode(
-	pi: ExtensionAPI,
-	dependencies: { readSettings?(): ReturnType<typeof readPlanModeSettings> } = {},
-) {
+interface PlanModeDependencies {
+	readSettings?(): ReturnType<typeof readPlanModeSettings>;
+	settingsPath?: string;
+}
+export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDependencies = {}) {
 	let state: PlanModeState = { enabled: false, awaitingAction: false };
 	let settings: PlanModeSettings = { thinkingLevel: "inherit" };
 	let previousTools: string[] | undefined;
 	let readyPresentationIntent: ReadyPresentationIntent | undefined;
+	let latestCommandContext: ExtensionCommandContext | undefined;
 	let nextReadyPresentationNonce = 0;
 	let menuGeneration = 0;
 	let workflowGeneration = 0;
+	let refreshStateBeforeFirstAgentStart = false;
 	let menuController = new AbortController();
+	const implementationRetention = createImplementationRetentionCoordinator();
+	const persistState = () => pi.appendEntry<PlanModeState>(STATE_ENTRY_TYPE, state);
+	const planExports = createPlanExportController({
+		getState: () => state,
+		getSettings: () => settings,
+		finishReady: (ctx) => exitPlanMode(ctx),
+	});
+	const planActions = createPlanActionController({
+		getState: () => state,
+		captureLifecycle: captureMenuLifecycle,
+		statusText: planStatusText,
+		implementationOutcome,
+		getExportDestination: (ctx) => planExports.getDestination(ctx),
+		show: (ctx) => showStoredPlan(pi, ctx, state),
+		finalize: requestFinalPlan,
+		implementHere: startImplementation,
+		implementFresh: startFreshImplementation,
+		exportPlan: (ctx, path, signal, isCurrent) => planExports.export(path, ctx, signal, isCurrent),
+		settings: showSettings,
+		save: savePlanForLater,
+		stay: updateUi,
+		exitReady: (ctx) => {
+			exitPlanMode(ctx);
+			ctx.ui.notify("Plan mode disabled. Proposed plan discarded.", "info");
+		},
+		clearSaved: (ctx) => {
+			exitPlanMode(ctx);
+			ctx.ui.notify("Saved plan cleared.", "info");
+		},
+	});
 
 	pi.registerFlag("plan", {
 		description: "Start in Codex-like Plan mode",
@@ -159,10 +202,22 @@ export default function planMode(
 		description: "Enter or manage Codex-like Plan mode",
 		getArgumentCompletions: completePlanArguments,
 		handler: async (args, ctx) => {
+			latestCommandContext = ctx;
 			const prompt = args.trim();
 			const command = prompt.toLowerCase();
+			if (command === "start") {
+				if (savedPlanBlocksNewWorkflow(ctx, state.savedPlan !== undefined && !state.enabled))
+					return;
+				if (state.enabled) {
+					ctx.ui.notify("Plan mode is already active.", "info");
+					return;
+				}
+				enterPlanMode(ctx);
+				ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+				return;
+			}
 			if (command === "show") {
-				showStoredPlan(ctx);
+				showStoredPlan(pi, ctx, state);
 				return;
 			}
 			if (command === "finalize") {
@@ -170,53 +225,89 @@ export default function planMode(
 				return;
 			}
 			if (command === "implement") {
-				if (!state.enabled || !state.latestPlan?.trim()) {
+				if (!(state.enabled && state.latestPlan?.trim()) && !state.savedPlan?.plan.trim()) {
 					ctx.ui.notify("No completed plan is available to implement.", "warning");
 					return;
 				}
-				startImplementation(ctx);
+				await startImplementation(ctx);
+				return;
+			}
+			if (command === "save") {
+				savePlanForLater(ctx);
+				return;
+			}
+			const exportMatch = /^export(?:\s+([\s\S]+))?$/iu.exec(prompt);
+			if (exportMatch) {
+				const lifecycle = captureMenuLifecycle();
+				await planExports.export(exportMatch[1], ctx, lifecycle.signal, lifecycle.isCurrent);
 				return;
 			}
 			if (command === "exit" || command === "off") {
-				const hadActiveImplementation = state.activeImplementation !== undefined;
+				const notification = state.activeImplementation
+					? "Active implementation plan cleared."
+					: state.savedPlan
+						? "Saved plan cleared."
+						: state.latestPlan
+							? "Plan mode disabled. Proposed plan discarded."
+							: "Plan mode disabled.";
 				exitPlanMode(ctx);
-				ctx.ui.notify(
-					hadActiveImplementation
-						? "Active implementation plan cleared."
-						: "Plan mode disabled. Proposed plan discarded.",
-					"info",
-				);
+				ctx.ui.notify(notification, "info");
 				return;
 			}
 			if (command === "tools") {
-				if (!state.enabled) enterPlanMode(ctx);
-				await showToolSelector(ctx);
+				if (savedPlanBlocksNewWorkflow(ctx, state.savedPlan !== undefined && !state.enabled))
+					return;
+				if (state.enabled) {
+					const message =
+						"Plan-mode tools are locked while Planning is active. Exit Plan mode and choose tools before starting again.";
+					if (!ctx.hasUI) throw new Error(message);
+					ctx.ui.notify(message, "warning");
+					return;
+				}
+				if (!ctx.hasUI) {
+					throw new Error("/plan tools requires TUI or RPC mode and is unavailable here.");
+				}
+				await showLaunchMenu(ctx, "tools");
 				return;
 			}
 			if (prompt) {
+				if (savedPlanBlocksNewWorkflow(ctx, state.savedPlan !== undefined && !state.enabled))
+					return;
 				enterPlanModeWithPrompt(prompt, ctx);
 				return;
+			}
+			if (!ctx.hasUI) {
+				throw new Error(
+					"The interactive /plan menu is unavailable in print and JSON modes. Use /plan start or /plan <prompt>.",
+				);
 			}
 			if (!state.enabled) {
 				if (state.activeImplementation && ctx.hasUI) {
 					await showActivePlanMenu(ctx);
 					return;
 				}
-				enterPlanMode(ctx);
-				ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+				if (state.savedPlan) {
+					await planActions.showSaved(ctx);
+					return;
+				}
+				await showLaunchMenu(ctx);
 				return;
 			}
-			await showPlanMenu(ctx);
+			await planActions.showCurrent(ctx);
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		const generation = ++menuGeneration;
+		refreshStateBeforeFirstAgentStart = event.reason === "new";
 		menuController.abort(new DOMException("Plan-mode session replaced", "AbortError"));
 		menuController = new AbortController();
 		readyPresentationIntent = undefined;
+		latestCommandContext = undefined;
+		implementationRetention.reset();
 		settings = { thinkingLevel: "inherit" };
 		restoreState(ctx);
+		implementationRetention.restore(state.activeImplementation);
 		const loadedSettings = await (dependencies.readSettings?.() ?? readPlanModeSettings());
 		if (generation !== menuGeneration || menuController.signal.aborted) return;
 		if (loadedSettings.kind === "loaded") settings = loadedSettings.settings;
@@ -226,7 +317,17 @@ export default function planMode(
 		if (loadedSettings.notice) ctx.ui.notify(loadedSettings.notice, "warning");
 		const persistFlagActivation = pi.getFlag("plan") === true && !state.enabled;
 		if (persistFlagActivation) {
-			state = { ...state, enabled: true, activeImplementation: undefined };
+			state = state.savedPlan
+				? {
+						...state,
+						enabled: true,
+						latestPlan: state.savedPlan.plan,
+						latestPlanSource: state.savedPlan.source,
+						awaitingAction: true,
+						savedPlan: undefined,
+						activeImplementation: undefined,
+					}
+				: { ...state, enabled: true, activeImplementation: undefined };
 		}
 		if (state.enabled) {
 			activatePlanModeTools();
@@ -249,10 +350,14 @@ export default function planMode(
 		}
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		menuGeneration += 1;
 		menuController.abort(new DOMException("Plan-mode session shut down", "AbortError"));
 		readyPresentationIntent = undefined;
+		latestCommandContext = undefined;
+		refreshStateBeforeFirstAgentStart = false;
+		implementationRetention.reset();
+		await awaitPlanModeSettingsWrites(dependencies.settingsPath);
 		captureManualThinkingLevel();
 		persistState();
 		if (state.enabled) {
@@ -271,14 +376,6 @@ export default function planMode(
 					"Plan mode blocks update_plan because it tracks execution progress rather than conversational planning.",
 			};
 		}
-		if (settings.allowedPlanSubagents !== undefined) {
-			const blocked = enforcePlanSubagentAllowlist(
-				event.toolName,
-				event.input,
-				settings.allowedPlanSubagents,
-			);
-			if (blocked) return blocked;
-		}
 		const calledTool = toolByName(event.toolName);
 		if (calledTool && classifyPlanModeTool(calledTool) === "blocked") {
 			return {
@@ -295,45 +392,35 @@ export default function planMode(
 		// Built-in-compatible overrides retain the canonical name but replace its source metadata.
 		if (event.toolName !== "bash") return;
 
-		const command = readCommand(event.input);
-		if (!isSafeCommand(command, settings.safeSubcommands)) {
+		const blocked = findBlockedCommandSegment(readCommand(event.input), settings.safeSubcommands);
+		if (blocked !== undefined) {
 			return {
 				block: true,
-				reason: `Plan mode blocks mutating or non-allowlisted bash commands.\nCommand: ${command}`,
+				reason: `Plan mode blocks bash commands outside its reviewed inspection policy or containing explicitly unsafe arguments.\nBlocked command: ${blocked}`,
 			};
 		}
 	});
 
-	pi.on("context", async (event) => {
-		const messagesWithoutPlanContext = event.messages.filter(
-			(message: unknown) =>
-				!messageContainsLegacyPlanModeContextArtifact(message) &&
-				!messageContainsPlanModeImplementationContextArtifact(message),
-		);
-		if (state.enabled) {
-			return {
-				messages: messagesWithoutPlanContext.filter(
-					(message: unknown) => !messageContainsPlanModeImplementationHandoff(message),
-				),
-			};
+	pi.on("context", async (event, ctx) => {
+		const result = implementationRetention.transformContext(event.messages, state);
+		if (result.clearActiveImplementationId) {
+			clearActiveImplementation(result.clearActiveImplementationId, ctx);
 		}
-		const inactiveMessages = state.activeImplementation
-			? messagesWithoutPlanContext
-			: messagesWithoutPlanContext.filter(
-					(message: unknown) => !messageContainsPlanModeImplementationHandoff(message),
-				);
-		const messages = inactiveMessages
-			.filter((message: unknown) => !messageContainsInactivePlanModeArtifact(message))
-			.map(stripProposedPlanBlocksFromMessage)
-			.map(stripPlanModeCompletionCallsFromMessage)
-			.filter((message: unknown) => !isEmptyAssistantMessage(message));
-		const contextualMessages = state.activeImplementation
-			? injectActiveImplementationContext(messages, state.activeImplementation)
-			: messages;
-		return { messages: contextualMessages as typeof event.messages };
+		return { messages: result.messages as typeof event.messages };
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
+		if (refreshStateBeforeFirstAgentStart) {
+			refreshStateBeforeFirstAgentStart = false;
+			restoreState(ctx);
+			implementationRetention.reset();
+			implementationRetention.restore(state.activeImplementation);
+			if (state.enabled) {
+				activatePlanModeTools();
+				applyPlanThinkingLevel();
+			} else deactivatePlanModeQuestionTool();
+			updateUi(ctx);
+		}
 		if (!state.enabled) return;
 		if (state.latestPlan || state.awaitingAction) {
 			readyPresentationIntent = undefined;
@@ -369,6 +456,11 @@ export default function planMode(
 	});
 
 	onAgentSettled(pi, async (_event, ctx) => {
+		const settledImplementationId = implementationRetention.implementationSettled(
+			state.activeImplementation,
+		);
+		if (settledImplementationId) clearActiveImplementation(settledImplementationId, ctx);
+
 		const intent = readyPresentationIntent;
 		if (!intent || !readyPresentationIsCurrent(intent)) return;
 		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
@@ -386,7 +478,7 @@ export default function planMode(
 				);
 			}
 			if (ctx.hasUI && completedPlanIsCurrent(intent)) {
-				await showPlanReadyMenu(ctx);
+				await planActions.showReady(latestCommandContext ?? ctx);
 			}
 		} catch (error: unknown) {
 			if (!isStaleExtensionContextError(error)) throw error;
@@ -400,6 +492,7 @@ export default function planMode(
 			...state,
 			enabled: true,
 			awaitingAction: false,
+			savedPlan: undefined,
 			activeImplementation: undefined,
 		};
 		activatePlanModeTools();
@@ -435,6 +528,7 @@ export default function planMode(
 			latestPlan: undefined,
 			latestPlanSource: undefined,
 			awaitingAction: false,
+			savedPlan: undefined,
 			activeImplementation: undefined,
 			manualThinkingLevel: undefined,
 		};
@@ -503,32 +597,6 @@ export default function planMode(
 		return completedPlanIsCurrent(intent) && readyPresentationIntent?.nonce === intent.nonce;
 	}
 
-	function showStoredPlan(ctx: ExtensionContext) {
-		const readyPlan = state.enabled ? state.latestPlan?.trim() : undefined;
-		const activePlan = state.activeImplementation?.plan.trim();
-		const plan = readyPlan ?? activePlan;
-		if (!plan) {
-			ctx.ui.notify(
-				"No completed plan is available. Use /plan finalize when planning is complete.",
-				"info",
-			);
-			return;
-		}
-		try {
-			pi.sendMessage(
-				{
-					customType: PROPOSED_PLAN_MESSAGE_TYPE,
-					content: `**${readyPlan ? "Proposed Plan" : "Active Implementation Plan"}**\n\n${plan}`,
-					display: true,
-				},
-				{ triggerTurn: false },
-			);
-		} catch (error: unknown) {
-			const detail = error instanceof Error ? error.message : String(error);
-			ctx.ui.notify(`Unable to show completed plan: ${detail}`, "error");
-		}
-	}
-
 	function requestFinalPlan(ctx: ExtensionContext) {
 		if (!state.enabled) {
 			ctx.ui.notify("Plan mode is not active. Use /plan first.", "warning");
@@ -540,15 +608,68 @@ export default function planMode(
 		);
 	}
 
-	function startImplementation(ctx: ExtensionContext) {
-		const plan = state.latestPlan?.trim();
+	function savePlanForLater(ctx: ExtensionContext) {
+		const plan = state.enabled ? state.latestPlan?.trim() : undefined;
+		if (!plan) {
+			const message = "No completed plan is available to save.";
+			if (!ctx.hasUI) throw new Error(message);
+			ctx.ui.notify(message, "warning");
+			return;
+		}
 		const source = state.latestPlanSource ?? "legacy_proposed_plan";
+
+		workflowGeneration += 1;
+		readyPresentationIntent = undefined;
+		state = {
+			...state,
+			enabled: false,
+			latestPlan: undefined,
+			latestPlanSource: undefined,
+			awaitingAction: false,
+			savedPlan: { plan, source },
+			activeImplementation: undefined,
+			manualThinkingLevel: undefined,
+		};
+		restoreTools();
+		restoreThinkingLevel();
+		state = { ...state, manualThinkingLevel: undefined };
+		persistState();
+		updateUi(ctx);
+		ctx.ui.notify("Plan saved for later. Plan mode disabled.", "info");
+	}
+
+	async function startFreshImplementation(ctx: ExtensionContext, menuIsCurrent: () => boolean) {
+		await startFreshImplementationFromState(ctx, {
+			getState: () => state,
+			menuIsCurrent,
+			retention: configuredImplementationPlanRetention(settings),
+			stateEntryType: STATE_ENTRY_TYPE,
+		});
+	}
+
+	async function startImplementation(ctx: ExtensionContext) {
+		const savedPlan = state.enabled ? undefined : state.savedPlan;
+		if (savedPlan) {
+			const sessionGeneration = menuGeneration;
+			const planWorkflowGeneration = workflowGeneration;
+			const isCurrent = () =>
+				sessionGeneration === menuGeneration &&
+				planWorkflowGeneration === workflowGeneration &&
+				!menuController.signal.aborted &&
+				!state.enabled &&
+				state.savedPlan === savedPlan;
+			if (!(await preflightSavedPlanImplementation(ctx, isCurrent))) return;
+		}
+		const plan = (state.enabled ? state.latestPlan : savedPlan?.plan)?.trim();
+		const source =
+			(state.enabled ? state.latestPlanSource : savedPlan?.source) ?? "legacy_proposed_plan";
 		if (!plan) {
 			ctx.ui.notify("Plan mode disabled. No proposed plan is available to implement.", "warning");
 			return;
 		}
 
 		workflowGeneration += 1;
+		const previousState = state;
 		const wasEnabled = state.enabled;
 		readyPresentationIntent = undefined;
 		state = {
@@ -557,11 +678,13 @@ export default function planMode(
 			latestPlan: undefined,
 			latestPlanSource: undefined,
 			awaitingAction: false,
+			savedPlan: undefined,
 			activeImplementation: {
 				id: randomUUID(),
 				plan,
 				source,
 				startedAt: Date.now(),
+				retention: configuredImplementationPlanRetention(settings),
 			},
 			manualThinkingLevel: undefined,
 		};
@@ -573,16 +696,68 @@ export default function planMode(
 		persistState();
 		updateUi(ctx);
 
-		const sent = sendPlanModeUserMessage(
-			`Plan mode is now disabled. Full tool access is restored. Implement this proposed plan now:\n\n${plan}`,
-			ctx,
-		);
+		const sent = sendPlanModeUserMessage(formatImplementationHandoff(plan), ctx);
 		if (!sent) {
-			enterPlanMode(ctx);
-			state = { ...state, latestPlan: plan, latestPlanSource: source, awaitingAction: true };
+			if (savedPlan) {
+				state = previousState;
+			} else {
+				enterPlanMode(ctx);
+				state = previousState;
+				applyPlanThinkingLevel();
+			}
 			persistState();
 			updateUi(ctx);
 		}
+	}
+
+	function clearActiveImplementation(id: string, ctx: ExtensionContext) {
+		if (state.activeImplementation?.id !== id) return false;
+		workflowGeneration += 1;
+		state = { ...state, activeImplementation: undefined };
+		persistState();
+		updateUi(ctx);
+		return true;
+	}
+
+	async function showLaunchMenu(ctx: ExtensionContext, initialScreen: "main" | "tools" = "main") {
+		const lifecycle = captureMenuLifecycle();
+		const tools = selectableTools();
+		await showPlanLaunchMenu(ctx, {
+			statusText: "Status: Off — normal tools are active.",
+			initialScreen,
+			getSelectedNames: () => snapshotPlanModeSelectedNames(tools, toolSelectionSnapshot()),
+			toolSummary: (selectedNames) =>
+				`When started: ${snapshotPlanModeToolNames(tools, selectedNames, toolSelectionSnapshot()).join(", ")}`,
+			tools: tools.map((tool) => {
+				const selectable = canSelectToolInPlanMode(tool);
+				const policy = toolPolicyLabel(tool);
+				const description = tool.description ?? "No description available";
+				return {
+					name: tool.name,
+					description: `${policy} · ${description}`,
+					searchText: [policy, description].join(" "),
+					disabled: !selectable,
+					disabledReason: selectable ? undefined : "Blocked by Plan-mode policy",
+				};
+			}),
+			...lifecycle,
+			start: (signal) => {
+				if (signal.aborted || !lifecycle.isCurrent()) return;
+				enterPlanMode(ctx);
+				ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+			},
+			startWithTools: (names, signal) => {
+				if (signal.aborted || !lifecycle.isCurrent()) return;
+				state = {
+					...state,
+					selectedToolNames: filterAvailableSelectedToolNames(names, tools),
+					selectedToolKeys: undefined,
+				};
+				enterPlanMode(ctx);
+				ctx.ui.notify("Plan mode enabled with the selected tools.", "info");
+			},
+			settings: (signal) => showSettings(ctx, signal, lifecycle.isCurrent),
+		});
 	}
 
 	async function showActivePlanMenu(ctx: ExtensionContext) {
@@ -593,9 +768,12 @@ export default function planMode(
 		const lifecycle = captureMenuLifecycle();
 		await showActiveImplementationMenu(ctx, {
 			statusText: planStatusText(),
+			getExportDestination: () => planExports.getDestination(ctx),
 			signal: lifecycle.signal,
 			isCurrent: lifecycle.isCurrent,
-			show: () => showStoredPlan(ctx),
+			show: () => showStoredPlan(pi, ctx, state),
+			exportPlan: (path, signal) => planExports.export(path, ctx, signal, lifecycle.isCurrent),
+			settings: (signal) => showSettings(ctx, signal, lifecycle.isCurrent),
 			startNew: () => {
 				enterPlanMode(ctx);
 				ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
@@ -607,170 +785,24 @@ export default function planMode(
 		});
 	}
 
-	async function showPlanMenu(ctx: ExtensionContext) {
-		if (!ctx.hasUI) {
-			ctx.ui.notify(planStatusText(), "info");
-			return;
-		}
-		const lifecycle = captureMenuLifecycle();
-		type Action = "show" | "finalize" | "implement" | "tools" | "stay" | "exit";
-		const menu = defineMenu<undefined, "main", Action, ExtensionContext>({
-			start: "main",
-			screens: {
-				main: () => ({
-					kind: "actions",
-					title: "Plan mode",
-					lines: [planStatusText()],
-					items: state.latestPlan
-						? [
-								{ id: "show", label: "Show latest proposed plan", action: "show" },
-								{ id: "implement", label: "Implement this plan", action: "implement" },
-								{ id: "tools", label: "Configure Plan-mode tools", action: "tools" },
-								{ id: "stay", label: "Stay in Plan mode", action: "stay" },
-								{ id: "exit", label: "Exit Plan mode", action: "exit" },
-							]
-						: [
-								{ id: "finalize", label: "Request final plan", action: "finalize" },
-								{ id: "tools", label: "Configure Plan-mode tools", action: "tools" },
-								{ id: "stay", label: "Stay in Plan mode", action: "stay" },
-								{ id: "exit", label: "Exit Plan mode", action: "exit" },
-							],
-					hint: "close",
-				}),
+	async function showSettings(
+		ctx: ExtensionContext,
+		signal: AbortSignal,
+		isCurrent: () => boolean,
+	) {
+		const result = await showPlanModeSettings(ctx, {
+			tools: selectableTools(),
+			signal,
+			isCurrent,
+			settingsPath: dependencies.settingsPath,
+			onSaved: (saved) => {
+				if (isCurrent()) settings = saved;
 			},
-			actions: {
-				show: async () => {
-					showStoredPlan(ctx);
-					return { kind: "close" };
-				},
-				finalize: async () => {
-					requestFinalPlan(ctx);
-					return { kind: "close" };
-				},
-				implement: async () => {
-					startImplementation(ctx);
-					return { kind: "close" };
-				},
-				tools: async () => {
-					await showToolSelector(ctx);
-					return { kind: "stay" };
-				},
-				stay: async () => {
-					updateUi(ctx);
-					return { kind: "close" };
-				},
-				exit: async () => {
-					exitPlanMode(ctx);
-					ctx.ui.notify("Plan mode disabled. Proposed plan discarded.", "info");
-					return { kind: "close" };
-				},
-			},
+			...(dependencies.readSettings
+				? { readSettings: async () => dependencies.readSettings?.() ?? { kind: "missing" } }
+				: {}),
 		});
-		await runMenu(ctx, menu, {
-			getState: () => undefined,
-			...lifecycle,
-		});
-	}
-
-	async function showPlanReadyMenu(ctx: ExtensionContext) {
-		const lifecycle = captureMenuLifecycle();
-		type Action = "implement" | "stay" | "exit";
-		const menu = defineMenu<undefined, "ready", Action, ExtensionContext>({
-			start: "ready",
-			screens: {
-				ready: () => ({
-					kind: "actions",
-					title: "Proposed plan ready. What next?",
-					items: [
-						{ id: "implement", label: "Implement this plan", action: "implement" },
-						{ id: "stay", label: "Stay in Plan mode", action: "stay" },
-						{ id: "exit", label: "Exit Plan mode", action: "exit" },
-					],
-					hint: "close",
-				}),
-			},
-			actions: {
-				implement: async () => {
-					startImplementation(ctx);
-					return { kind: "close" };
-				},
-				stay: async () => ({ kind: "close" }),
-				exit: async () => {
-					exitPlanMode(ctx);
-					ctx.ui.notify("Plan mode disabled. Proposed plan discarded.", "info");
-					return { kind: "close" };
-				},
-			},
-		});
-		await runMenu(ctx, menu, {
-			getState: () => undefined,
-			...lifecycle,
-		});
-	}
-
-	async function showToolSelector(ctx: ExtensionContext) {
-		if (!ctx.hasUI) {
-			ctx.ui.notify(formatToolSummary(), "info");
-			return;
-		}
-		const lifecycle = captureMenuLifecycle();
-		const tools = selectableTools();
-		const toolById = new Map(tools.map((tool, index) => [`${index}:${tool.name}`, tool]));
-		const menu = defineMenu<undefined, "tools", "toggle", ExtensionContext>({
-			start: "tools",
-			screens: {
-				tools: () => {
-					const selectedNames = planModeSelectedNames(tools);
-					return {
-						kind: "multiSelect",
-						title: "Plan-mode tools",
-						lines: ["Non-built-in tools run at user risk."],
-						enableSearch: true,
-						viewportSize: TOOL_SELECTOR_VIEWPORT_SIZE,
-						items: tools.map((tool, index) => {
-							const selectable = canSelectToolInPlanMode(tool);
-							return {
-								id: `${index}:${tool.name}`,
-								label: tool.name,
-								description: `${toolPolicyLabel(tool)} · ${tool.description}`,
-								searchText: [toolPolicyLabel(tool), tool.description].filter(Boolean).join(" "),
-								selected: selectedNames.has(tool.name),
-								disabled: !selectable,
-								disabledReason: selectable ? undefined : "Blocked by Plan-mode policy",
-							};
-						}),
-						action: "toggle",
-						hint: "close",
-						doneLabel: "Done",
-					};
-				},
-			},
-			actions: {
-				toggle: async ({ itemId, selected }) => {
-					const tool = toolById.get(itemId);
-					if (!tool || !canSelectToolInPlanMode(tool)) return { kind: "rejected" };
-					const names = planModeSelectedNames(tools);
-					if (selected) names.add(tool.name);
-					else names.delete(tool.name);
-					state = {
-						...state,
-						selectedToolNames: filterAvailableSelectedNames(Array.from(names), tools),
-					};
-					applyPlanModeTools();
-					persistState();
-					updateUi(ctx);
-					return { kind: "stay" };
-				},
-			},
-		});
-		await runMenu(ctx, menu, {
-			getState: () => undefined,
-			...lifecycle,
-		});
-		if (!lifecycle.isCurrent()) return;
-		applyPlanModeTools();
-		persistState();
-		updateUi(ctx);
+		return result.kind === "closed" && "reason" in result && result.reason === "close";
 	}
 
 	function captureMenuLifecycle() {
@@ -806,7 +838,7 @@ export default function planMode(
 			return ["read", "bash", PLAN_MODE_QUESTION_TOOL_NAME, PLAN_MODE_COMPLETE_TOOL_NAME];
 		}
 
-		const selectedNames = planModeSelectedNames(tools);
+		const selectedNames = snapshotPlanModeSelectedNames(tools, toolSelectionSnapshot());
 		return withRequiredPlanModeTools(
 			tools
 				.filter((tool) => selectedNames.has(tool.name) && canSelectToolInPlanMode(tool))
@@ -814,37 +846,12 @@ export default function planMode(
 		);
 	}
 
-	function planModeSelectedNames(tools: ToolInfo[]) {
-		const selectedToolNames = state.selectedToolNames ?? migrateSelectedToolKeys(tools);
-		if (selectedToolNames === undefined) return new Set(defaultPlanModeToolNames(tools));
-
-		state = {
-			...state,
-			selectedToolNames: filterAvailableSelectedNames(selectedToolNames, tools),
-			selectedToolKeys: undefined,
+	function toolSelectionSnapshot() {
+		return {
+			selectedToolNames: state.selectedToolNames,
+			selectedToolKeys: state.selectedToolKeys,
+			defaultPlanTools: settings.defaultPlanTools,
 		};
-		return new Set(state.selectedToolNames);
-	}
-
-	function defaultPlanModeToolNames(tools: ToolInfo[]) {
-		if (settings.defaultPlanTools !== undefined) {
-			return filterAvailableSelectedNames(settings.defaultPlanTools, tools);
-		}
-		return tools
-			.filter((tool) => isBuiltinTool(tool) && SAFE_BUILTIN_PLAN_TOOLS.has(tool.name))
-			.map((tool) => tool.name);
-	}
-
-	function migrateSelectedToolKeys(tools: ToolInfo[]) {
-		if (state.selectedToolKeys === undefined) return undefined;
-		return state.selectedToolKeys
-			.map((key) => toolNameFromLegacyKey(key, tools))
-			.filter((name): name is string => name !== undefined);
-	}
-
-	function filterAvailableSelectedNames(names: string[], tools: ToolInfo[]) {
-		const availableNames = new Set(tools.filter(canSelectToolInPlanMode).map((tool) => tool.name));
-		return unique(names.filter((name) => availableNames.has(name)));
 	}
 
 	function selectableTools() {
@@ -933,10 +940,6 @@ export default function planMode(
 		}
 	}
 
-	function persistState() {
-		pi.appendEntry<PlanModeState>(STATE_ENTRY_TYPE, state);
-	}
-
 	function restoreState(ctx: ExtensionContext) {
 		state = restorePlanModeState(ctx.sessionManager.getBranch(), STATE_ENTRY_TYPE);
 	}
@@ -951,6 +954,10 @@ export default function planMode(
 
 	function planStatusText() {
 		return formatPlanModeStatusText(state, formatToolSummary);
+	}
+
+	function implementationOutcome() {
+		return implementationRetentionPreview(configuredImplementationPlanRetention(settings));
 	}
 
 	function formatToolSummary() {

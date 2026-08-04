@@ -5,10 +5,15 @@ import {
   HASH_SEP,
 } from "./hashline";
 
-export function detectEnding(content: string): "\r\n" | "\n" {
-  const crlfIdx = content.indexOf("\r\n");
+export type LineEnding = "\r\n" | "\n" | "\r";
+
+export function detectEnding(content: string): LineEnding {
   const lfIdx = content.indexOf("\n");
-  if (lfIdx === -1 || crlfIdx === -1) return "\n";
+  if (lfIdx === -1) {
+    return content.indexOf("\r") >= 0 ? "\r" : "\n";
+  }
+  const crlfIdx = content.indexOf("\r\n");
+  if (crlfIdx === -1) return "\n";
   return crlfIdx < lfIdx ? "\r\n" : "\n";
 }
 
@@ -18,9 +23,11 @@ export function toLF(text: string): string {
 
 export function restoreEndings(
   text: string,
-  ending: "\r\n" | "\n",
+  ending: LineEnding,
 ): string {
-  return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
+  if (ending === "\r\n") return text.replace(/\n/g, "\r\n");
+  if (ending === "\r") return text.replace(/\n/g, "\r");
+  return text;
 }
 
 export function stripBOM(content: string): { bom: string; text: string } {
@@ -40,12 +47,15 @@ function fmtDiffLine(
   return `${prefix}${hash}${HASH_SEP}${line}`;
 }
 
+const ELLIPSIS_MARKER: unique symbol = Symbol("ellipsis");
+const isEllipsisMarker = (line: string | symbol): line is symbol =>
+  line === ELLIPSIS_MARKER;
+
 export function genDiff(
   oldContent: string,
   newContent: string,
   contextLines = 2,
   newContentHashes?: string[],
-  _oldHashes?: string[],
 ): { diff: string; firstChangedLine: number | undefined } {
   const effectiveNewHashes = newContentHashes ?? _lineHashesPure(newContent);
 
@@ -79,7 +89,7 @@ export function genDiff(
     const nextPartIsChange =
       i < parts.length - 1 && (parts[i + 1]!.added || parts[i + 1]!.removed);
     if (lastWasChange || nextPartIsChange) {
-      let linesToShow = displayLines;
+      let linesToShow: (string | symbol)[] = displayLines;
       let skipStart = 0;
       let skipMiddle = 0;
 
@@ -88,7 +98,7 @@ export function genDiff(
         linesToShow = displayLines.slice(skipStart);
       } else if (nextPartIsChange && displayLines.length > contextLines * 2) {
         const tail = displayLines.slice(-contextLines);
-        linesToShow = [...displayLines.slice(0, contextLines), "__ELLIPSIS__", ...tail];
+        linesToShow = [...displayLines.slice(0, contextLines), ELLIPSIS_MARKER, ...tail];
         skipMiddle = displayLines.length - contextLines * 2;
       } else if (linesToShow.length > contextLines) {
         linesToShow = linesToShow.slice(0, contextLines);
@@ -99,7 +109,7 @@ export function genDiff(
         newLineNum += skipStart;
       }
       for (const line of linesToShow) {
-        if (line === "__ELLIPSIS__") {
+        if (isEllipsisMarker(line)) {
           output.push(" ...");
           newLineNum += skipMiddle;
           continue;

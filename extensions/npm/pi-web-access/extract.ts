@@ -1,4 +1,5 @@
 import { Readability } from "@mozilla/readability";
+import { resizeImage } from "@earendil-works/pi-coding-agent";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
 import pLimit from "p-limit";
@@ -13,7 +14,10 @@ import { extractWithParallel, isParallelAvailable } from "./parallel.ts";
 import { extractWithTinyFish, isTinyFishAvailable } from "./tinyfish.ts";
 import { extractWithSearch1API, isSearch1APIAvailable } from "./search1api.ts";
 import { extractWithQuerit, isQueritAvailable } from "./querit.ts";
+import { extractWithKagi, isKagiExtractAvailable } from "./kagi.ts";
+import { extractWithOllama, isOllamaFetchAvailable } from "./ollama.ts";
 import { extractWithFirecrawl, isFirecrawlAvailable } from "./firecrawl.ts";
+import { extractWithBrightDataUnlocker, isBrightDataUnlockerAvailable } from "./brightdata-unlocker.ts";
 import { isVideoFile, extractVideo, extractVideoFrame, getLocalVideoDuration } from "./video-extract.ts";
 import { appendDeclaredWebLinks, discoverDeclaredWebLinks, type DeclaredWebLink } from "./declared-web-links.ts";
 import { fetchRemoteUrl, loadFetchContentDomainPolicy, loadSsrfConfig, validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
@@ -24,6 +28,7 @@ const CONCURRENT_LIMIT = 3;
 
 const NON_RECOVERABLE_ERRORS = ["Unsupported content type", "Response too large"];
 const MIN_USEFUL_CONTENT = 500;
+const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
 
 export { loadSsrfConfig } from "./ssrf-protection.ts";
@@ -72,6 +77,8 @@ export interface ExtractedContent {
 	thumbnail?: { data: string; mimeType: string };
 	frames?: VideoFrame[];
 	duration?: number;
+	mimeType?: string;
+	status?: number;
 }
 
 type HttpExtractedContent = ExtractedContent & { declaredLinks?: DeclaredWebLink[] };
@@ -83,6 +90,8 @@ export interface ExtractOptions {
 	timestamp?: string;
 	frames?: number;
 	model?: string;
+	mode?: "readable" | "raw" | "answer";
+	answerModel?: string;
 	/** Custom DNS resolver used for SSRF validation. Primarily a test seam. */
 	lookup?: Lookup;
 }
@@ -261,6 +270,10 @@ export async function extractContent(
 		} catch (err) {
 			return { url, title: "", content: "", error: errorMessage(err) };
 		}
+	}
+
+	if (options?.mode === "raw") {
+		return extractViaHttp(url, signal, options);
 	}
 
 	if (options?.frames && !options.timestamp) {
@@ -534,6 +547,46 @@ export async function extractContent(
 	}
 	if (signal?.aborted) return abortedResult(url);
 
+	let kagiError: string | null = null;
+	try {
+		if (isKagiExtractAvailable()) {
+			const ssrf = loadSsrfConfig();
+			const kagiResult = await extractWithKagi(url, signal, {
+				timeoutMs: options?.timeoutMs,
+				...(options?.lookup ? { lookup: options.lookup } : {}),
+				ssrf,
+			});
+			if (kagiResult) return withDeclaredLinks(kagiResult);
+		}
+	} catch (err) {
+		if (isAbortError(err)) return abortedResult(url);
+		kagiError = errorMessage(err);
+		if (isConfigParseError(err)) {
+			return { ...httpResult, error: kagiError };
+		}
+	}
+	if (signal?.aborted) return abortedResult(url);
+
+	let ollamaError: string | null = null;
+	try {
+		if (isOllamaFetchAvailable()) {
+			const ssrf = loadSsrfConfig();
+			const ollamaResult = await extractWithOllama(url, signal, {
+				timeoutMs: options?.timeoutMs,
+				...(options?.lookup ? { lookup: options.lookup } : {}),
+				ssrf,
+			});
+			if (ollamaResult) return withDeclaredLinks(ollamaResult);
+		}
+	} catch (err) {
+		if (isAbortError(err)) return abortedResult(url);
+		ollamaError = errorMessage(err);
+		if (isConfigParseError(err)) {
+			return { ...httpResult, error: ollamaError };
+		}
+	}
+	if (signal?.aborted) return abortedResult(url);
+
 	let parallelError: string | null = null;
 	try {
 		if (isParallelAvailable()) {
@@ -545,6 +598,26 @@ export async function extractContent(
 		parallelError = errorMessage(err);
 		if (isConfigParseError(err)) {
 			return { ...httpResult, error: parallelError };
+		}
+	}
+	if (signal?.aborted) return abortedResult(url);
+
+	let brightdataError: string | null = null;
+	try {
+		if (isBrightDataUnlockerAvailable()) {
+			const ssrf = loadSsrfConfig();
+			const brightdataResult = await extractWithBrightDataUnlocker(url, signal, {
+				timeoutMs: options?.timeoutMs,
+				...(options?.lookup ? { lookup: options.lookup } : {}),
+				ssrf,
+			});
+			if (brightdataResult) return withDeclaredLinks(brightdataResult);
+		}
+	} catch (err) {
+		if (isAbortError(err)) return abortedResult(url);
+		brightdataError = errorMessage(err);
+		if (isConfigParseError(err)) {
+			return { ...httpResult, error: brightdataError };
 		}
 	}
 	if (signal?.aborted) return abortedResult(url);
@@ -570,14 +643,20 @@ export async function extractContent(
 		...(tinyfishError ? [`TinyFish fallback failed: ${tinyfishError}`] : []),
 		...(search1apiError ? [`Search1API fallback failed: ${search1apiError}`] : []),
 		...(queritError ? [`Querit fallback failed: ${queritError}`] : []),
+		...(kagiError ? [`Kagi fallback failed: ${kagiError}`] : []),
+		...(ollamaError ? [`Ollama fallback failed: ${ollamaError}`] : []),
 		...(parallelError ? [`Parallel fallback failed: ${parallelError}`] : []),
+		...(brightdataError ? [`Bright Data fallback failed: ${brightdataError}`] : []),
 		"",
 		"Fallback options:",
 		`  \u2022 Set firecrawlBaseUrl in ${WEB_SEARCH_CONFIG_PATH} to a self-hosted Firecrawl instance`,
 		`  • Set tinyfishApiKey in ${WEB_SEARCH_CONFIG_PATH} or TINYFISH_API_KEY`,
 		`  • Set search1apiApiKey in ${WEB_SEARCH_CONFIG_PATH} or SEARCH1API_KEY`,
 		`  • Set queritApiKey in ${WEB_SEARCH_CONFIG_PATH} or QUERIT_API_KEY`,
+		`  • Set kagiApiKey in ${WEB_SEARCH_CONFIG_PATH} or KAGI_API_KEY`,
+		`  • Set ollamaApiKey in ${WEB_SEARCH_CONFIG_PATH} or OLLAMA_API_KEY`,
 		`  • Set parallelApiKey in ${WEB_SEARCH_CONFIG_PATH} or PARALLEL_API_KEY`,
+		`  • Set brightdataApiKey and brightdataUnlockerZone in ${WEB_SEARCH_CONFIG_PATH} or BRIGHTDATA_API_KEY and BRIGHTDATA_UNLOCKER_ZONE`,
 		`  \u2022 Set GEMINI_API_KEY in ${WEB_SEARCH_CONFIG_PATH}`,
 		"  \u2022 Sign into gemini.google.com in Chrome",
 		"  \u2022 Use web_search to find content about this topic",
@@ -614,7 +693,25 @@ export async function readPDFResponseBuffer(response: Response, maxSizeMB: numbe
 
 async function readTextResponseWithLimit(response: Response, maxBytes: number): Promise<string> {
 	const buffer = await readResponseBufferWithLimit(response, maxBytes, () => responseSizeLimitError(maxBytes));
-	return new TextDecoder().decode(buffer);
+	const charset = response.headers.get("content-type")?.match(/charset\s*=\s*["']?([^;"'\s]+)/i)?.[1];
+	try {
+		return new TextDecoder(charset || "utf-8").decode(buffer);
+	} catch {
+		return new TextDecoder("utf-8").decode(buffer);
+	}
+}
+
+function isTextContentType(contentType: string): boolean {
+	const mimeType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+	return mimeType.startsWith("text/") ||
+		mimeType === "application/json" ||
+		mimeType === "application/ld+json" ||
+		mimeType === "application/xml" ||
+		mimeType === "application/xhtml+xml" ||
+		mimeType === "application/javascript" ||
+		mimeType === "application/x-javascript" ||
+		mimeType.endsWith("+json") ||
+		mimeType.endsWith("+xml");
 }
 
 async function readResponseBufferWithLimit(
@@ -705,18 +802,20 @@ async function extractViaHttp(
 			},
 		);
 
-		if (!response.ok) {
+		if (!response.ok && options?.mode !== "raw") {
 			activityMonitor.logComplete(activityId, response.status);
 			return {
 				url,
 				title: "",
 				content: "",
 				error: `HTTP ${response.status}: ${response.statusText}`,
+				status: response.status,
 			};
 		}
 
 		const contentLengthHeader = response.headers.get("content-length");
 		const contentType = response.headers.get("content-type") || "";
+		const mimeType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
 		const isPDFContent = isPDF(url, contentType);
 		const pdfConfig = isPDFContent ? loadPDFConfig() : null;
 		const maxResponseSize = (pdfConfig?.maxSizeMB ?? 5) * 1024 * 1024;
@@ -732,6 +831,39 @@ async function extractViaHttp(
 						? pdfSizeLimitError(pdfConfig.maxSizeMB).message
 						: `Response too large (${Math.round(contentLength / 1024 / 1024)}MB)`,
 				};
+			}
+		}
+
+		if (options?.mode === "raw") {
+			if (!isTextContentType(contentType)) {
+				activityMonitor.logComplete(activityId, response.status);
+				return { url, title: "", content: "", error: `Unsupported content type in raw mode: ${mimeType || "missing"}`, mimeType, status: response.status };
+			}
+			const text = await readTextResponseWithLimit(response, maxResponseSize);
+			activityMonitor.logComplete(activityId, response.status);
+			return { url, title: extractTextTitle(text, url), content: text, error: null, mimeType, status: response.status };
+		}
+
+		if (SUPPORTED_IMAGE_TYPES.has(mimeType)) {
+			try {
+				const buffer = await readResponseBufferWithLimit(response, maxResponseSize, () => responseSizeLimitError(maxResponseSize));
+				const resized = await resizeImage(new Uint8Array(buffer), mimeType, { maxWidth: 2000, maxHeight: 2000 });
+				activityMonitor.logComplete(activityId, response.status);
+				if (!resized) return { url, title: "", content: "", error: `Could not decode image: ${mimeType}`, mimeType, status: response.status };
+				const title = new URL(response.url || url).pathname.split("/").pop() || url;
+				return {
+					url,
+					title,
+					content: `Image fetched (${resized.width}×${resized.height}, ${resized.mimeType})`,
+					error: null,
+					thumbnail: { data: resized.data, mimeType: resized.mimeType },
+					mimeType: resized.mimeType,
+					status: response.status,
+				};
+			} catch (err) {
+				const message = errorMessage(err);
+				activityMonitor.logError(activityId, message);
+				return { url, title: "", content: "", error: message, mimeType, status: response.status };
 			}
 		}
 

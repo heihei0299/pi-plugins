@@ -1,6 +1,9 @@
-export const DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024;
+import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
+
+export const DEFAULT_MAX_OUTPUT_BYTES = DEFAULT_MAX_BYTES;
 export const DEFAULT_MAX_STDERR_BYTES = 16 * 1024;
-export const DEFAULT_MAX_CONTEXT_BYTES = 50 * 1024;
+export const DEFAULT_MAX_CONTEXT_BYTES = DEFAULT_MAX_BYTES;
+export const MAX_SUBAGENT_TIMEOUT_MS = 2_147_483_647;
 export const DEFAULT_MAX_MESSAGES = 200;
 export const TRUNCATION_MARKER = "\n… [truncated by pi-subagents]";
 export const TAIL_TRUNCATION_MARKER = "… [truncated by pi-subagents]\n";

@@ -2,6 +2,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	AssistantMessageComponent,
 	getMarkdownTheme,
+	type KeybindingsManager,
 	type Theme,
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
@@ -18,7 +19,8 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import type { SideThreadTurn } from "./side-thread.js";
+import type { BtwThinkingLevel, SideThreadTurn } from "./side-thread.js";
+import { sanitizeSingleLine } from "./text.js";
 
 const TRANSCRIPT_CHROME_LINES = 2;
 const OSC133_MARKERS = ["\u001b]133;A\u0007", "\u001b]133;B\u0007", "\u001b]133;C\u0007"];
@@ -29,6 +31,13 @@ export type TranscriptPagerAction =
 	| { kind: "submit"; question: string }
 	| { kind: "bringToMain"; questionDraft: string }
 	| { kind: "close" };
+
+export interface BtwThinkingControl {
+	level: BtwThinkingLevel;
+	levels: readonly BtwThinkingLevel[];
+	keybindings: KeybindingsManager;
+	onChange: (level: BtwThinkingLevel) => void;
+}
 
 export class BtwTranscriptPager implements Component {
 	private readonly transcriptComponents: Component[];
@@ -41,17 +50,23 @@ export class BtwTranscriptPager implements Component {
 	private warning: string | undefined;
 	private finished = false;
 	private isFocused = false;
+	private thinkingLevel: BtwThinkingLevel | undefined;
 
 	constructor(
 		private readonly tui: TUI,
 		private readonly theme: Theme,
 		turns: readonly SideThreadTurn[],
 		private readonly onAction: (action: TranscriptPagerAction) => void,
-		options: { startAtBottom?: boolean; initialQuestion?: string } = {},
+		private readonly options: {
+			startAtBottom?: boolean;
+			initialQuestion?: string;
+			thinking?: BtwThinkingControl;
+		} = {},
 	) {
 		this.transcriptComponents = buildTranscriptComponents(turns, this.theme);
 		this.canBringToMain = turns.some((turn) => turn.kind === "answered");
 		this.followBottom = options.startAtBottom ?? false;
+		this.thinkingLevel = options.thinking?.level;
 		const editorTheme: EditorTheme = {
 			borderColor: (text) => this.theme.fg("accent", text),
 			selectList: {
@@ -102,7 +117,7 @@ export class BtwTranscriptPager implements Component {
 		this.clampScrollOffset();
 
 		return fitComposerLayout(
-			renderSideThreadHeader(safeWidth, this.theme),
+			renderSideThreadHeader(safeWidth, this.theme, this.thinkingLevel),
 			contentLines.slice(this.scrollOffset, this.scrollOffset + viewportHeight),
 			this.renderFooter(safeWidth),
 			editorLines,
@@ -120,6 +135,22 @@ export class BtwTranscriptPager implements Component {
 		if (this.canBringToMain && matchesKey(data, Key.ctrl("r"))) {
 			this.finished = true;
 			this.onAction({ kind: "bringToMain", questionDraft: this.editor.getExpandedText() });
+			return;
+		}
+		const thinking = this.options.thinking;
+		if (
+			thinking &&
+			thinking.levels.length > 1 &&
+			thinking.keybindings.matches(data, "app.thinking.cycle")
+		) {
+			const currentIndex = thinking.levels.indexOf(this.thinkingLevel ?? thinking.level);
+			const nextLevel = thinking.levels[(currentIndex + 1) % thinking.levels.length];
+			if (nextLevel) {
+				this.thinkingLevel = nextLevel;
+				thinking.onChange(nextLevel);
+				this.warning = undefined;
+				this.tui.requestRender();
+			}
 			return;
 		}
 		if (matchesKey(data, Key.pageUp)) {
@@ -144,23 +175,38 @@ export class BtwTranscriptPager implements Component {
 		this.editor.invalidate();
 	}
 
+	dispose(): void {
+		if (this.finished) return;
+		this.finished = true;
+		this.onAction({ kind: "close" });
+	}
+
 	private renderFooter(width: number): string {
 		if (this.warning) {
 			const warning = width < 32 ? "Empty • Ctrl+C" : `${this.warning} • Ctrl+C exit`;
 			return truncateToWidth(this.theme.fg("warning", warning), width);
 		}
 		const scrollable = this.getMaxScrollOffset() > 0;
-		const fullBase = this.canBringToMain
+		const thinking = this.options.thinking;
+		const cycleHint =
+			thinking && thinking.levels.length > 1 && this.thinkingLevel
+				? ` • thinking ${this.thinkingLevel} • ${thinkingKeyLabel(thinking.keybindings)} cycle`
+				: "";
+		const base = this.canBringToMain
 			? "btw • Enter send • Ctrl+R bring to main • Ctrl+C exit"
 			: "btw • Enter send • Ctrl+C exit";
+		const fullBase = `${base}${cycleHint}`;
 		const fallbackBase = "btw • Enter • Ctrl+C";
 		const compactBase = this.canBringToMain ? "btw • Enter • Ctrl+R • Ctrl+C" : fallbackBase;
+		const compactWithThinking = `${compactBase}${cycleHint}`;
 		let hints =
 			visibleWidth(fullBase) <= width
 				? fullBase
-				: visibleWidth(compactBase) <= width
-					? compactBase
-					: fallbackBase;
+				: visibleWidth(compactWithThinking) <= width
+					? compactWithThinking
+					: visibleWidth(compactBase) <= width
+						? compactBase
+						: fallbackBase;
 		if (scrollable) {
 			const history = ` • ${this.scrollOffset > 0 ? "↑ older" : "↓ newer"} • PgUp/PgDn history`;
 			const compactHistory = " • PgUp/PgDn";
@@ -212,6 +258,7 @@ export class BtwAnsweringView implements Component {
 		turns: readonly SideThreadTurn[],
 		pendingQuestion: string,
 		private readonly onCancel: () => void,
+		private readonly thinkingLevel?: BtwThinkingLevel,
 	) {
 		this.transcriptComponents = buildTranscriptComponents(turns, this.theme, pendingQuestion);
 		this.loader = new Loader(
@@ -239,7 +286,7 @@ export class BtwAnsweringView implements Component {
 		const loaderWidth = Math.max(1, safeWidth - visibleWidth(cancelHint) - 3);
 		const loaderLine = this.loader.render(loaderWidth).at(-1) ?? "Answering…";
 		const lines = [
-			renderSideThreadHeader(safeWidth, this.theme),
+			renderSideThreadHeader(safeWidth, this.theme, this.thinkingLevel),
 			...contentLines.slice(this.scrollOffset, this.scrollOffset + viewportHeight),
 			truncateToWidth(`${loaderLine} • ${this.theme.fg("muted", cancelHint)}`, safeWidth),
 		];
@@ -278,8 +325,15 @@ export class BtwAnsweringView implements Component {
 	}
 
 	dispose(): void {
-		this.finish();
+		if (this.finished) {
+			this.loader.stop();
+			this.controller.abort();
+			return;
+		}
+		this.finished = true;
+		this.loader.stop();
 		this.controller.abort();
+		this.onCancel();
 	}
 
 	private scrollBy(delta: number): void {
@@ -350,10 +404,33 @@ function renderTranscriptLines(components: readonly Component[], width: number):
 		.map(stripShellIntegrationMarkers);
 }
 
-function renderSideThreadHeader(width: number, theme: Theme): string {
-	const title = truncateToWidth("─ btw · side thread ", width);
+function renderSideThreadHeader(
+	width: number,
+	theme: Theme,
+	thinkingLevel?: BtwThinkingLevel,
+): string {
+	const thinking = thinkingLevel ? ` · thinking ${thinkingLevel}` : "";
+	const title = truncateToWidth(`─ btw · side thread${thinking} `, width);
 	const ruleWidth = Math.max(0, width - visibleWidth(title));
 	return theme.fg("muted", `${title}${"─".repeat(ruleWidth)}`);
+}
+
+function thinkingKeyLabel(keybindings: KeybindingsManager): string {
+	const key =
+		sanitizeSingleLine(String(keybindings.getKeys("app.thinking.cycle")[0] ?? "shift+tab")) ||
+		"Shift+Tab";
+	return key
+		.split("+")
+		.map((part) => {
+			const lower = part.toLowerCase();
+			if (lower === "shift") return "Shift";
+			if (lower === "ctrl") return "Ctrl";
+			if (lower === "alt") return "Alt";
+			return part.length === 1
+				? part.toUpperCase()
+				: `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}`;
+		})
+		.join("+");
 }
 
 function fitComposerLayout(

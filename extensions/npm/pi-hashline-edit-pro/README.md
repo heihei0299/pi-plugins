@@ -1,19 +1,17 @@
 # pi-hashline-edit-pro
 
-A [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) extension that replaces the built-in `read` and `edit` tools with a hash-anchored line-replacing workflow. Strict semantics, no silent relocation, no autocorrection, no fuzzy fallback. Every line gets a unique content hash, so edits stay precise and stale anchors are caught before they reach the file.
+A [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) extension that replaces the built-in `read` and `edit` tools with a hash-anchored editing workflow. Every line of a file is tagged with a unique 3-character content hash; `replace` targets lines by those hashes instead of raw text, so stale context is caught and rejected before it reaches the file.
 
-Fork of [pi-hashline-edit](https://github.com/RimuruW/pi-hashline-edit) by RimuruW. The strict-semantics policy is unchanged. This fork extends the upstream design with 3-character hashes and collision resolution for unique per-line anchors.
+Fork of [pi-hashline-edit](https://github.com/RimuruW/pi-hashline-edit) by RimuruW, extending it with 3-character hashes and collision resolution — see [Hashing](#hashing).
 
-Every line returned by `read` carries a short content hash. Edits reference those hashes instead of raw text, so the tool can detect stale context and reject outdated changes before they reach the file.
+## Features
 
-## Why fork?
-
-The original uses 2-character hashes of a 16-character alphabet, with the hash being a pure function of line content. That's 8 bits / 256 buckets, and two byte-identical lines (e.g. repeated `import` statements, repeated `}`) always share a hash because the hash is `xxHash32(content)`.
-
-This fork makes two changes that compound:
-
-1. **3-character hash length** over a 64-char URL-safe base64 alphabet (up from 2 characters in the upstream), expanding the hash space from 256 to 262,144 buckets.
-2. **Perfect hashing (collision resolution).** When computing hashes for a file, if a line's base hash collides with an already-assigned hash, the next available hash is assigned from a bitset (32KB, 262,144 bits) using a hint cursor for O(1) amortized lookup. This ensures every line gets a unique anchor, even within a 3-character hash space. Two byte-identical lines (e.g. repeated `}` or repeated `import` statements) get different hashes automatically.
+- **Hash-anchored reads.** `read` returns every line as `HASH│content`.
+- **Precise edits.** `replace` targets a line range by hash. Mismatched anchors fail loudly with `[E_STALE_ANCHOR]` — never a silent "close enough" relocation.
+- **Stable anchors.** Editing one part of a file leaves the hashes of untouched lines unchanged, so anchors from earlier reads stay valid.
+- **Autocorrection with warnings.** Unambiguous copy-paste mistakes — hash prefixes, diff-preview rows, reversed ranges — are fixed automatically and reported.
+- **Safe writes.** Atomic temp-file-then-rename writes preserve permissions, BOMs, line endings, symlinks, and hard links.
+- **Auto-read.** Fresh anchors are appended to the result of every `write`, `replace`, and `undo_last_replace`.
 
 ## Installation
 
@@ -29,116 +27,127 @@ From a local checkout:
 pi install /path/to/pi-hashline-edit-pro
 ```
 
-## How It Works
+## Quick start
 
-### `read` -- tagged line output
+1. Read a file. Every line comes back with a hash prefix (no line numbers — the hash is the address):
 
-Text files are returned with a `HASH│content` prefix on every line. The line number is not part of the wire format, only the 3-character hash followed by the `│` separator and the line content. Example output for the source below:
+```text
+ve7│function hello() {
+szJ│  console.log("world");
+kQm│}
+```
 
-```js
-function hello() {
-  console.log("world");
+2. Replace a line by its hash:
+
+```json
+{
+  "path": "src/main.ts",
+  "hash_range_inclusive": ["szJ", "szJ"],
+  "content_lines": ["  console.log('hi');"]
 }
 ```
 
-would be returned as:
+3. Keep editing. Anchors for untouched lines remain valid across edits, so hashes from earlier reads keep working; changed lines get fresh anchors, which auto-read appends to each result.
 
-```text
-0qH│function hello() {
-szJ│  console.log("world");
-_zl│}
-```
+## The `read` tool
 
-- `HASH` is a 3-character content hash from the URL-safe base64 alphabet `A-Za-z0-9-_` (e.g. `aB3`). See [Hashing](#hashing) for details.
+Returns a text file with every line prefixed by `HASH│content`. The hash is a 3-character content hash from the alphabet `A-Za-z0-9` (e.g. `aB3`).
 
 Optional parameters:
 
-- `offset` -- start reading from this line number (1-indexed).
-- `limit` -- maximum number of lines to return.
+| Parameter | Description |
+| --- | --- |
+| `offset` | Start reading from this line number (1-indexed). |
+| `limit` | Maximum number of lines to return. |
 
-Images (JPEG, PNG, GIF, WebP) are passed through as attachments and do not participate in the hashline protocol. Binary and directory paths are rejected with a descriptive error. Empty files are returned as a single empty-line hash (`HASH│`). Use replace on that hash to insert content.
+Paged output ends with a continuation hint, e.g. `[Showing lines 1-50 of 120. Use offset=51 to continue.]`.
 
-### `replace` -- hash-anchored modifications
+Edge cases:
 
-Replaces using the `HASH│content` anchors from `read` output to target lines precisely. Two modes are available, toggled via `/toggle-replace-mode` (persists across sessions):
+- **Images** (JPEG, PNG, GIF, WebP) are passed through as visual attachments and don't participate in the hashline protocol.
+- **Binary and directory paths** are rejected with a descriptive error.
+- **UTF-16/UTF-32 encoded text** (detected via BOM) is rejected with `[E_NOT_TEXT]` — editing such a file would decode it as `U+FFFD` garbage and rewrite it as corrupted UTF-8.
+- **Empty files** are returned as a single empty-line hash (`HASH│`); use `replace` on that hash to insert content.
+- **BOMs** are stripped for display; **non-UTF-8 bytes** are shown as `U+FFFD` (editing such a file rewrites it as UTF-8, with a warning).
+- **Files over 238,328 lines** are rejected with `[E_FILE_TOO_LARGE]` (see [Hashing](#hashing)).
 
-**Bulk mode (default):** `hash_range_inclusive` and `content_lines` go inside a `changes` array, supporting multiple edits in one call.
+## The `replace` tool
+
+The built-in `edit` tool is disabled — `replace` is the only edit path; call it with the hash anchors from `read` output.
+
+Exactly one edit per call, with `hash_range_inclusive` and `content_lines` at the top level of the request:
 
 ```json
 {
-  "changes": [
-    { "content_lines": ["  console.log('hashline');"], "hash_range_inclusive": ["ve7", "ve7"] }
-  ],
-  "path": "src/main.ts"
-}
-```
-
-**Flat mode:** `hash_range_inclusive` and `content_lines` sit at the top level. Only one edit per call.
-
-```json
-{
-  "content_lines": ["  console.log('hashline');"],
-  "hash_range_inclusive": ["ve7", "ve7"],
-  "path": "src/main.ts"
+  "path": "src/main.ts",
+  "hash_range_inclusive": ["szJ", "kQm"],
+  "content_lines": ["  console.log('hi');", "}"]
 }
 ```
 
 | Field | Description |
 | --- | --- |
-| `hash_range_inclusive` | Inclusive line range `[start_hash, end_hash]` (required). |
-| `content_lines` | Literal replacement content, one string per line (use `[]` to delete the range). |
+| `hash_range_inclusive` | Pair of 3-char hashes from `read` output marking the first and last line of the range to replace (inclusive). |
+| `content_lines` | Replacement content, one string per line. Use `[]` to delete the range. |
 
-- **Request structure validation.** The request envelope (`path`, `changes` in bulk mode; `path`, `hash_range_inclusive`, `content_lines` in flat mode) and individual edit items are validated before any file I/O. Unknown fields, missing required fields, invalid types, and malformed anchors are rejected with `[E_BAD_SHAPE]` or `[E_BAD_REF]`.
-- **Legacy dialect rejected.** The native top-level `oldText`/`newText` (and `old_text`/`new_text`) dialect is rejected with `[E_LEGACY_SHAPE]`. The error message tells the model to call `read` first and send `{content_lines: [...], hash_range_inclusive: ["<START>", "<END>"]}`.
-- **Batched atomicity (bulk mode).** All edits in a single call validate against the same pre-edit snapshot and apply bottom-up, so the hashes from a single `read` call remain valid across all edits in the batch.
+Behavior:
 
-### Stable hashing across edits
+- **Validation before any file I/O.** Unknown fields, missing fields, wrong types, and malformed anchors are rejected with `[E_BAD_SHAPE]` / `[E_BAD_REF]`. The edit applies against the pre-edit snapshot, so all hashes in the request come from one consistent file state.
+- **Rejected dialects.** The `changes` array dialect and the legacy `oldText`/`newText` dialect are rejected with `[E_BAD_SHAPE]` / `[E_LEGACY_SHAPE]`; the error tells you to send `{hash_range_inclusive: ["<START>", "<END>"], content_lines: [...]}`.
+- **Autocorrections** (all accompanied by a warning unless noted):
+  - A `HASH│` prefix accidentally left on a `content_lines` entry is stripped.
+  - Diff-preview rows (`+HASH│…`, `-HASH│…`, `-   │…`) pasted into `content_lines` have their markers stripped. Numbered deletion rows (`-1    foo`) and unified-diff lines are written literally — never silently altered.
+  - A reversed range (start hash after end hash) is swapped and applied.
+  - A duplicated boundary line — the classic `}`, `});`, or `} else {` pasted twice — is silently removed; the duplicate never reaches the file.
+  - `file_path` is accepted as an alias for `path`; a JSON-string `content_lines` is parsed into an array.
+- **Response.** A successful edit reports `Successfully replaced in {path}. Added X line(s), removed Y line(s).` plus any warnings. An edit that produces identical content reports `No changes made` and never rotates anchors. The post-edit diff is exposed to the host UI via `details.diff` only — it is intentionally not part of the model-visible text.
+- **Undo.** Every successful replace is undoable once via `undo_last_replace` — see [Undo](#undo).
 
-Hashes are now computed with a persistent store (`~/.config/pi-hashline-edit-pro/hash-store.sqlite`) that preserves hashes for unchanged lines across edits. When you replace lines in a file, the runtime maps the old content against the new content and copies hashes for unchanged lines to their new positions. This means editing one part of a file does not change the hashes of unrelated lines elsewhere — the model can keep using previously seen anchors for untouched regions. A replace that produces identical content (a no-op, reported as "No changes made") never rotates hashes: no file change means no anchor change, so previously read anchors remain valid after a no-op.
+## Anchor stability
 
-The store is a SQLite database (WAL journal mode) keyed by canonical file path. Each snapshot stores a 64-bit content checksum (`xxhash64`) plus the per-line hashes, not the full text, so a cache hit is a single keyed lookup and a one-row write. Reads, replaces, undo, and pruning all share one transactional store, so concurrent Pi sessions editing different files never silently clobber each other's snapshots (per-path writers serialize via `BEGIN IMMEDIATE`; same-path concurrent edits still fail safe — stale anchors are rejected by content matching). Stale snapshots (for files that no longer exist) are pruned on session start.
+Hashes are stored in a persistent per-file store (`~/.config/pi-hashline-edit-pro/hash-store.sqlite`) that preserves the hashes of unchanged lines across edits. When a range is replaced, the runtime maps the old content onto the new content and copies hashes for lines that survived; only genuinely new lines get fresh hashes.
 
-On first run after upgrading, a one-time migration imports the previous `hash-store.json` into the database and renames the old file to `hash-store.json.bak`; the old JSON store is otherwise discarded.
+Two guarantees make this safe even with duplicated content:
 
-### Chained edits
+- **An edited range never borrows a hash from a line outside it.** Lines outside the replaced range keep their hashes unconditionally, even when their content is byte-identical to lines inside the range.
+- **Re-inserted identical text keeps its hash.** If replacement content matches a line that was just removed, the removed line's hash is reused — "replace X with X" doesn't rotate the anchor.
 
-After a successful replace, the response confirms with `Successfully replaced in {path}. Added X line(s), removed Y line(s).` (warnings are still shown if present). When auto-read is enabled, fresh anchors are appended automatically. Otherwise call `read` to get fresh anchors for follow-up edits.
-### Auto-read after write and replace
+A no-op replace never changes the file, so anchors remain valid. On first run after upgrading from an older version, the previous `hash-store.json` is imported once and renamed to `hash-store.json.bak`.
 
-Auto-read is **disabled by default**. When enabled, after a successful `write` or `replace` the extension automatically reads the file and appends a `--- Auto-read (hashline anchors) ---` block to the result. This gives the model immediate `HASH│content` anchors for the file without requiring a separate `read` call. The workflow becomes:
+## Auto-read
 
-1. `write` a file, result includes hashline anchors
-2. `replace` using those anchors directly
+Enabled by default. After a successful `write`, `replace`, or `undo_last_replace`, the extension reads the file and appends an `--- Auto-read (hashline anchors) ---` block to the result, so the model gets immediate `HASH│content` anchors without a separate `read` call.
 
-Toggle at runtime with the `/toggle-auto-read` command. The setting persists across sessions in the config file (`~/.config/pi-hashline-edit-pro/config.json`). Set `PI_HASHLINE_AUTO_READ=1` to enable by default on first run.
+- After `replace` / `undo_last_replace`, the block covers the changed span plus 2 lines of context above and below — the rest of the file keeps its anchors from the persistent store.
+- After `write`, the block dumps from the top of the file. For files over 2000 lines, the dump is truncated with a pagination hint — use `read` with `offset` to continue.
+- Toggle at runtime with `/toggle-auto-read`; the setting persists across sessions.
+- If the auto-read itself fails (e.g. the file was deleted between the operation and the read), a short `--- Auto-read failed: ... ---` notice is appended instead of the anchor block, so the model knows the anchors are missing.
 
-For large files (>2000 lines), the auto-read output is truncated with a pagination hint. Use `read` with `offset` to see more.
+## Undo
 
-### Diff for the host
+`undo_last_replace` reverts the most recent successful `replace` on a file, restoring the exact previous content — BOM and line endings included — and the previous anchors.
 
-The post-edit diff (with `+`/`-` markers) is exposed to the host UI via `details.diff`. It is intentionally not in the LLM-visible text. The model already knows what it changed and can call `read` for fresh anchors when needed.
+- History is per-file and single-level: only the most recent replace can be reverted.
+- History is persisted in the hash store (`~/.config/pi-hashline-edit-pro/hash-store.sqlite`) and survives session restarts; a failed `write` does not clear it.
+- A successful `write` clears the history for that file.
+- Call `read` after an undo to get fresh anchors for follow-up edits.
+- **Safety guard.** If the file was modified or deleted since the last replace, `undo_last_replace` refuses with `[E_UNDO_STALE]` rather than overwriting those changes.
 
-### Commands
+## Commands and configuration
 
 | Command | Description |
 | --- | --- |
-| `/toggle-replace-mode` | Switch between bulk mode (`changes` array) and flat mode (top-level fields). Persists across sessions. |
 | `/toggle-auto-read` | Toggle automatic hashline anchors after write and replace operations. Persists across sessions. |
 
-### Config file
-
-Settings are stored in `~/.config/pi-hashline-edit-pro/config.json`:
+Settings live in `~/.config/pi-hashline-edit-pro/config.json`, created automatically when a setting is toggled:
 
 ```json
 {
-  "replaceMode": "bulk",
-  "autoRead": false
+  "autoRead": true
 }
 ```
 
-The file is created automatically when any setting is toggled. Both fields are independent — toggling one never clobbers the other.
-
-### Error codes
+## Error codes
 
 | Code | Meaning |
 | --- | --- |
@@ -146,61 +155,50 @@ The file is created automatically when any setting is toggled. Both fields are i
 | `[E_BAD_REF]` | An anchor in `hash_range_inclusive` is not a bare 3-char hash. |
 | `[E_STALE_ANCHOR]` | An anchor does not match any line in the current file; call `read` for fresh anchors. |
 | `[E_AMBIGUOUS_ANCHOR]` | An anchor matches multiple lines; call `read` for fresh anchors. |
-| `[E_INVALID_PATCH]` | `content_lines` contains diff-preview rows (`+HASH│`, `-HASH│`, `-   │`, `-N   `). |
-| `[E_BARE_HASH_PREFIX]` | A `content_lines` entry starts with a hash-like `HASH│` prefix. |
+| `[E_INVALID_PATCH]` | A `content_lines` entry is a diff-preview row (`+HASH│`, `-HASH│`, `-   │`) — the marker is stripped automatically with a warning. |
+| `[E_BARE_HASH_PREFIX]` | A `content_lines` entry starts with a hash-like `HASH│` prefix — the prefix is stripped automatically with a warning. |
 | `[E_LEGACY_SHAPE]` | The request uses the unsupported `oldText`/`newText` dialect. |
-| `[E_BAD_OP]` | Range start line is after range end line. |
-| `[E_EDIT_CONFLICT]` | Two edits in one batch overlap the same original lines. |
+| `[E_BAD_OP]` | Range start line is after range end line — the pair is swapped automatically with a warning. |
 | `[E_WOULD_EMPTY]` | An edit would empty a non-empty file; use `write` instead. |
-| `[E_FILE_TOO_LARGE]` | The file exceeds the 262,144-line hashline limit. |
+| `[E_NOT_FOUND]` | The path does not exist. |
+| `[E_ACCESS]` | The file is not readable or writable. |
+| `[E_NOT_TEXT]` | The path is a directory, binary file, image, or UTF-16/UTF-32 encoded text; hashline editing only supports text files. |
+| `[E_UNDO_STALE]` | `undo_last_replace` refused: the file was modified or deleted after the last replace. |
+| `[E_FILE_TOO_LARGE]` | The file exceeds the 238,328-line hashline limit. |
 
-## Design Decisions
-
-- **Stale anchors fail (per-line).** A hash mismatch means that specific line's content changed since the last `read`; the error tells the model to call `read()` to get fresh anchors, then copy the 3-character HASH of the start and end of the range being replaced into `hash_range_inclusive` of the next replace call. Because staleness is per-line, editing or appending lines does **not** invalidate anchors for lines whose content is unchanged — anchors for untouched regions stay valid across edits to other regions.
-- **No fallback relocation.** Mismatched anchors are never silently relocated to a "close enough" line. This trades convenience for correctness.
-- **Strict patch content.** If `content_lines` contains diff-preview rows — `+HASH│` addition prefixes, `-HASH│` or `-   │` deletion rows (the padded format the diff preview emits), or `-N   ` numbered deletion rows — the edit is rejected with `[E_INVALID_PATCH]`. This narrowly guards against pasting the tool's own diff-preview rows back as content; standard unified-diff lines (`+x`, `-x`, ` x`, `@@ … @@`) are **not** rejected — they are written literally, since literal content must never be silently altered. Bare `HASH│` content (the first 4 chars of a `content_lines` entry looking like 3 base64 chars + `│`) is rejected with `[E_BARE_HASH_PREFIX]`. When the suspect's prefix happens to match a real file-line anchor, the error message flags that as strong evidence the model copied an anchor from the read output.
-
-- **BOM preservation.** A UTF-8 BOM is stripped for display and hashing but restored on write, so edits (and undo) never silently strip a BOM from a file that has one.
-- **Atomic writes.** Files are written via temp-file-then-rename to avoid corruption from interrupted writes. Symlink chains are resolved so the target file is updated without replacing the symlink. Hard-linked files are updated in place to preserve the shared inode. File permissions are preserved across atomic renames.
-- **Per-file mutation queue.** Edits queue by the canonical write target, so concurrent edits through different symlink paths still serialize onto the same underlying file.
-- **Boundary duplication auto-fix.** When the last line of a replacement matches the next surviving line (or the first line matches the preceding one), the runtime automatically strips the duplicate from `content_lines` before applying the edit. This catches a common LLM pattern where closing delimiters like `}`, `});`, or `} else {` are accidentally duplicated. The auto-fix is completely silent — the model sees a normal successful edit. The duplicate never reaches the file. Raw line comparison (not trimmed) avoids false positives when indentation differs.
-- **Flat mode normalization.** When flat mode is active, the tool's `execute` function wraps the top-level `hash_range_inclusive` and `content_lines` into a single-element `changes` array internally, then runs the same pipeline as bulk mode. The `normReq` function in `replace-normalize.ts` also handles flat format directly, so any code path that normalizes input (e.g. `compPreview`) works with both formats.
-- **Persistent hash store.** `lineHashes` is async and uses a persistent store to preserve hashes for unchanged lines across edits. The store is a SQLite database at `~/.config/pi-hashline-edit-pro/hash-store.sqlite` (per-path snapshots keyed by resolved path storing a 64-bit content checksum + line hashes; auto-created on first use). When called from the replace pipeline, it maps old vs new content and copies hashes for unchanged lines. When called from read, it returns saved hashes if the content's checksum matches, otherwise computes fresh hashes via `_lineHashesPure`. Stale snapshots are pruned on session start. This ensures that editing one part of a file does not cascade to change hashes of unrelated lines. Per-operation work scales with the target file, not cumulative history. If the database is corrupt or unreadable it is quarantined (renamed to `hash-store.sqlite.corrupt-<timestamp>`) and rebuilt from content on the next session start — the store is a cache, never a source of truth.
 ## Hashing
 
-Hashes are computed with [xxhash-wasm](https://github.com/jungomi/xxhash-wasm) (xxHash32 via WebAssembly), then mapped to a 3-character string from the URL-safe base64 alphabet `A-Za-z0-9-_`. That's 64 distinct characters, 6 bits per position, 18 bits of entropy per anchor.
+Each line is canonicalized (carriage returns stripped, trailing whitespace trimmed) and hashed with [xxhash-wasm](https://github.com/jungomi/xxhash-wasm) (xxHash32), then mapped to a 3-character string over `A-Za-z0-9` — 62³ = 238,328 possible anchors. The canonicalization keeps anchors stable across editor-save cycles that add or remove trailing whitespace.
 
-The alphabet is sized for an LLM consumer. The model tokenizes, it doesn't squint at pixel glyphs, so the human-readability heuristics used by smaller hand-curated alphabets (no G/L/I/O because they look like digits, no vowels so the hash doesn't accidentally spell a word, no hex digits so it can't be confused with `0xFF`) don't apply. The full 64 chars give maximum entropy per character, with case and digits included.
+The alphabet is sized for an LLM consumer: the model tokenizes rather than squinting at glyphs, so case and digits are all included. The URL-safe specials `-` and `_` are deliberately excluded — a hash starting with `-` is shape-identical to a diff-preview deletion row, and `-`/`_` at a line start are markdown-active, inviting mis-copying and false autocorrections.
 
-Before hashing, each line is normalized: carriage returns are stripped and trailing whitespace is trimmed. This `canon()` normalization prevents insignificant whitespace changes from cascade-triggering hash churn across the file. Two lines that differ only in trailing spaces or `\r` characters produce the same hash, so anchor stability is preserved across editor-save cycles that add or remove trailing whitespace.
+**Unique anchors by construction.** If a line's base hash collides with an already-assigned hash, the next free hash is allocated from a bitset (O(1) amortized). Every line in a file therefore gets a unique anchor — two byte-identical lines (repeated `}`, repeated `import` statements) never share one. The same guarantee sets the file size cap: at most 238,328 lines per file, beyond which `read` and `replace` reject with `[E_FILE_TOO_LARGE]` (use `write` for very large files).
 
-**Perfect hashing (collision resolution):** When computing hashes for a file, if a line's base hash collides with an already-assigned hash, the next available hash is assigned from a bitset (32KB, 262,144 bits) using a hint cursor for O(1) amortized lookup. This ensures every line in a file gets a unique anchor, even with the shorter 3-character hash space. Two byte-identical lines (e.g. repeated `}` or repeated `import` statements) get different hashes automatically.
-The runtime always precomputes the full per-line hash array for a file via `lineHashes(content, path)`, then looks up by line number during validation and during `read` / `replace` response formatting. There is no per-line recomputation that could disagree with what the model saw in its last read. When `path` is provided, `lineHashes` uses a persistent store to preserve hashes for unchanged lines across edits — see [Stable hashing across edits](#stable-hashing-across-edits).
-`HASH_LEN` in `src/hashline/hash.ts` sets the hash body length; bump it to 4 if you need even more entropy without collision resolution.
+## Design decisions
 
-The 3-character space holds 262,144 unique anchors, so files are capped at 262,144 lines: `read` and `replace` reject larger files with `[E_FILE_TOO_LARGE]` (use `write` or a non-line-based approach for very large files).
-
-### Bare-prefix detector
-
-With the `│` delimiter format, the bare-prefix detector regex `^\s*([A-Za-z0-9_\-]{3})│` is highly specific. It only matches lines starting with a hash-like prefix. This eliminates false positives from common code patterns like `init:`, `data:`, `else:`, etc. The detector rejects edit lines matching this pattern with `[E_BARE_HASH_PREFIX]` to prevent the model from accidentally pasting hash anchors into file content.
+- **Stale anchors fail, per line.** A hash mismatch means that line's content changed since the last `read`. The error says so and, when only one anchor of a pair is stale, shows the current lines around the still-valid anchor so the range can be re-located without a full re-read. Mismatched anchors are never silently relocated to a "close enough" line — correctness over convenience.
+- **Autocorrection only when the intent is unambiguous**, and always visible: hash-prefix and diff-row stripping produce a warning; the boundary-duplication fix is silent because the duplicate never reaches the file. Literal content is never silently altered when the intent is ambiguous (numbered deletion rows and unified-diff lines are written verbatim).
+- **Byte-exact preservation.** UTF-8 BOMs, CRLF, LF, and CR-only line endings, file permissions, and trailing newlines survive edits and undo.
+- **Atomic and ordered writes.** Files are written via temp-file-then-rename; symlink chains are resolved so the target is updated without replacing the symlink; hard-linked files are updated in place; concurrent edits to the same underlying file serialize through a per-target mutation queue.
+- **One edit per call.** The request shape stays `{path, hash_range_inclusive, content_lines}` from schema through validation to application; there is no batching dialect.
 
 ## Development
 
-Requires [Node.js](https://nodejs.org) and npm.
+Requires [Node.js](https://nodejs.org) ≥ 22.13 and npm.
 
 ```bash
 npm install
 npm test
+npm run lint
+npm run typecheck
 ```
 
 Set `PI_HASHLINE_DEBUG=1` to show an "active" notification at session start.
 
-Set `PI_HASHLINE_AUTO_READ=1` to enable auto-read after write and replace by default on first run (can still be toggled at runtime with `/toggle-auto-read`; the setting persists across sessions once toggled).
-
 ## Credits
 
-- [RimuruW](https://github.com/RimuruW) -- original `pi-hashline-edit` and the strict-semantics policy
-- [can1357](https://github.com/can1357) -- original [oh-my-pi](https://github.com/can1357/oh-my-pi) implementation and the hashline concept
+- [RimuruW](https://github.com/RimuruW) — original `pi-hashline-edit` and the strict-semantics policy
+- [can1357](https://github.com/can1357) — original [oh-my-pi](https://github.com/can1357/oh-my-pi) implementation and the hashline concept
 
 ## License
 

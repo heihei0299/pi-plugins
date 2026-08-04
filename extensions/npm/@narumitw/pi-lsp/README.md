@@ -16,6 +16,45 @@ The extension is language-agnostic: servers are selected by config and file exte
 - Starts language servers only for tool calls, then shuts them down.
 - Shows statusline activity only while LSP tools are running.
 
+## 🎯 When to use pi-lsp
+
+Use pi-lsp when an LSP can answer a targeted question about the files being edited faster than the
+project's authoritative validation commands. It is most useful when:
+
+- a full-project lint or typecheck is slow, but only a few files need intermediate feedback;
+- structured diagnostics with exact ranges and severity are easier to act on than CLI output;
+- a language server provides a useful source action such as `source.fixAll` or
+  `source.organizeImports`;
+- a multi-language repository benefits from one configurable interface for targeted diagnostics.
+
+For most repositories, first document the authoritative format, lint, typecheck, build, and test
+commands in `AGENTS.md`, then enforce them with pre-commit hooks or CI where appropriate. If those
+commands are already fast and reliable, pi-lsp may add little value.
+
+A practical workflow is:
+
+1. Use `lsp_diagnostics` during an edit only when targeted feedback is useful.
+2. Optionally use `lsp_fix` for a supported server-provided source action.
+3. Before considering the task complete, run the repository's authoritative validation commands.
+4. Treat pre-commit hooks and CI as the final enforcement layer.
+
+### Current limitations
+
+- Diagnostics are not continuously injected into the conversation; the agent must call
+  `lsp_diagnostics`.
+- Language servers start and stop for each tool call, so pi-lsp does not retain an editor-like
+  incremental session.
+- The current tools expose diagnostics and source code actions, not symbol navigation, references,
+  or semantic rename.
+- A clean LSP result does not replace the project's formatter, linter, type checker, build, or tests.
+- This project has not yet demonstrated through benchmarks that LSP improves agent task success,
+  latency, or tool usage.
+
+This outcome-first framing is informed by
+[Eric Traut's comment on LSP integration for coding agents](https://github.com/openai/codex/issues/8745#issuecomment-3713058579):
+the protocol was not designed specifically for coding agents, and repository-native checks may
+already provide much of the desired verification value.
+
 ## 📦 Install
 
 ```bash
@@ -80,14 +119,23 @@ Ensure the Go install directory (`$GOBIN` or `$(go env GOPATH)/bin`) is also on 
 
 Custom config is resolved in this order:
 
-1. `PI_LSP_CONFIG` as inline JSON or a path to a JSON file
-2. `<workspace>/.pi/pi-lsp.json`, only when Pi trusts the current project
-3. `~/.pi/agent/pi-lsp.json`
-4. the built-in server catalog
+1. `<workspace>/.pi/pi-lsp.json`, only when Pi trusts the current project
+2. `~/.pi/agent/pi-lsp.json`
+3. the built-in server catalog
 
-`PI_LSP_CONFIG` only accepts JSON or a JSON file path; JavaScript and TypeScript config files are not evaluated. An untrusted project's canonical and legacy files are ignored. A `root` passed to an LSP tool selects files and the server working directory; it does not grant that directory authority to provide project settings. Project settings always come from the trusted Pi session workspace.
+An untrusted project's canonical and legacy files are ignored. A `root` passed to an LSP tool selects files and the server working directory; it does not grant that directory authority to provide project settings. Project settings always come from the trusted Pi session workspace.
 
 Compatibility: user-scoped `lsp.json` and trusted project-scoped `.pi/lsp.json` remain readable with a warning and are never modified automatically; rename them to their canonical `pi-lsp.json` names. New paths take precedence when both names exist.
+
+pi-lsp-specific environment settings have been removed. Move their values into canonical JSON:
+
+| Removed setting | JSON replacement |
+| --- | --- |
+| `PI_LSP_CONFIG` inline JSON | Save the same object as user `pi-lsp.json` or trusted project `.pi/pi-lsp.json` |
+| `PI_LSP_CONFIG=/path/to/file.json` | Move or copy that configuration to one of the canonical paths above |
+| `PI_<SERVER>_LSP_COMMAND` | Set the server's `command` to an argv array, with one string per executable or argument |
+
+`servers[].env` remains supported because it configures the launched LSP child process rather than pi-lsp itself.
 
 Providing custom config replaces the default server map. The following `pi-lsp.json` example intentionally keeps five selected servers:
 
@@ -155,7 +203,7 @@ Each server entry supports:
 
 - `command`: argv array used to start the LSP server.
 - `extensions`: file extensions that should route to this server.
-- `env`: extra environment variables for the LSP server process.
+- `env`: environment overrides for the LSP server process. The child inherits Pi's environment, then applies these values; an `env.PATH` value is also used to resolve `command[0]`.
 - `initialization`: LSP initialization options and workspace configuration values.
 - `skipDirectories`: additional directory names to exclude from recursive discovery. Explicitly requested paths remain available.
 - `diagnosticsSettleMs`: positive number of milliseconds without another push-diagnostics publication before using the latest result. Defaults to `800`; the built-in intelephense route uses `4000`. The global timeout remains the upper bound.
@@ -168,12 +216,17 @@ Global options:
 
 pi-lsp infers `languageId` from common extensions and falls back to the extension without the leading dot.
 
-Per-server command overrides still use the normalized server name:
+For example, run the configured Ruff server through the project's uv environment without shell-string parsing:
 
-```bash
-PI_TY_LSP_COMMAND="uvx ty server" \
-PI_RUFF_LSP_COMMAND="uvx ruff server" \
-pi -e ./extensions/pi-lsp
+```json
+{
+  "servers": {
+    "ruff": {
+      "command": ["uv", "run", "--no-sync", "ruff", "server"],
+      "extensions": [".py", ".pyi"]
+    }
+  }
+}
 ```
 
 ## ⚠️ Tool changes

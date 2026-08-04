@@ -1,4 +1,3 @@
-import * as os from "node:os";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import {
@@ -10,6 +9,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import type { AgentScope, SubagentThinkingLevel } from "./agents.js";
 import { hasUsableAggregator, type SubagentParams } from "./params.js";
+import { expansionHint, formatToolActivity, safeBlock, safeLine } from "./render-common.js";
 import {
 	getResultFinalOutput,
 	isResultError,
@@ -17,15 +17,15 @@ import {
 	type SubagentDetails,
 } from "./runner.js";
 
-const COLLAPSED_ITEM_COUNT = 10;
+const COLLAPSED_ITEM_COUNT = 5;
 
 function previewTask(task: unknown, maxLength = 40): string {
-	if (typeof task !== "string" || task.length === 0) return "...";
-	return task.length > maxLength ? `${task.slice(0, maxLength)}...` : task;
+	const safe = safeLine(task, "...", 2 * 1024);
+	return safe.length > maxLength ? `${safe.slice(0, maxLength)}...` : safe;
 }
 
 function previewAgent(agent: unknown): string {
-	return typeof agent === "string" && agent.length > 0 ? agent : "...";
+	return safeLine(agent, "...", 256);
 }
 
 export function formatTokens(count: number): string {
@@ -59,12 +59,12 @@ export function formatUsageStats(
 	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
 	if (usage.contextTokens && usage.contextTokens > 0)
 		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
+	const safeProvider = actualProvider ? safeLine(actualProvider, "", 256) : undefined;
+	const safeModel = actualModel ? safeLine(actualModel, "", 256) : undefined;
 	const actual =
-		actualProvider && actualModel
-			? `${actualProvider}/${actualModel}`
-			: (actualModel ?? actualProvider);
-	if (actual ?? model) parts.push(actual ?? model ?? "");
-	if (thinkingLevel) parts.push(`requested-thinking:${thinkingLevel}`);
+		safeProvider && safeModel ? `${safeProvider}/${safeModel}` : (safeModel ?? safeProvider);
+	if (actual ?? model) parts.push(actual ?? safeLine(model, "", 256));
+	if (thinkingLevel) parts.push(`requested-thinking:${safeLine(thinkingLevel, "", 128)}`);
 	return parts.join(" ");
 }
 
@@ -83,71 +83,7 @@ function formatToolCall(
 	args: Record<string, unknown>,
 	themeFg: (color: ThemeColor, text: string) => string,
 ): string {
-	const shortenPath = (p: string) => {
-		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-	};
-
-	switch (toolName) {
-		case "bash": {
-			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
-			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
-		}
-		case "read": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const offset = args.offset as number | undefined;
-			const limit = args.limit as number | undefined;
-			let text = themeFg("accent", filePath);
-			if (offset !== undefined || limit !== undefined) {
-				const startLine = offset ?? 1;
-				const endLine = limit !== undefined ? startLine + limit - 1 : "";
-				text += themeFg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
-			}
-			return themeFg("muted", "read ") + text;
-		}
-		case "write": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const content = (args.content || "") as string;
-			const lines = content.split("\n").length;
-			let text = themeFg("muted", "write ") + themeFg("accent", filePath);
-			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
-			return text;
-		}
-		case "edit": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "ls": {
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "find": {
-			const pattern = (args.pattern || "*") as string;
-			const rawPath = (args.path || ".") as string;
-			return (
-				themeFg("muted", "find ") +
-				themeFg("accent", pattern) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
-		}
-		case "grep": {
-			const pattern = (args.pattern || "") as string;
-			const rawPath = (args.path || ".") as string;
-			return (
-				themeFg("muted", "grep ") +
-				themeFg("accent", `/${pattern}/`) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
-		}
-		default: {
-			const argsStr = JSON.stringify(args);
-			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
-			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
-		}
-	}
+	return formatToolActivity(toolName, args, themeFg);
 }
 
 type DisplayItem =
@@ -160,10 +96,14 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 		if (msg.role === "assistant") {
 			for (const part of msg.content) {
 				if (part.type === "text") {
-					const text = part.text.trim();
+					const text = safeBlock(part.text, "", 8 * 1024).trim();
 					if (text) items.push({ type: "text", text });
 				} else if (part.type === "toolCall") {
-					items.push({ type: "toolCall", name: part.name, args: part.arguments });
+					items.push({
+						type: "toolCall",
+						name: safeLine(part.name, "tool", 256),
+						args: part.arguments,
+					});
 				}
 			}
 		}
@@ -179,6 +119,47 @@ function getCollapsedDisplayItems(result: SingleResult): { items: DisplayItem[];
 	}
 	const items = getDisplayItems(result.messages);
 	return { items, total: items.length };
+}
+
+function sanitizeSingleResultForRender(result: SingleResult): SingleResult {
+	return {
+		...result,
+		agent: safeLine(result.agent, "subagent", 256),
+		task: safeBlock(result.task, "", 50 * 1024),
+		stderr: safeBlock(result.stderr, "", 8 * 1024),
+		model: result.model ? safeLine(result.model, "", 256) : undefined,
+		actualProvider: result.actualProvider ? safeLine(result.actualProvider, "", 256) : undefined,
+		actualModel: result.actualModel ? safeLine(result.actualModel, "", 256) : undefined,
+		stopReason: result.stopReason ? safeLine(result.stopReason, "", 256) : undefined,
+		errorMessage: result.errorMessage ? safeBlock(result.errorMessage, "", 8 * 1024) : undefined,
+		finalOutput: result.finalOutput ? safeBlock(result.finalOutput, "", 50 * 1024) : undefined,
+	};
+}
+
+function renderResultStatus(result: SingleResult, isPartial: boolean): string {
+	if (isResultError(result)) {
+		return result.stopReason === "aborted" || result.aborted ? "Cancelled" : "Failed";
+	}
+	return isPartial || result.exitCode === -1 ? "Running" : "Completed";
+}
+
+function coloredStatus(theme: Theme, status: string): string {
+	const color: ThemeColor =
+		status === "Failed" ? "error" : status === "Completed" ? "success" : "warning";
+	return theme.fg(color, status);
+}
+
+function coloredResultStatus(theme: Theme, result: SingleResult, isPartial: boolean): string {
+	return coloredStatus(theme, renderResultStatus(result, isPartial));
+}
+
+function formatResultPolicy(result: SingleResult): string {
+	if (!result.policy) return "";
+	return [
+		`inherited: ${result.policy.inherited.map((tool) => safeLine(tool, "", 256)).join(", ") || "none"}`,
+		`overridden: ${result.policy.overridden.map((tool) => safeLine(tool, "", 256)).join(", ") || "none"}`,
+		`unsupported: ${result.policy.unsupported.map((tool) => safeLine(tool, "", 256)).join(", ") || "none"}`,
+	].join("\n");
 }
 
 export function renderSubagentCall(args: SubagentParams, theme: Theme) {
@@ -239,11 +220,22 @@ export function renderSubagentResult(
 	{ expanded, isPartial }: ToolRenderResultOptions,
 	theme: Theme,
 ) {
-	const details = result.details as SubagentDetails | undefined;
-	if (!details || details.results.length === 0) {
+	const rawDetails = result.details as SubagentDetails | undefined;
+	if (!rawDetails || rawDetails.results.length === 0) {
 		const text = result.content[0];
-		return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+		return new Text(
+			text?.type === "text" ? safeBlock(text.text, "(no output)", 8 * 1024) : "(no output)",
+			0,
+			0,
+		);
 	}
+	const details: SubagentDetails = {
+		...rawDetails,
+		results: rawDetails.results.map(sanitizeSingleResultForRender),
+		aggregator: rawDetails.aggregator
+			? sanitizeSingleResultForRender(rawDetails.aggregator)
+			: undefined,
+	};
 
 	const mdTheme = getMarkdownTheme();
 
@@ -254,7 +246,8 @@ export function renderSubagentResult(
 		if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
 		for (const item of toShow) {
 			if (item.type === "text") {
-				const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
+				const safeText = safeBlock(item.text, "", 8 * 1024);
+				const preview = expanded ? safeText : safeText.split("\n").slice(0, 3).join("\n");
 				text += `${theme.fg("toolOutput", preview)}\n`;
 			} else {
 				text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
@@ -276,7 +269,7 @@ export function renderSubagentResult(
 
 		if (expanded) {
 			const container = new Container();
-			let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+			let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${safeLine(r.agentSource, "unknown", 128)})`)} · ${coloredResultStatus(theme, r, isPartial)}`;
 			if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 			container.addChild(new Text(header, 0, 0));
 			if (isError && r.errorMessage)
@@ -284,6 +277,12 @@ export function renderSubagentResult(
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
 			container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
+			const policy = formatResultPolicy(r);
+			if (policy) {
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("muted", "─── Policy ───"), 0, 0));
+				container.addChild(new Text(theme.fg("dim", policy), 0, 0));
+			}
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
 			if (displayItems.length === 0 && !finalOutput) {
@@ -314,15 +313,16 @@ export function renderSubagentResult(
 		}
 
 		const collapsed = getCollapsedDisplayItems(r);
-		let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+		let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${safeLine(r.agentSource, "unknown", 128)})`)} · ${coloredResultStatus(theme, r, isPartial)}`;
 		if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 		if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
 		if (collapsed.items.length > 0) {
 			text += `\n${renderDisplayItems(collapsed.items, COLLAPSED_ITEM_COUNT, collapsed.total)}`;
-			if (collapsed.total > COLLAPSED_ITEM_COUNT)
-				text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+			if (collapsed.total > COLLAPSED_ITEM_COUNT) text += `\n${expansionHint()}`;
 		} else if (finalOutput.trim()) {
-			text += `\n${theme.fg("toolOutput", finalOutput.trim().split("\n").slice(0, 3).join("\n"))}`;
+			const outputLines = finalOutput.trim().split("\n");
+			text += `\n${theme.fg("toolOutput", outputLines.slice(0, 3).join("\n"))}`;
+			if (outputLines.length > 3) text += `\n${expansionHint()}`;
 		} else if (!isError || !r.errorMessage) {
 			text += `\n${theme.fg("muted", isPartial && !isError ? "(running...)" : "(no output)")}`;
 		}
@@ -356,6 +356,11 @@ export function renderSubagentResult(
 			: successCount === details.results.length
 				? theme.fg("success", "✓")
 				: theme.fg("error", "✗");
+		const overallStatus = currentIsRunning
+			? "Running"
+			: successCount === details.results.length
+				? "Completed"
+				: "Failed";
 
 		if (expanded) {
 			const container = new Container();
@@ -364,7 +369,8 @@ export function renderSubagentResult(
 					icon +
 						" " +
 						theme.fg("toolTitle", theme.bold("chain ")) +
-						theme.fg("accent", `${successCount}/${details.results.length} steps`),
+						theme.fg("accent", `${successCount}/${details.results.length} steps`) +
+						` · ${coloredStatus(theme, overallStatus)}`,
 					0,
 					0,
 				),
@@ -383,12 +389,17 @@ export function renderSubagentResult(
 				container.addChild(new Spacer(1));
 				container.addChild(
 					new Text(
-						`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}`,
+						`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon} ${coloredResultStatus(theme, r, currentIsRunning && r === currentResult)}`,
 						0,
 						0,
 					),
 				);
 				container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+				const policy = formatResultPolicy(r);
+				if (policy)
+					container.addChild(
+						new Text(theme.fg("muted", "Policy:\n") + theme.fg("dim", policy), 0, 0),
+					);
 				if (rFailed && r.errorMessage)
 					container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
 
@@ -429,7 +440,8 @@ export function renderSubagentResult(
 			icon +
 			" " +
 			theme.fg("toolTitle", theme.bold("chain ")) +
-			theme.fg("accent", `${successCount}/${details.results.length} steps`);
+			theme.fg("accent", `${successCount}/${details.results.length} steps`) +
+			` · ${coloredStatus(theme, overallStatus)}`;
 		for (const r of details.results) {
 			const rFailed = isResultError(r);
 			const rIcon = rFailed
@@ -439,7 +451,7 @@ export function renderSubagentResult(
 					: theme.fg("success", "✓");
 			const collapsed = getCollapsedDisplayItems(r);
 			const finalOutput = getResultFinalOutput(r).trim();
-			text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
+			text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon} ${coloredResultStatus(theme, r, currentIsRunning && r === currentResult)}`;
 			if (rFailed && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
 			if (collapsed.items.length > 0)
 				text += `\n${renderDisplayItems(collapsed.items, 5, collapsed.total)}`;
@@ -451,7 +463,7 @@ export function renderSubagentResult(
 		}
 		const usageStr = formatUsageStats(aggregateUsage(details.results));
 		if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
-		text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+		text += `\n${expansionHint()}`;
 		return new Text(text, 0, 0);
 	}
 
@@ -485,12 +497,17 @@ export function renderSubagentResult(
 			: aggregator
 				? `${successCount}/${details.results.length} tasks + fan-in`
 				: `${successCount}/${details.results.length} tasks`;
+		const overallStatus = isRunning
+			? "Running"
+			: failCount > 0 || aggregatorFailed
+				? "Failed"
+				: "Completed";
 
 		if (expanded && !isRunning) {
 			const container = new Container();
 			container.addChild(
 				new Text(
-					`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
+					`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)} · ${coloredStatus(theme, overallStatus)}`,
 					0,
 					0,
 				),
@@ -508,9 +525,18 @@ export function renderSubagentResult(
 
 				container.addChild(new Spacer(1));
 				container.addChild(
-					new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
+					new Text(
+						`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon} ${coloredResultStatus(theme, r, resultIsRunning(r))}`,
+						0,
+						0,
+					),
 				);
 				container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+				const policy = formatResultPolicy(r);
+				if (policy)
+					container.addChild(
+						new Text(theme.fg("muted", "Policy:\n") + theme.fg("dim", policy), 0, 0),
+					);
 				if (rFailed && r.errorMessage)
 					container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
 
@@ -550,7 +576,7 @@ export function renderSubagentResult(
 				container.addChild(new Spacer(1));
 				container.addChild(
 					new Text(
-						`${theme.fg("muted", "─── fan-in → ") + theme.fg("accent", aggregator.agent)} ${rIcon}`,
+						`${theme.fg("muted", "─── fan-in → ") + theme.fg("accent", aggregator.agent)} ${rIcon} ${coloredResultStatus(theme, aggregator, aggregatorRunning)}`,
 						0,
 						0,
 					),
@@ -558,6 +584,11 @@ export function renderSubagentResult(
 				container.addChild(
 					new Text(theme.fg("muted", "Task: ") + theme.fg("dim", aggregator.task), 0, 0),
 				);
+				const aggregatorPolicy = formatResultPolicy(aggregator);
+				if (aggregatorPolicy)
+					container.addChild(
+						new Text(theme.fg("muted", "Policy:\n") + theme.fg("dim", aggregatorPolicy), 0, 0),
+					);
 				if (aggregatorFailed && aggregator.errorMessage)
 					container.addChild(
 						new Text(theme.fg("error", `Error: ${aggregator.errorMessage}`), 0, 0),
@@ -592,7 +623,7 @@ export function renderSubagentResult(
 		}
 
 		// Collapsed view (or still running)
-		let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
+		let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)} · ${coloredStatus(theme, overallStatus)}`;
 		for (const r of details.results) {
 			const rFailed = isResultError(r);
 			const rRunning = resultIsRunning(r);
@@ -603,7 +634,7 @@ export function renderSubagentResult(
 					: theme.fg("success", "✓");
 			const collapsed = getCollapsedDisplayItems(r);
 			const finalOutput = getResultFinalOutput(r).trim();
-			text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
+			text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon} ${coloredResultStatus(theme, r, rRunning)}`;
 			if (rFailed && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
 			if (collapsed.items.length > 0)
 				text += `\n${renderDisplayItems(collapsed.items, 5, collapsed.total)}`;
@@ -620,7 +651,7 @@ export function renderSubagentResult(
 					: theme.fg("success", "✓");
 			const collapsed = getCollapsedDisplayItems(aggregator);
 			const finalOutput = getResultFinalOutput(aggregator).trim();
-			text += `\n\n${theme.fg("muted", "─── fan-in → ")}${theme.fg("accent", aggregator.agent)} ${rIcon}`;
+			text += `\n\n${theme.fg("muted", "─── fan-in → ")}${theme.fg("accent", aggregator.agent)} ${rIcon} ${coloredResultStatus(theme, aggregator, aggregatorRunning)}`;
 			if (aggregatorFailed && aggregator.errorMessage)
 				text += `\n${theme.fg("error", `Error: ${aggregator.errorMessage}`)}`;
 			if (collapsed.items.length > 0)
@@ -636,10 +667,14 @@ export function renderSubagentResult(
 			const usageStr = formatUsageStats(aggregateUsage(usageResults));
 			if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
 		}
-		if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+		if (!expanded) text += `\n${expansionHint()}`;
 		return new Text(text, 0, 0);
 	}
 
 	const text = result.content[0];
-	return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+	return new Text(
+		text?.type === "text" ? safeBlock(text.text, "(no output)", 8 * 1024) : "(no output)",
+		0,
+		0,
+	);
 }

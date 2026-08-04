@@ -1,7 +1,9 @@
 // types.ts - Core type definitions
 import type { Transport as McpTransport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { ContentBlock as McpContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import type { TextContent, ImageContent } from "@earendil-works/pi-ai";
 import type { UiStreamMode } from "./ui-stream-types.ts";
+import type { UiToolVisibility } from "./ui-tool-visibility.ts";
 
 export type Transport = McpTransport;
 
@@ -256,12 +258,35 @@ export interface UiSessionMessages {
   prompts: string[];
   notifications: string[];
   intents: Array<{ intent: string; params?: Record<string, unknown> }>;
+  contexts: UiModelContextUpdate[];
+}
+
+export interface UiModelContextUpdate {
+  summary: string;
+  truncated: boolean;
+  payload?: Record<string, unknown>;
 }
 
 export interface UiModelContextParams {
-  content?: unknown[];
+  content?: McpContentBlock[];
   structuredContent?: Record<string, unknown>;
-  [key: string]: unknown;
+}
+
+export function createUiModelContextUpdate(params: UiModelContextParams, maxChars = 12_000): UiModelContextUpdate | undefined {
+  const payload = Object.fromEntries(
+    Object.entries(params).filter(([, value]) => value !== undefined),
+  );
+  if (Object.keys(payload).length === 0) return undefined;
+
+  const serialized = JSON.stringify(payload);
+  if (serialized.length <= maxChars) {
+    return { payload, summary: serialized, truncated: false };
+  }
+
+  return {
+    summary: `${serialized.slice(0, Math.max(0, maxChars - 1))}…`,
+    truncated: true,
+  };
 }
 
 export interface UiOpenLinkResult {
@@ -356,6 +381,8 @@ export interface ServerEntry {
   // Include/exclude specific MCP tools/resources by original or prefixed name
   includeTools?: string[];
   excludeTools?: string[];
+  // Require interactive approval before calling matching MCP tools/resources.
+  approveTools?: boolean | string[];
   // Debug
   debug?: boolean;  // Show server stderr (default: false)
   /** Enable metadata-only JSONL protocol tracing for this server. */
@@ -406,7 +433,16 @@ export interface McpSettings {
   idleTimeout?: number; // minutes, default 10, 0 to disable
   requestTimeoutMs?: number; // milliseconds, overrides the SDK request timeout when > 0
   directTools?: boolean;
+  /** Register the trusted MCP-only JavaScript scripting tool. Defaults to true; set false to hide it. */
+  scriptMode?: boolean;
+  /** Default approval gate for matching tools/resources; per-server settings override it. */
+  approveTools?: boolean | string[];
   disableProxyTool?: boolean;
+  /** Freeze direct-tool registration after the initial sync. Automatic metadata updates
+   * (reconnects, lazy-connect, tool-list-changed) won't rebuild the system prompt,
+   * preserving the prompt-cache prefix. The agent rediscovers explicitly via
+   * mcp({ connect: "server" }). Default: false. */
+  freezeDirectTools?: boolean;
   autoAuth?: boolean;
   sampling?: boolean;
   samplingAutoApprove?: boolean;
@@ -463,6 +499,7 @@ export interface ToolMetadata {
   description: string;
   resourceUri?: string;   // For resource tools: the URI to read
   uiResourceUri?: string; // For app-enabled tools: the UI resource URI
+  uiVisibility?: UiToolVisibility[];
   inputSchema?: unknown;  // JSON Schema for parameters (stored for describe/errors)
   uiStreamMode?: UiStreamMode;
 }
@@ -503,6 +540,7 @@ export interface CachedTool {
   description?: string;
   inputSchema?: unknown;
   uiResourceUri?: string;
+  uiVisibility?: UiToolVisibility[];
   uiStreamMode?: "eager" | "stream-first";
 }
 
@@ -603,7 +641,7 @@ function normalizeToolName(value: string): string {
   return value.replace(/-/g, "_");
 }
 
-function getToolNameCandidates(toolName: string, serverName: string, prefix: ToolPrefix): Set<string> {
+export function getToolNameCandidates(toolName: string, serverName: string, prefix: ToolPrefix): Set<string> {
   return new Set<string>([
     normalizeToolName(toolName),
     normalizeToolName(formatToolName(toolName, serverName, prefix)),
@@ -618,7 +656,7 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`^${escaped}$`);
 }
 
-function matchesToolPattern(candidates: Set<string>, patterns?: unknown): boolean {
+export function matchesToolPattern(candidates: Set<string>, patterns?: unknown): boolean {
   if (!Array.isArray(patterns) || patterns.length === 0) return false;
 
   for (const pattern of patterns) {

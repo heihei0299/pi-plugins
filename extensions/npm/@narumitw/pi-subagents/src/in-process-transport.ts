@@ -1,22 +1,17 @@
-import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
-	createAgentSession,
-	DefaultResourceLoader,
+	type AgentSessionServices,
 	getAgentDir,
 	type ModelRegistry,
+	type ModelRuntime,
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import {
-	type AgentConfig,
-	discoverAgents,
-	isThinkingLevel,
-	type SubagentThinkingLevel,
-} from "./agents.js";
+import { type AgentConfig, discoverAgents, type SubagentThinkingLevel } from "./agents.js";
 import { redactPrivateText } from "./context.js";
 import { resolveDefaultSubagentTimeoutMs } from "./execution.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, DEFAULT_MAX_OUTPUT_BYTES, truncateUtf8 } from "./limits.js";
+import { assertPiPromptSourcesAreReadableFiles } from "./prompt-source-safety.js";
 import type { AgentTurn, ManagedAgent, TurnOutcome } from "./registry.js";
 import { readSubagentSettings } from "./settings.js";
 import type { SubagentTransport } from "./transport.js";
@@ -32,9 +27,20 @@ interface ChildModelRuntime {
 }
 
 interface CodingAgentRuntimeModule {
-	ModelRuntime?: {
-		create(options?: { authPath?: string; modelsPath?: string | null }): Promise<ChildModelRuntime>;
-	};
+	createAgentSessionFromServices?: typeof import("@earendil-works/pi-coding-agent").createAgentSessionFromServices;
+	createAgentSessionServices?: typeof import("@earendil-works/pi-coding-agent").createAgentSessionServices;
+	resolveCliModel?: typeof import("@earendil-works/pi-coding-agent").resolveCliModel;
+}
+
+interface CoreModelSupport {
+	modelRuntime: ModelRuntime;
+	resolveCliModel: typeof import("@earendil-works/pi-coding-agent").resolveCliModel;
+}
+
+interface CoreSessionSupport {
+	createAgentSessionFromServices: typeof import("@earendil-works/pi-coding-agent").createAgentSessionFromServices;
+	createAgentSessionServices: typeof import("@earendil-works/pi-coding-agent").createAgentSessionServices;
+	resolveCliModel: typeof import("@earendil-works/pi-coding-agent").resolveCliModel;
 }
 
 interface RegisteredProviderRegistry {
@@ -335,38 +341,36 @@ export async function createSdkChildSession(
 	options: ChildSessionCreateOptions,
 ): Promise<ChildSession> {
 	const agentDir = getAgentDir();
-	const { loader: resourceLoader, settingsManager } = await createInProcessResourceLoader(
+	const projectTrusted =
+		options.agent.target?.trust.projectTrusted ??
+		(options.agent.agentScope === "project" || options.agent.agentScope === "both");
+	const { services, support: coreSupport } = await prepareInProcessServices(
 		options.agent.cwd,
 		agentDir,
 		options.agentConfig.systemPrompt,
-		options.agent.agentScope === "project" || options.agent.agentScope === "both",
+		projectTrusted,
 	);
-	const resolved = await resolveChildModel(options);
-	const modelRuntime = await createChildModelRuntime(
-		options.modelRegistry,
-		resolved.model,
-		agentDir,
+	copyRegisteredProviders(
+		options.modelRegistry as unknown as RegisteredProviderRegistry,
+		services.modelRuntime as unknown as ChildModelRuntime,
 	);
-	const model =
-		modelRuntime?.getModel(resolved.model.provider, resolved.model.id) ?? resolved.model;
+	const modelSupport: CoreModelSupport = {
+		modelRuntime: services.modelRuntime,
+		resolveCliModel: coreSupport.resolveCliModel,
+	};
+	const resolved = await resolveChildModel(options, modelSupport);
+	await transferChildModelAuth(options.modelRegistry, resolved.model, services.modelRuntime);
+	const model = resolved.model;
 	const sessionManager = SessionManager.inMemory(options.agent.cwd);
 	seedChildSessionManager(sessionManager, options, model);
-	const sessionOptions: Record<string, unknown> = {
-		cwd: options.agent.cwd,
-		agentDir,
+	const created = await coreSupport.createAgentSessionFromServices({
+		services,
+		sessionManager,
 		model,
 		thinkingLevel: resolved.thinkingLevel,
-		resourceLoader,
-		settingsManager,
-		sessionManager,
 		tools: options.tools,
 		noTools: options.tools?.length === 0 ? "all" : undefined,
-	};
-	if (modelRuntime) sessionOptions.modelRuntime = modelRuntime;
-	else sessionOptions.modelRegistry = options.modelRegistry;
-	const created = await createAgentSession(
-		sessionOptions as NonNullable<Parameters<typeof createAgentSession>[0]>,
-	);
+	});
 	const session = created.session;
 	if (options.tools !== undefined) {
 		const active = session.getActiveToolNames();
@@ -396,25 +400,31 @@ export async function createSdkChildSession(
 	};
 }
 
-async function createChildModelRuntime(
-	modelRegistry: ModelRegistry,
-	model: Model<Api>,
-	agentDir: string,
-): Promise<ChildModelRuntime | undefined> {
+async function loadCoreSessionSupport(): Promise<CoreSessionSupport | undefined> {
 	const codingAgentModule = (await import(
 		"@earendil-works/pi-coding-agent"
 	)) as unknown as CodingAgentRuntimeModule;
-	if (!codingAgentModule.ModelRuntime) return undefined;
+	if (
+		!codingAgentModule.createAgentSessionFromServices ||
+		!codingAgentModule.createAgentSessionServices ||
+		!codingAgentModule.resolveCliModel
+	) {
+		return undefined;
+	}
+	return {
+		createAgentSessionFromServices: codingAgentModule.createAgentSessionFromServices,
+		createAgentSessionServices: codingAgentModule.createAgentSessionServices,
+		resolveCliModel: codingAgentModule.resolveCliModel,
+	};
+}
 
-	const modelRuntime = await codingAgentModule.ModelRuntime.create({
-		authPath: join(agentDir, "auth.json"),
-		modelsPath: join(agentDir, "models.json"),
-	});
-	const registeredProviders = modelRegistry as unknown as RegisteredProviderRegistry;
-	copyRegisteredProviders(registeredProviders, modelRuntime);
+async function transferChildModelAuth(
+	modelRegistry: ModelRegistry,
+	model: Model<Api>,
+	modelRuntime: ModelRuntime,
+): Promise<void> {
 	const auth = await modelRegistry.getApiKeyAndHeaders(model);
 	if (auth.ok && auth.apiKey) await modelRuntime.setRuntimeApiKey(model.provider, auth.apiKey);
-	return modelRuntime;
 }
 
 export function copyRegisteredProviders(
@@ -432,20 +442,33 @@ export function copyRegisteredProviders(
 	}
 }
 
-export async function resolveChildModel(options: ChildSessionCreateOptions): Promise<{
+export async function resolveChildModel(
+	options: ChildSessionCreateOptions,
+	support?: CoreModelSupport,
+): Promise<{
 	model: Model<Api>;
 	thinkingLevel: SubagentThinkingLevel;
 }> {
+	if (!support) throw unsupportedInProcessCoreError();
 	let model = options.parentRuntime.model;
 	let modelThinkingLevel: SubagentThinkingLevel | undefined;
-	if (options.agentConfig.model) {
-		const parsed = parseModelRequest(options.agentConfig.model);
-		model = resolveConfiguredModel(parsed.model, options.modelRegistry);
-		modelThinkingLevel = parsed.thinkingLevel;
+	if (options.agentConfig.model !== undefined) {
+		const requested = options.agentConfig.model.trim();
+		if (!requested) throw new Error("In-process subagent model cannot be empty");
+		const resolved = support.resolveCliModel({
+			cliModel: requested,
+			modelRuntime: support.modelRuntime,
+		});
+		if (resolved.error) throw new Error(resolved.error);
+		if (!resolved.model)
+			throw new Error(`Unable to resolve in-process subagent model ${requested}`);
+		model = resolved.model;
+		modelThinkingLevel = resolved.thinkingLevel;
 	}
 	if (!model) model = options.modelRegistry.getAvailable()[0];
 	if (!model)
 		throw new Error("No model with configured authentication is available for in-process subagent");
+	model = support.modelRuntime.getModel(model.provider, model.id) ?? model;
 	return {
 		model,
 		thinkingLevel:
@@ -456,69 +479,42 @@ export async function resolveChildModel(options: ChildSessionCreateOptions): Pro
 	};
 }
 
-function parseModelRequest(value: string): {
-	model: string;
-	thinkingLevel?: SubagentThinkingLevel;
-} {
-	const requested = value.trim();
-	const separator = requested.lastIndexOf(":");
-	if (separator > 0) {
-		const suffix = requested.slice(separator + 1);
-		if (isThinkingLevel(suffix)) {
-			return { model: requested.slice(0, separator), thinkingLevel: suffix };
-		}
-	}
-	return { model: requested };
+function unsupportedInProcessCoreError(): Error {
+	return new Error(
+		'In-process subagents require Pi core createAgentSessionServices, createAgentSessionFromServices, and resolveCliModel support; set stateful.transport to "subprocess".',
+	);
 }
 
-function resolveConfiguredModel(value: string, modelRegistry: ModelRegistry): Model<Api> {
-	const requested = value.trim();
-	if (!requested) throw new Error("In-process subagent model cannot be empty");
-	const slash = requested.indexOf("/");
-	if (slash > 0) {
-		const exact = modelRegistry.find(requested.slice(0, slash), requested.slice(slash + 1));
-		if (exact) return exact;
-	}
-	const lowered = requested.toLowerCase();
-	const exactMatches = modelRegistry
-		.getAll()
-		.filter((model) => model.id.toLowerCase() === lowered || model.name.toLowerCase() === lowered);
-	if (exactMatches.length === 1) return exactMatches[0];
-	const partialMatches = modelRegistry
-		.getAll()
-		.filter(
-			(model) =>
-				model.id.toLowerCase().includes(lowered) || model.name.toLowerCase().includes(lowered),
-		);
-	if (partialMatches.length === 1) return partialMatches[0];
-	const displayedMatches = partialMatches
-		.slice(0, 8)
-		.map((model) => `${model.provider}/${model.id}`);
-	const remaining = partialMatches.length - displayedMatches.length;
-	const suffix =
-		displayedMatches.length > 0
-			? `; matches: ${displayedMatches.join(", ")}${remaining > 0 ? `, and ${remaining} more` : ""}`
-			: "";
-	throw new Error(`Unable to resolve in-process subagent model ${requested}${suffix}`);
+async function prepareInProcessServices(
+	cwd: string,
+	agentDir: string,
+	agentSystemPrompt: string,
+	projectTrusted: boolean,
+): Promise<{ services: AgentSessionServices; support: CoreSessionSupport }> {
+	assertPiPromptSourcesAreReadableFiles(cwd, agentDir, projectTrusted, ["SYSTEM.md"]);
+	const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+	const support = await loadCoreSessionSupport();
+	if (!support) throw unsupportedInProcessCoreError();
+	const services = await support.createAgentSessionServices({
+		cwd,
+		agentDir,
+		settingsManager,
+		resourceLoaderOptions: {
+			noExtensions: true,
+			appendSystemPrompt: agentSystemPrompt.trim() ? [agentSystemPrompt] : [],
+		},
+	});
+	return { services, support };
 }
 
-export async function createInProcessResourceLoader(
+export async function createInProcessServices(
 	cwd: string,
 	agentDir: string,
 	agentSystemPrompt: string,
 	projectTrusted = false,
-): Promise<{ loader: DefaultResourceLoader; settingsManager: SettingsManager }> {
-	const settingsManager = SettingsManager.create(cwd, agentDir);
-	settingsManager.setProjectTrusted(projectTrusted);
-	const loader = new DefaultResourceLoader({
-		cwd,
-		agentDir,
-		settingsManager,
-		noExtensions: true,
-		appendSystemPrompt: agentSystemPrompt.trim() ? [agentSystemPrompt] : [],
-	});
-	await loader.reload();
-	return { loader, settingsManager };
+): Promise<AgentSessionServices> {
+	return (await prepareInProcessServices(cwd, agentDir, agentSystemPrompt, projectTrusted))
+		.services;
 }
 
 export function seedChildSessionManager(

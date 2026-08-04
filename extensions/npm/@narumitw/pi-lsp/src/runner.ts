@@ -1,7 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { commandFromEnv } from "./command.js";
 import { collectSupportedFiles, resolveRoot, resolveSupportedFile } from "./files.js";
 import { LspClient } from "./lsp-client.js";
 import { applyTextEdits, collectWorkspaceEdits, hasOverlappingTextEdits } from "./text-edits.js";
@@ -24,7 +23,7 @@ export async function runDiagnostics(
 	statusKey: string,
 ) {
 	const root = resolveRoot(params.root);
-	const command = commandFromEnv(adapter.commandEnvVar, adapter.defaultCommand);
+	const command = adapter.defaultCommand;
 	const files =
 		params.files ??
 		collectSupportedFiles(adapter, root, params.paths, params.limit ?? DEFAULT_FILE_LIMIT);
@@ -39,11 +38,12 @@ export async function runDiagnostics(
 
 	const client = new LspClient(adapter, command, root, timeoutMs);
 	const abort = () => client.close();
-	signal?.addEventListener("abort", abort, { once: true });
 	throwIfAborted(signal, adapter);
-	ctx.ui.setStatus(statusKey, `${adapter.name} diagnostics`);
+	signal?.addEventListener("abort", abort, { once: true });
 
 	try {
+		ctx.ui.setStatus(statusKey, `${adapter.name} diagnostics`);
+		throwIfAborted(signal, adapter);
 		await client.start();
 		await client.initialize(root);
 
@@ -92,14 +92,15 @@ export async function runFix(
 	const file = resolveSupportedFile(adapter, root, params.path);
 	const actionKind = params.kind?.trim() || "source.fixAll";
 
-	const command = commandFromEnv(adapter.commandEnvVar, adapter.defaultCommand);
+	const command = adapter.defaultCommand;
 	const client = new LspClient(adapter, command, root, timeoutMs);
 	const abort = () => client.close();
-	signal?.addEventListener("abort", abort, { once: true });
 	throwIfAborted(signal, adapter);
-	ctx.ui.setStatus(statusKey, `${adapter.name} fix`);
+	signal?.addEventListener("abort", abort, { once: true });
 
 	try {
+		ctx.ui.setStatus(statusKey, `${adapter.name} fix`);
+		throwIfAborted(signal, adapter);
 		await client.start();
 		await client.initialize(root);
 		throwIfAborted(signal, adapter);

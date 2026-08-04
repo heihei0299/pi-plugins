@@ -4,6 +4,8 @@ import { Type } from "typebox";
 import { StringEnum, complete, type Api, type ImageContent, type Model, type TextContent } from "@earendil-works/pi-ai/compat";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import { normalizeFetchContentParams } from "./fetch-params.ts";
+import { findContent, type FindMode } from "./content-find.ts";
+import { answerFromPage } from "./page-query.ts";
 import { clearCloneCache } from "./github-extract.ts";
 import { getConfiguredSearchRouting, normalizeSearchProviderSelection, RESOLVED_SEARCH_PROVIDERS, SEARCH_PROVIDERS, search, type AttributedSearchResponse, type SearchProvider, type SearchProviderSelection, type ResolvedSearchProvider } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
@@ -47,10 +49,15 @@ import { isSearchinfinityAvailable } from "./searchinfinity.ts";
 import { isQueritAvailable } from "./querit.ts";
 import { isTavilyAvailable } from "./tavily.ts";
 import { isSerpdiveAvailable } from "./serpdive.ts";
+import { isKagiAvailable } from "./kagi.ts";
+import { isOllamaAvailable } from "./ollama.ts";
 import { isSearXNGAvailable } from "./searxng.ts";
 import { isAnySearchAvailable } from "./anysearch.ts";
+import { isXaiSearchAvailable } from "./xai-search.ts";
+import { isBrightDataAvailable } from "./brightdata.ts";
+import { isSerpBaseAvailable } from "./serpbase.ts";
 import { buildSearchErrorPlan, type SearchErrorDetails, type SearchErrorPlan } from "./render-search-error.ts";
-import { loadEnabledModelPatterns, modelMatchesEnabledPatterns } from "./summary-model-scope.ts";
+import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns } from "./summary-model-scope.ts";
 import {
 	buildResearchArtifact,
 	withClaimAssessment,
@@ -98,7 +105,13 @@ function renderSearchErrorPlan(plan: SearchErrorPlan, expanded: boolean, theme: 
 
 interface WebSearchConfig {
 	anysearchApiKey?: unknown;
+	brightdataApiKey?: unknown;
+	brightdataSerpZone?: unknown;
+	kagiApiKey?: unknown;
+	ollamaApiKey?: unknown;
+	serpbaseApiKey?: unknown;
 	tinyfishApiKey?: unknown;
+	xaiApiKey?: unknown;
 	provider?: unknown;
 	searchProvider?: unknown;
 	workflow?: string;
@@ -137,7 +150,12 @@ interface ProviderAvailability {
 	perplexity: boolean;
 	exa: boolean;
 	gemini: boolean;
+	kagi: boolean;
+	ollama: boolean;
 	anysearch: boolean;
+	xai: boolean;
+	brightdata: boolean;
+	serpbase: boolean;
 }
 
 type WebSearchWorkflow = "none" | "summary-review" | "auto-summary";
@@ -328,14 +346,20 @@ async function getProviderAvailability(ctx: ExtensionContext): Promise<ProviderA
 		querit: isQueritAvailable(),
 		tavily: isTavilyAvailable(),
 		serpdive: isSerpdiveAvailable(),
+		kagi: isKagiAvailable(),
+		ollama: isOllamaAvailable(),
 		searxng: isSearXNGAvailable(),
 		perplexity: isPerplexityAvailable(),
 		exa: isExaAvailable(),
 		gemini: geminiApiAvail || !!geminiWebAvail,
 		anysearch: isAnySearchAvailable(),
+		xai: await isXaiSearchAvailable(ctx),
+		brightdata: isBrightDataAvailable(),
+		serpbase: isSerpBaseAvailable(),
 	};
 	return {
-		all: Object.entries(providers).some(([provider, available]) => provider !== "anysearch" && provider !== "gemini" && available) || geminiApiAvail,
+		// AnySearch, xAI, Bright Data, and SerpBase are explicit-only, so they never make `all` eligible.
+		all: Object.entries(providers).some(([provider, available]) => provider !== "anysearch" && provider !== "xai" && provider !== "brightdata" && provider !== "serpbase" && provider !== "gemini" && available) || geminiApiAvail,
 		...providers,
 	};
 }
@@ -376,6 +400,8 @@ function firstAvailableProvider(available: ProviderAvailability, preferOpenAI: b
 	if (available.querit) return "querit";
 	if (available.tavily) return "tavily";
 	if (available.serpdive) return "serpdive";
+	if (available.kagi) return "kagi";
+	if (available.ollama) return "ollama";
 	if (available.perplexity) return "perplexity";
 	if (available.gemini) return "gemini";
 	return fallback;
@@ -428,6 +454,12 @@ function resolveProvider(
 	}
 	if (provider === "serpdive" && !available.serpdive) {
 		return firstAvailableProvider(available, preferOpenAI, "serpdive");
+	}
+	if (provider === "kagi" && !available.kagi) {
+		return firstAvailableProvider(available, preferOpenAI, "kagi");
+	}
+	if (provider === "ollama" && !available.ollama) {
+		return firstAvailableProvider(available, preferOpenAI, "ollama");
 	}
 	if (provider === "searxng" && !available.searxng) {
 		return firstAvailableProvider(available, preferOpenAI, "searxng");
@@ -487,6 +519,36 @@ const MAX_CONTENT_SLICE_LENGTH = MAX_INLINE_CONTENT;
 
 function stripThumbnails(results: ExtractedContent[]): ExtractedContent[] {
 	return results.map(({ thumbnail, frames, ...rest }) => rest);
+}
+
+function initialContentSlice(content: string): {
+	text: string;
+	endOffset: number;
+	totalBytes: number;
+	totalLines: number;
+	shownBytes: number;
+	shownLines: number;
+} {
+	let endOffset = Math.min(content.length, MAX_INLINE_CONTENT);
+	if (endOffset < content.length) {
+		const lineBreak = content.lastIndexOf("\n", endOffset);
+		if (lineBreak >= Math.floor(MAX_INLINE_CONTENT * 0.8)) endOffset = lineBreak + 1;
+	}
+	const text = content.slice(0, endOffset);
+	return {
+		text,
+		endOffset,
+		totalBytes: Buffer.byteLength(content),
+		totalLines: content.length === 0 ? 0 : content.split("\n").length,
+		shownBytes: Buffer.byteLength(text),
+		shownLines: text.length === 0 ? 0 : text.split("\n").length,
+	};
+}
+
+function normalizeFindQueries(value: string | string[]): string[] {
+	const queries = (Array.isArray(value) ? value : [value]).map(query => query.trim()).filter(Boolean);
+	if (queries.length === 0) throw new Error("findText must contain at least one non-empty string");
+	return queries;
 }
 
 function formatSearchSummary(results: SearchResult[], answer: string): string {
@@ -940,7 +1002,7 @@ export default function (pi: ExtensionAPI) {
 	): Promise<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> }> {
 		const enabledModelPatterns = loadEnabledModelPatterns(ctx);
 		for (const { provider, id } of candidates) {
-			const model = ctx.modelRegistry.find(provider, id);
+			const model = findModelWithProviderRouting(ctx.modelRegistry, provider, id);
 			if (!model || !modelMatchesEnabledPatterns(model, enabledModelPatterns)) continue;
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 			if (auth.ok && auth.apiKey) return { model, apiKey: auth.apiKey, headers: auth.headers };
@@ -1048,18 +1110,35 @@ export default function (pi: ExtensionAPI) {
 		const config = loadConfig();
 		const configuredSummaryModel = typeof config.summaryModel === "string" ? config.summaryModel.trim() : "";
 		const preferredDefaults = [
-			"anthropic/claude-haiku-4-5",
-			"openai-codex/gpt-5.3-codex-spark",
+			{ provider: "anthropic", id: "claude-haiku-4-5" },
+			{ provider: "openai-codex", id: "gpt-5.3-codex-spark" },
 		];
 
+		const resolveAvailableModelValue = (selector: string): string | null => {
+			const slashIndex = selector.indexOf("/");
+			if (slashIndex <= 0 || slashIndex >= selector.length - 1) return null;
+			const model = findModelWithProviderRouting(
+				summaryContext.modelRegistry,
+				selector.slice(0, slashIndex),
+				selector.slice(slashIndex + 1),
+			);
+			if (!model) return null;
+			const value = `${model.provider}/${model.id}`;
+			return availableValues.has(value) ? value : null;
+		};
+
 		let defaultSummaryModel: string | null = null;
-		if (configuredSummaryModel.length > 0 && availableValues.has(configuredSummaryModel)) {
-			defaultSummaryModel = configuredSummaryModel;
+		if (scopeLoaded && configuredSummaryModel.length > 0) {
+			defaultSummaryModel = availableValues.has(configuredSummaryModel)
+				? configuredSummaryModel
+				: resolveAvailableModelValue(configuredSummaryModel);
 		}
-		if (!defaultSummaryModel) {
+		if (scopeLoaded && !defaultSummaryModel) {
 			for (const preferred of preferredDefaults) {
-				if (availableValues.has(preferred)) {
-					defaultSummaryModel = preferred;
+				const model = findModelWithProviderRouting(summaryContext.modelRegistry, preferred.provider, preferred.id);
+				const value = model ? `${model.provider}/${model.id}` : null;
+				if (value && availableValues.has(value)) {
+					defaultSummaryModel = value;
 					break;
 				}
 			}
@@ -1483,7 +1562,7 @@ export default function (pi: ExtensionAPI) {
 		name: toolNames.webSearch,
 		label: "Web Search",
 		description:
-			`Search the web using OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, SERPdive, SearXNG, Exa, Perplexity, Gemini, or AnySearch. Pass a provider array to search only those providers simultaneously, or use provider "all" to search every eligible provider except AnySearch. Returns an AI-synthesized answer with source citations. OpenAI search uses a Codex subscription or OpenAI API key. AnySearch is available only when explicitly selected. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. The configured provider is used when provider is omitted or set to auto; omit provider unless explicitly overriding it. Without a configured provider, auto-selects OpenAI when suitable and available, then Exa, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, SERPdive, Perplexity, Gemini API, or Gemini Web. When SearXNG is configured, it is preferred first for local/private search.`,
+			`Search the web using OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, SERPdive, Kagi, Ollama, SearXNG, Exa, Perplexity, Gemini, AnySearch, xAI, Bright Data, or SerpBase. Pass a provider array to search only those providers simultaneously, or use provider "all" to search every eligible provider except AnySearch, xAI, Bright Data, and SerpBase. Returns an AI-synthesized answer with source citations. OpenAI search uses a Codex subscription or OpenAI API key; xAI search uses a SuperGrok/X Premium subscription or xAI API key. AnySearch, xAI, Bright Data, and SerpBase are available only when explicitly selected. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. The configured provider is used when provider is omitted or set to auto; omit provider unless explicitly overriding it. Without a configured provider, auto-selects OpenAI when suitable and available, then Exa, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, SERPdive, Kagi, Ollama, Perplexity, Gemini API, or Gemini Web. When SearXNG is configured, it is preferred first for local/private search.`,
 		promptSnippet:
 			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage. Omit provider unless explicitly overriding the configured default.",
 		parameters: Type.Object({
@@ -1495,7 +1574,7 @@ export default function (pi: ExtensionAPI) {
 				StringEnum(["day", "week", "month", "year"], { description: "Filter by recency" }),
 			),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
-			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; use all to search every eligible provider except AnySearch, omit this field to use the configured provider, or use auto when none is configured")),
+			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; use all to search every eligible provider except AnySearch, xAI, Bright Data, and SerpBase, omit this field to use the configured provider, or use auto when none is configured")),
 			workflow: Type.Optional(
 				StringEnum(["none", "summary-review", "auto-summary"], {
 					description: "Search workflow mode: none = no curator, summary-review = open curator with auto summary draft (default), auto-summary = generate summary without opening curator",
@@ -2055,7 +2134,7 @@ export default function (pi: ExtensionAPI) {
 			fetchContent: Type.Optional(Type.Boolean({ description: "Fetch up to 5 result pages for exact passage extraction." })),
 			recencyFilter: Type.Optional(StringEnum(["day", "week", "month", "year"], { description: "Filter by recency." })),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains; prefix with - to exclude." })),
-			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; all searches every eligible provider except AnySearch")),
+			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; all searches every eligible provider except AnySearch, xAI, Bright Data, and SerpBase")),
 		}),
 		async execute(_callId, params, signal, _onUpdate, ctx) {
 			const claim = typeof params.claim === "string" ? params.claim.trim() : "";
@@ -2140,9 +2219,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: toolNames.fetchContent,
 		label: "Fetch Content",
-		description: `Fetch URL(s) and extract readable content as markdown. Supports YouTube video transcripts (with thumbnail), GitHub repository contents, and local video files (with frame thumbnail). Video frames can be extracted via timestamp/range or sampled across the entire video with frames alone. Falls back to Gemini for pages that block bots or fail Readability extraction. For YouTube and video files: ALWAYS pass the user's specific question via the prompt parameter — this directs the AI to focus on that aspect of the video, producing much better results than a generic extraction. Content is always stored and can be retrieved with ${toolNames.getSearchContent}.`,
+		description: `Fetch URL(s) and extract readable content as markdown. Use mode "raw" for exact textual HTTP response bodies or mode "answer" with prompt to answer using only fetched content. Direct image URLs return resized image content. Supports YouTube transcripts, GitHub repositories, PDFs, and local videos. Full original content is stored for retrieval with ${toolNames.getSearchContent}.`,
 		promptSnippet:
-			"Use to extract readable content from URL(s), YouTube, GitHub repos, or local videos. For video questions, pass the user's exact question in prompt.",
+			"Use to fetch readable or raw URL content, direct images, GitHub repos, and videos. Mode answer answers a prompt using only the fetched source.",
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "Single URL to fetch" })),
 			urls: Type.Optional(Type.Array(Type.String(), { description: "Multiple URLs (parallel)" })),
@@ -2150,7 +2229,13 @@ export default function (pi: ExtensionAPI) {
 				description: "Force cloning large GitHub repositories that exceed the size threshold",
 			})),
 			prompt: Type.Optional(Type.String({
-				description: "Question or instruction for video analysis (YouTube and video files). Pass the user's specific question here — e.g. 'describe the book shown at the advice for beginners section'. Without this, a generic transcript extraction is used which may miss what the user is asking about.",
+				description: "Question or instruction for video analysis, or the page-local question required by mode answer.",
+			})),
+			mode: Type.Optional(StringEnum(["readable", "raw", "answer"], {
+				description: "Fetch mode: readable (default extraction), raw (exact textual HTTP body), or answer (answer prompt using only fetched content).",
+			})),
+			answerModel: Type.Optional(Type.String({
+				description: "Optional provider/model-id override for mode answer. Defaults to the current Pi model.",
 			})),
 			timestamp: Type.Optional(Type.String({
 				description: "Extract video frame(s) at a timestamp or time range. Single: '1:23:45', '23:45', or '85' (seconds). Range: '23:41-25:00' extracts evenly-spaced frames across that span (default 6). Use frames with ranges to control density; single+frames uses a fixed 5s interval. YouTube requires yt-dlp + ffmpeg; local videos require ffmpeg. Use a range when you know the approximate area but not the exact moment — you'll get a contact sheet to visually identify the right frame.",
@@ -2165,8 +2250,28 @@ export default function (pi: ExtensionAPI) {
 			})),
 		}),
 
-		async execute(_toolCallId, params, signal, onUpdate): Promise<AgentToolResult<Record<string, unknown>>> {
-			const { urlList, options } = normalizeFetchContentParams(params);
+		async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
+			let normalized: ReturnType<typeof normalizeFetchContentParams>;
+			try {
+				normalized = normalizeFetchContentParams(params);
+			} catch (err) {
+				const error = err instanceof Error ? err.message : String(err);
+				return { content: [{ type: "text", text: `Error: ${error}` }], details: { error } };
+			}
+			const { urlList, options } = normalized;
+			const mode = options.mode ?? "readable";
+			if (mode === "answer" && !options.prompt) {
+				return { content: [{ type: "text", text: "Error: mode answer requires prompt." }], details: { error: "mode answer requires prompt" } };
+			}
+			if (mode === "raw" && (options.forceClone === true || options.timestamp || options.frames || options.prompt || options.model || options.answerModel)) {
+				return { content: [{ type: "text", text: "Error: mode raw cannot be combined with forceClone, prompt, timestamp, frames, model, or answerModel." }], details: { error: "Incompatible raw mode options" } };
+			}
+			if (mode !== "answer" && options.answerModel) {
+				return { content: [{ type: "text", text: "Error: answerModel requires mode answer." }], details: { error: "answerModel requires mode answer" } };
+			}
+			if (mode === "answer" && options.model) {
+				return { content: [{ type: "text", text: "Error: use answerModel, not model, with mode answer." }], details: { error: "model is incompatible with mode answer" } };
+			}
 			if (urlList.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: No URL provided." }],
@@ -2179,9 +2284,35 @@ export default function (pi: ExtensionAPI) {
 				details: { phase: "fetch", progress: 0 },
 			});
 
-			const fetchResults = await fetchAllContent(urlList, signal, options);
-			const successful = fetchResults.filter((r) => !r.error).length;
-			const totalChars = fetchResults.reduce((sum, r) => sum + r.content.length, 0);
+			const { answerModel: _answerModel, ...extractionOptions } = options;
+			const fetchOptions = mode === "answer"
+				? (() => {
+					const { prompt: _prompt, ...rest } = extractionOptions;
+					return rest;
+				})()
+				: extractionOptions;
+			const fetchResults = await fetchAllContent(urlList, signal, fetchOptions);
+			const presentedResults = mode === "answer"
+				? await Promise.all(fetchResults.map(async result => {
+					if (result.error) return result;
+					if (result.thumbnail || result.mimeType?.startsWith("image/")) {
+						return { ...result, error: "Page answer requires textual fetched content" };
+					}
+					try {
+						const answer = await answerFromPage({
+							question: options.prompt!,
+							pageText: result.content,
+							sourceUrl: result.url,
+							...(options.answerModel ? { model: options.answerModel } : {}),
+						}, ctx, signal);
+						return { ...result, content: answer.text };
+					} catch (err) {
+						return { ...result, error: `Page answer failed: ${err instanceof Error ? err.message : String(err)}` };
+					}
+				}))
+				: fetchResults;
+			const successful = presentedResults.filter((r) => !r.error).length;
+			const totalChars = presentedResults.reduce((sum, r) => sum + r.content.length, 0);
 
 			// ALWAYS store results (even for single URL)
 			const responseId = generateId();
@@ -2196,7 +2327,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Single URL: return content directly (possibly truncated) with responseId
 			if (urlList.length === 1) {
-				const result = fetchResults[0];
+				const result = presentedResults[0];
 				if (result.error) {
 					return {
 						content: [{ type: "text", text: `Error: ${result.error}` }],
@@ -2205,14 +2336,13 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const fullLength = result.content.length;
-				const truncated = fullLength > MAX_INLINE_CONTENT;
-				let output = truncated
-					? result.content.slice(0, MAX_INLINE_CONTENT) + "\n\n[Content truncated...]"
-					: result.content;
+				const slice = initialContentSlice(result.content);
+				const truncated = slice.endOffset < fullLength;
+				let output = slice.text;
 
 				if (truncated) {
-					output += `\n\n---\nShowing ${MAX_INLINE_CONTENT} of ${fullLength} chars. ` +
-						`Use ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0, offset: ${MAX_INLINE_CONTENT} }) for the next slice.`;
+					output += `\n\n---\nShowing ${slice.endOffset} of ${fullLength} chars, ${slice.shownBytes} of ${slice.totalBytes} bytes, and ${slice.shownLines} of ${slice.totalLines} lines. ` +
+						`Use ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0, offset: ${slice.endOffset} }) for the next slice.`;
 				}
 
 				const content: Array<TextContent | ImageContent> = [];
@@ -2243,13 +2373,20 @@ export default function (pi: ExtensionAPI) {
 						timestamp: params.timestamp,
 						frames: params.frames,
 						duration: result.duration,
+						mode,
+						mimeType: result.mimeType,
+						status: result.status,
+						totalBytes: slice.totalBytes,
+						totalLines: slice.totalLines,
+						shownBytes: slice.shownBytes,
+						shownLines: slice.shownLines,
 					},
 				};
 			}
 
 			// Multi-URL: existing behavior (summary + responseId)
 			let output = "## Fetched URLs\n\n";
-			for (const { url, title, content, error } of fetchResults) {
+			for (const { url, title, content, error } of presentedResults) {
 				if (error) {
 					output += `- ${url}: Error - ${error}\n`;
 				} else {
@@ -2265,8 +2402,8 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme) {
-			const { url, urls, prompt, timestamp, frames, model } = args as { url?: string; urls?: string[]; prompt?: string; timestamp?: string; frames?: number; model?: string };
-			const urlList = urls ?? (url ? [url] : []);
+			const { urlList, options } = normalizeFetchContentParams(args);
+			const { prompt, timestamp, frames, model, mode, answerModel } = options;
 			if (urlList.length === 0) {
 				return new Text(theme.fg("toolTitle", theme.bold("fetch ")) + theme.fg("error", "(no URL)"), 0, 0);
 			}
@@ -2284,6 +2421,9 @@ export default function (pi: ExtensionAPI) {
 					lines.push(theme.fg("muted", `  ... and ${urlList.length - 5} more`));
 				}
 			}
+			if (mode && mode !== "readable") {
+				lines.push(theme.fg("dim", "  mode: ") + theme.fg("warning", mode));
+			}
 			if (timestamp) {
 				lines.push(theme.fg("dim", "  timestamp: ") + theme.fg("warning", timestamp));
 			}
@@ -2296,6 +2436,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (model) {
 				lines.push(theme.fg("dim", "  model: ") + theme.fg("warning", model));
+			}
+			if (answerModel) {
+				lines.push(theme.fg("dim", "  answer model: ") + theme.fg("warning", answerModel));
 			}
 			return new Text(lines.join("\n"), 0, 0);
 		},
@@ -2391,9 +2534,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: toolNames.getSearchContent,
 		label: "Get Search Content",
-		description: `Retrieve bounded content slices from a previous ${storedContentSources} call.`,
+		description: `Retrieve bounded content slices or find matching passages in a previous ${storedContentSources} call.`,
 		promptSnippet:
-			`Use after ${storedContentSources} to retrieve stored content via responseId plus query/url selectors. Fetched URL content is returned in bounded slices; use offset/limit to continue.`,
+			`Use after ${storedContentSources} to retrieve stored content via responseId. Use findText to locate passages without paging through the full content.`,
 		parameters: Type.Object({
 			responseId: Type.String({ description: `The responseId from ${storedContentSources}` }),
 			query: Type.Optional(Type.String({ description: searchQueryDescription })),
@@ -2402,9 +2545,20 @@ export default function (pi: ExtensionAPI) {
 			urlIndex: Type.Optional(Type.Number({ description: "Get content for URL at index" })),
 			offset: Type.Optional(Type.Number({ description: "Character offset for fetched URL content slices (default 0)" })),
 			limit: Type.Optional(Type.Number({ description: `Maximum characters to return for fetched URL content slices (default/max ${MAX_CONTENT_SLICE_LENGTH})` })),
+			findText: Type.Optional(Type.Union([
+				Type.String({ minLength: 1, maxLength: 500 }),
+				Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { minItems: 1, maxItems: 10 }),
+			], { description: "Text or texts to find in the selected stored content." })),
+			findMode: Type.Optional(StringEnum(["exact", "case-insensitive", "fuzzy"], { description: "Matching mode for findText (default: case-insensitive)." })),
 		}),
 
 		async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
+			if (params.findText !== undefined && (params.offset !== undefined || params.limit !== undefined)) {
+				return { content: [{ type: "text", text: "findText cannot be combined with offset or limit" }], details: { error: "Incompatible find options" } };
+			}
+			if (params.findMode !== undefined && params.findText === undefined) {
+				return { content: [{ type: "text", text: "findMode requires findText" }], details: { error: "findMode requires findText" } };
+			}
 			const data = getResult(params.responseId);
 			if (!data) {
 				return {
@@ -2477,8 +2631,23 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
+				const fullResults = formatFullResults(queryData);
+				if (params.findText !== undefined) {
+					try {
+						const found = findContent(fullResults, normalizeFindQueries(params.findText), (params.findMode ?? "case-insensitive") as FindMode);
+						const { text, ...findDetails } = found;
+						return {
+							content: [{ type: "text", text }],
+							details: { query: queryData.query, resultCount: queryData.results.length, findMode: params.findMode ?? "case-insensitive", ...findDetails },
+						};
+					} catch (err) {
+						const error = err instanceof Error ? err.message : String(err);
+						return { content: [{ type: "text", text: error }], details: { error, query: queryData.query } };
+					}
+				}
+
 				return {
-					content: [{ type: "text", text: formatFullResults(queryData) }],
+					content: [{ type: "text", text: fullResults }],
 					details: { query: queryData.query, resultCount: queryData.results.length },
 				};
 			}
@@ -2519,6 +2688,20 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text", text: `Error for ${urlData.url}: ${urlData.error}` }],
 						details: { error: urlData.error, url: urlData.url },
 					};
+				}
+
+				if (params.findText !== undefined) {
+					try {
+						const found = findContent(urlData.content, normalizeFindQueries(params.findText), (params.findMode ?? "case-insensitive") as FindMode);
+						const { text, ...findDetails } = found;
+						return {
+							content: [{ type: "text", text: `# ${urlData.title || urlData.url}\n\n${text}` }],
+							details: { url: urlData.url, title: urlData.title, contentLength: urlData.content.length, findMode: params.findMode ?? "case-insensitive", ...findDetails },
+						};
+					} catch (err) {
+						const error = err instanceof Error ? err.message : String(err);
+						return { content: [{ type: "text", text: error }], details: { error, url: urlData.url } };
+					}
 				}
 
 				const offset = params.offset ?? 0;
@@ -2575,13 +2758,14 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme) {
-			const { responseId, query, queryIndex, url, urlIndex, offset } = args as {
+			const { responseId, query, queryIndex, url, urlIndex, offset, findText } = args as {
 				responseId: string;
 				query?: string;
 				queryIndex?: number;
 				url?: string;
 				urlIndex?: number;
 				offset?: number;
+				findText?: string | string[];
 			};
 			let target = "";
 			if (query) target = `query="${query}"`;
@@ -2589,6 +2773,10 @@ export default function (pi: ExtensionAPI) {
 			else if (url) target = url.length > 30 ? url.slice(0, 27) + "..." : url;
 			else if (urlIndex !== undefined) target = `urlIndex=${urlIndex}`;
 			if (offset !== undefined) target += target ? ` @ ${offset}` : `offset=${offset}`;
+			if (findText !== undefined) {
+				const queries = Array.isArray(findText) ? findText : [findText];
+				target += `${target ? " · " : ""}find ${queries.length}`;
+			}
 			return new Text(theme.fg("toolTitle", theme.bold("get_content ")) + theme.fg("accent", target || responseId.slice(0, 8)), 0, 0);
 		},
 
@@ -2603,6 +2791,8 @@ export default function (pi: ExtensionAPI) {
 				offset?: number;
 				returnedChars?: number;
 				nextOffset?: number | null;
+				matchCount?: number;
+				returnedMatches?: number;
 			};
 
 			if (details?.error) {
@@ -2616,7 +2806,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			let statusLine: string;
-			if (details?.query) {
+			if (typeof details?.matchCount === "number") {
+				statusLine = theme.fg("success", details?.title || details?.query || "Content") + theme.fg("muted", ` (${details.matchCount} matches, ${details.returnedMatches ?? 0} shown)`);
+			} else if (details?.query) {
 				statusLine = theme.fg("success", `"${details.query}"`) + theme.fg("muted", ` (${details.resultCount} results)`);
 			} else {
 				const start = details?.offset ?? 0;

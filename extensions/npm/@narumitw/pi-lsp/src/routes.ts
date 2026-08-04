@@ -1,5 +1,5 @@
 import path from "node:path";
-import { commandExists, commandFromEnv, commandPathValue } from "./command.js";
+import { commandExists, commandPathValue } from "./command.js";
 import { collectSupportedFiles, resolveRoot } from "./files.js";
 import type { LspServerAdapter } from "./types.js";
 
@@ -44,7 +44,7 @@ export function selectDiagnosticRoutes(
 		? candidates
 		: candidates.filter((adapter) => {
 				if (!adapter.isDefault) return true;
-				const command = commandFromEnv(adapter.commandEnvVar, adapter.defaultCommand);
+				const command = adapter.defaultCommand;
 				if (commandExists(command.command, root, commandPathValue(adapter.env))) return true;
 				skipped.push({ adapter, reason: `${adapter.name} command missing`, files: [] });
 				return false;

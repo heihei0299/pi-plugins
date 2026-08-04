@@ -14,9 +14,7 @@ export const ANCHOR_LEN = HASH_LEN;
 export const HASH_SEP = "│";
 
 const ALPH =
-	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-const ALPH_BITS = 6;
-const ALPH_MASK = (1 << ALPH_BITS) - 1;
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 const ALPH_SAFE = ALPH.replace(/-/g, "\\-");
 const ALPH_RE = new RegExp(`^[${ALPH_SAFE}]+$`);
 export const HASH_CLASS = `[${ALPH_SAFE}]{${HASH_LEN}}`;
@@ -27,26 +25,29 @@ export const MAX_HASH_LINES = HASH_SPACE;
 function idxToHash(idx: number): string {
   let out = "";
   for (let j = 0; j < HASH_LEN; j++) {
-    out += ALPH[(idx >>> ((HASH_LEN - 1 - j) * ALPH_BITS)) & ALPH_MASK]!;
+    out = ALPH[idx % ALPH.length]! + out;
+    idx = Math.floor(idx / ALPH.length);
   }
   return out;
 }
 
-const HASH_TABLE: string[] = Array.from(
-  { length: HASH_SPACE },
-  (_, i) => idxToHash(i),
-);
+const hashCache = new Map<number, string>();
 
-export const HL_PREFIX_RE = new RegExp(
-	`^\\s*(?:>>>|>>)?\\s*${HASH_CLASS}│`,
-);
+function hashAt(idx: number): string {
+  let hash = hashCache.get(idx);
+  if (hash === undefined) {
+    hash = idxToHash(idx);
+    hashCache.set(idx, hash);
+  }
+  return hash;
+}
+
 export const HL_PREFIX_PLUS_RE = new RegExp(
 	`^\\+\\s*${HASH_CLASS}│`,
 );
 export const HL_PREFIX_MINUS_RE = new RegExp(
 	`^-(?:\\s*${HASH_CLASS}│| {${ANCHOR_LEN}}│)`,
 );
-export const DIFF_MINUS_RE = /^-\s*\d+\s{4}/;
 
 export const HL_BARE_PREFIX_RE = new RegExp(`^\\s*(${HASH_CLASS})│`);
 
@@ -66,22 +67,24 @@ function setBit(bits: Uint32Array, idx: number): void {
 
 function nextZeroBit(bits: Uint32Array, start: number): number {
   const totalWords = bits.length;
-  const totalBits = totalWords * 32;
+  const totalBits = HASH_SPACE;
+  const lastWordBits = HASH_SPACE - (totalWords - 1) * 32;
 
   if (start >= totalBits) start = 0;
 
   const wordIdx = start >>> 5;
   const bitOffset = start & 31;
+  const wordBits = (w: number): number => (w === totalWords - 1 ? lastWordBits : 32);
 
   let word = bits[wordIdx];
-  for (let b = bitOffset; b < 32; b++) {
+  for (let b = bitOffset; b < wordBits(wordIdx); b++) {
     if ((word >>> b & 1) === 0) return wordIdx * 32 + b;
   }
 
   for (let w = wordIdx + 1; w < totalWords; w++) {
     word = bits[w];
     if (~word !== 0) {
-      for (let b = 0; b < 32; b++) {
+      for (let b = 0; b < wordBits(w); b++) {
         if ((word >>> b & 1) === 0) return w * 32 + b;
       }
     }
@@ -90,7 +93,7 @@ function nextZeroBit(bits: Uint32Array, start: number): number {
   for (let w = 0; w < wordIdx; w++) {
     word = bits[w];
     if (~word !== 0) {
-      for (let b = 0; b < 32; b++) {
+      for (let b = 0; b < wordBits(w); b++) {
         if ((word >>> b & 1) === 0) return w * 32 + b;
       }
     }
@@ -110,13 +113,13 @@ function assignHash(used: Uint32Array, baseIdx: number, hint: { value: number })
   if (!getBit(used, baseIdx)) {
     setBit(used, baseIdx);
     hint.value = baseIdx + 1;
-    return HASH_TABLE[baseIdx];
+    return hashAt(baseIdx);
   }
   const start = hint.value > baseIdx + 1 ? hint.value : baseIdx + 1;
   const nextIdx = nextZeroBit(used, start);
   setBit(used, nextIdx);
   hint.value = nextIdx + 1;
-  return HASH_TABLE[nextIdx];
+  return hashAt(nextIdx);
 }
 
 export function _lineHashesPure(content: string): string[] {
@@ -127,7 +130,7 @@ export function _lineHashesPure(content: string): string[] {
 
   for (let i = 0; i < lines.length; i++) {
     const c = canon(lines[i]!);
-    const baseIdx = xxh32(c) >>> 14;
+    const baseIdx = (xxh32(c) >>> 14) % HASH_SPACE;
     hashes[i] = assignHash(used, baseIdx, hint);
   }
   return hashes;
@@ -175,50 +178,32 @@ function hashToIndex(hash: string): number {
   for (let j = 0; j < HASH_LEN; j++) {
     const charIdx = ALPH.indexOf(hash[j]!);
     if (charIdx < 0) return -1;
-    idx = (idx << ALPH_BITS) | charIdx;
+    idx = idx * ALPH.length + charIdx;
   }
   return idx;
 }
 
-function findNearestCandidate(
-  candidates: { index: number; hash: string }[],
+function nearestNew(
+  candidates: number[],
   target: number,
-  removedHashes?: Set<string>,
 ): number {
   let lo = 0;
   let hi = candidates.length;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
-    if (candidates[mid]!.index < target) lo = mid + 1;
+    if (candidates[mid]! < target) lo = mid + 1;
     else hi = mid;
   }
-  let left = lo - 1;
-  let right = lo;
-  while (left >= 0 || right < candidates.length) {
-    let bestPos = -1;
-    let bestDist = Infinity;
-    if (left >= 0) {
-      const candidate = candidates[left]!;
-      if (!removedHashes?.has(candidate.hash)) {
-        bestPos = left;
-        bestDist = target - candidate.index;
-      }
-    }
-    if (right < candidates.length) {
-      const candidate = candidates[right]!;
-      if (!removedHashes?.has(candidate.hash)) {
-        const dist = candidate.index - target;
-        if (dist < bestDist) {
-          bestPos = right;
-          bestDist = dist;
-        }
-      }
-    }
-    if (bestPos >= 0) return bestPos;
-    left--;
-    right++;
+  const left = lo - 1;
+  const right = lo;
+  if (
+    left >= 0 &&
+    (right >= candidates.length ||
+      target - candidates[left]! <= candidates[right]! - target)
+  ) {
+    return left;
   }
-  return -1;
+  return right < candidates.length ? right : -1;
 }
 
 function mapStableHashes(
@@ -227,53 +212,87 @@ function mapStableHashes(
   newContent: string,
   removedHashes?: Set<string>,
 ): string[] {
+  const oldLines = splitLines(oldContent);
   const newLines = splitLines(newContent);
   const newHashes = new Array<string>(newLines.length);
   const used = new Uint32Array(BITSET_WORDS);
   const hint = { value: 0 };
+  const removed = removedHashes ?? new Set<string>();
 
-  if (removedHashes) {
-    for (const hash of removedHashes) {
-      const idx = hashToIndex(hash);
-      if (idx >= 0) setBit(used, idx);
-    }
+  const oldHashIndex = new Map<string, number>();
+  for (let i = 0; i < oldHashes.length; i++) {
+    const hash = oldHashes[i]!;
+    oldHashIndex.set(hash, i);
+    const idx = hashToIndex(hash);
+    if (idx >= 0) setBit(used, idx);
   }
 
-  const contentMap = new Map<string, { index: number; hash: string }[]>();
-  const oldLines = splitLines(oldContent);
+  const removedIndexes = new Set<number>();
+  for (const hash of removed) {
+    const idx = oldHashIndex.get(hash);
+    if (idx !== undefined) removedIndexes.add(idx);
+  }
+
+  const survivors: { index: number; hash: string }[] = [];
+  const removedEntries: { index: number; hash: string }[] = [];
   for (let i = 0; i < oldLines.length; i++) {
-    const line = oldLines[i]!;
     const entry = { index: i, hash: oldHashes[i]! };
-    const list = contentMap.get(line);
-    if (list) {
-      list.push(entry);
-    } else {
-      contentMap.set(line, [entry]);
+    if (removedIndexes.has(i)) removedEntries.push(entry);
+    else survivors.push(entry);
+  }
+
+  const newByContent = new Map<string, number[]>();
+  for (let i = 0; i < newLines.length; i++) {
+    const key = canon(newLines[i]!);
+    const list = newByContent.get(key);
+    if (list) list.push(i);
+    else newByContent.set(key, [i]);
+  }
+
+  const markUsed = (hash: string): void => {
+    const idx = hashToIndex(hash);
+    if (idx >= 0) {
+      setBit(used, idx);
+      if (idx + 1 > hint.value) hint.value = idx + 1;
     }
+  };
+
+  for (const entry of survivors) {
+    const candidates = newByContent.get(canon(oldLines[entry.index]!));
+    if (!candidates || candidates.length === 0) continue;
+    const pos = nearestNew(candidates, entry.index);
+    if (pos < 0) continue;
+    const newIdx = candidates.splice(pos, 1)[0]!;
+    newHashes[newIdx] = entry.hash;
+    markUsed(entry.hash);
+  }
+
+  const removedByContent = new Map<string, { hashes: string[]; pos: number }>();
+  for (const entry of removedEntries) {
+    const key = canon(oldLines[entry.index]!);
+    let queue = removedByContent.get(key);
+    if (!queue) {
+      queue = { hashes: [], pos: 0 };
+      removedByContent.set(key, queue);
+    }
+    queue.hashes.push(entry.hash);
   }
 
   for (let i = 0; i < newLines.length; i++) {
-    const line = newLines[i]!;
-    const candidates = contentMap.get(line);
-    if (!candidates || candidates.length === 0) continue;
-
-    const bestIdx = findNearestCandidate(candidates, i, removedHashes);
-    if (bestIdx < 0) continue;
-    const match = candidates.splice(bestIdx, 1)[0]!;
-    newHashes[i] = match.hash;
-    const matchIdx = hashToIndex(match.hash);
-    if (matchIdx >= 0) {
-      setBit(used, matchIdx);
-      if (matchIdx + 1 > hint.value) hint.value = matchIdx + 1;
-    }
+    if (newHashes[i]) continue;
+    const queue = removedByContent.get(canon(newLines[i]!));
+    if (!queue || queue.pos >= queue.hashes.length) continue;
+    newHashes[i] = queue.hashes[queue.pos]!;
+    queue.pos += 1;
   }
 
   for (let i = 0; i < newLines.length; i++) {
     if (newHashes[i]) continue;
     const c = canon(newLines[i]!);
-    const baseIdx = xxh32(c) >>> 14;
+    const baseIdx = (xxh32(c) >>> 14) % HASH_SPACE;
     newHashes[i] = assignHash(used, baseIdx, hint);
   }
+
   return newHashes;
 }
 

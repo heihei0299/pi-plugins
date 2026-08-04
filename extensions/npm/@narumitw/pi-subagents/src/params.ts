@@ -1,11 +1,13 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { THINKING_LEVELS } from "./agents.js";
+import { MAX_SUBAGENT_TIMEOUT_MS } from "./limits.js";
 
 const TimeoutMs = Type.Number({
 	description:
 		"Hard timeout in milliseconds for each subagent subprocess. Defaults to PI_SUBAGENT_TIMEOUT_MS or 600000.",
 	minimum: 1,
+	maximum: MAX_SUBAGENT_TIMEOUT_MS,
 });
 
 const ThinkingLevelSchema = StringEnum(THINKING_LEVELS, {

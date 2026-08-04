@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { SubagentThinkingLevel } from "./agents.js";
+import type { TargetPolicyAudit } from "./cwd-policy.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, DEFAULT_MAX_OUTPUT_BYTES, truncateUtf8 } from "./limits.js";
 import { type AgentTurnRunner, normalizeTransport, type SubagentTransport } from "./transport.js";
 
@@ -50,9 +51,36 @@ export interface ManagedAgent {
 	context?: string;
 	contextSourceIds?: string[];
 	contextTruncated?: boolean;
+	workspaceMode?: "worktree";
+	target?: TargetPolicyAudit;
 	policy?: { inherited: string[]; overridden: string[]; unsupported: string[] };
 	mailbox: AgentMailboxMessage[];
 	currentMailboxMessageIds?: string[];
+}
+
+export interface AgentRunInspectionSummary {
+	id: string;
+	agent: string;
+	state: AgentLifecycleState;
+	createdAt: number;
+	updatedAt: number;
+	historyCount: number;
+	unreadMessages: number;
+}
+
+export interface AgentRunInspectionDetail extends AgentRunInspectionSummary {
+	cwd: string;
+	thinkingLevel?: SubagentThinkingLevel;
+	currentTask?: string;
+	error?: string;
+	workspaceMode?: "worktree";
+	target?: TargetPolicyAudit;
+	policy?: { inherited: string[]; overridden: string[]; unsupported: string[] };
+}
+
+export interface AgentInspectionCounts {
+	activeAgents: number;
+	retainedAgents: number;
 }
 
 export interface TurnOutcome {
@@ -220,6 +248,8 @@ export class AgentRegistry {
 		context?: string;
 		contextSourceIds?: string[];
 		contextTruncated?: boolean;
+		workspaceMode?: "worktree";
+		target?: TargetPolicyAudit;
 	}): Promise<ManagedAgent> {
 		if (!input.task.trim()) throw new Error("Subagent tasks cannot be empty");
 		const task = truncateUtf8(input.task, this.maxTaskBytes).text;
@@ -263,6 +293,8 @@ export class AgentRegistry {
 			context: input.context,
 			contextSourceIds: input.contextSourceIds,
 			contextTruncated: input.contextTruncated,
+			workspaceMode: input.workspaceMode,
+			target: input.target,
 		};
 		this.agents.set(record.id, record);
 		if (parent) {
@@ -498,6 +530,44 @@ export class AgentRegistry {
 		}
 		await this.changed();
 		if (shutdownError) throw shutdownError;
+	}
+
+	inspectionCounts(): AgentInspectionCounts {
+		let activeAgents = 0;
+		let retainedAgents = 0;
+		for (const agent of this.agents.values()) {
+			if (agent.state === "starting" || agent.state === "running") activeAgents++;
+			if (agent.state !== "closed") retainedAgents++;
+		}
+		return { activeAgents, retainedAgents };
+	}
+
+	listInspection(includeClosed = false): AgentRunInspectionSummary[] {
+		return [...this.agents.values()]
+			.filter((agent) => includeClosed || agent.state !== "closed")
+			.sort((left, right) => left.createdAt - right.createdAt)
+			.map((agent) => this.inspectSummary(agent));
+	}
+
+	getInspection(id: string): AgentRunInspectionDetail | undefined {
+		const agent = this.agents.get(id);
+		if (!agent) return undefined;
+		return {
+			...this.inspectSummary(agent),
+			cwd: agent.cwd,
+			thinkingLevel: agent.thinkingLevel,
+			currentTask: agent.currentTask,
+			error: agent.error,
+			workspaceMode: agent.workspaceMode,
+			target: agent.target ? { ...agent.target, trust: { ...agent.target.trust } } : undefined,
+			policy: agent.policy
+				? {
+						inherited: [...agent.policy.inherited],
+						overridden: [...agent.policy.overridden],
+						unsupported: [...agent.policy.unsupported],
+					}
+				: undefined,
+		};
 	}
 
 	list(includeClosed = false, rootId?: string): ManagedAgent[] {
@@ -755,6 +825,22 @@ export class AgentRegistry {
 		return next;
 	}
 
+	private inspectSummary(agent: ManagedAgent): AgentRunInspectionSummary {
+		let unreadMessages = 0;
+		for (const message of agent.mailbox) {
+			if (message.readAt === undefined) unreadMessages++;
+		}
+		return {
+			id: agent.id,
+			agent: agent.agent,
+			state: agent.state,
+			createdAt: agent.createdAt,
+			updatedAt: agent.updatedAt,
+			historyCount: agent.history.length,
+			unreadMessages,
+		};
+	}
+
 	private copy(agent: ManagedAgent): ManagedAgent {
 		return {
 			...agent,
@@ -765,6 +851,7 @@ export class AgentRegistry {
 				: undefined,
 			history: agent.history.map((turn) => ({ ...turn })),
 			mailbox: agent.mailbox.map((message) => ({ ...message })),
+			target: agent.target ? { ...agent.target, trust: { ...agent.target.trust } } : undefined,
 			policy: agent.policy
 				? {
 						inherited: [...agent.policy.inherited],

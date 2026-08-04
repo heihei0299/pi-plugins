@@ -4,8 +4,15 @@ import {
 	type AgentConfig,
 	type AgentScope,
 	discoverAgents,
+	type SubagentSettings,
 	type SubagentThinkingLevel,
 } from "./agents.js";
+import {
+	assertDelegationTargetAllowed,
+	type ResolvedSubagentTarget,
+	resolveSubagentTarget,
+	targetPolicyAudit,
+} from "./cwd-policy.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, truncateUtf8 } from "./limits.js";
 import { hasUsableAggregator, type SubagentParams } from "./params.js";
 import {
@@ -19,7 +26,12 @@ import {
 	type SingleResult,
 	type SubagentDetails,
 } from "./runner.js";
-import { readSubagentSettings, resolveSubagentThinkingLevel } from "./settings.js";
+import { safeTerminalLine } from "./safe-text.js";
+import {
+	DEFAULT_DELEGATION_CWD_POLICY,
+	readSubagentSettings,
+	resolveSubagentThinkingLevel,
+} from "./settings.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -104,11 +116,15 @@ export async function executeSubagent(
 	signal: AbortSignal | undefined,
 	onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined,
 	ctx: ExtensionContext,
+	settingsOverride?: SubagentSettings,
 ): Promise<AgentToolResult<SubagentDetails> & { isError?: boolean }> {
 	assertSubagentDepthAllowed();
 	const agentScope: AgentScope = params.agentScope ?? "user";
+	if ((agentScope === "project" || agentScope === "both") && !ctx.isProjectTrusted()) {
+		throw new Error("Project-local subagent definitions require a trusted project");
+	}
 	const aggregator = hasUsableAggregator(params.aggregator) ? params.aggregator : undefined;
-	const config = readSubagentSettings();
+	const config = settingsOverride ?? readSubagentSettings();
 	const discovery = discoverAgents(ctx.cwd, agentScope, config);
 	const agents = discovery.agents;
 	const confirmProjectAgents = params.confirmProjectAgents ?? true;
@@ -152,6 +168,28 @@ export async function executeSubagent(
 		};
 	}
 
+	const delegationPolicy = config?.cwdPolicy?.delegation ?? DEFAULT_DELEGATION_CWD_POLICY;
+	const resolveTarget = (cwd: string | undefined): ResolvedSubagentTarget => {
+		const target = resolveSubagentTarget({
+			workspace: ctx.cwd,
+			requestedCwd: cwd,
+			currentProjectTrusted: ctx.isProjectTrusted(),
+		});
+		assertDelegationTargetAllowed(target, delegationPolicy);
+		return target;
+	};
+	const singleTarget = hasSingle ? resolveTarget(params.cwd) : undefined;
+	const chainTargets = params.chain?.map((step) => resolveTarget(step.cwd)) ?? [];
+	const parallelTargets = params.tasks?.map((task) => resolveTarget(task.cwd)) ?? [];
+	const aggregatorTarget = aggregator ? resolveTarget(aggregator.cwd) : undefined;
+	const attachTarget = (result: SingleResult, target: ResolvedSubagentTarget): SingleResult => {
+		result.target = targetPolicyAudit(target);
+		return result;
+	};
+	const launchPolicy = (target: ResolvedSubagentTarget) => ({
+		projectTrust: target.trust.projectTrusted,
+	});
+
 	if (agentScope === "project" || agentScope === "both") {
 		const requestedAgentNames = new Set<string>();
 		if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
@@ -168,12 +206,19 @@ export async function executeSubagent(
 				throw new Error("Project-local subagent definitions require a trusted project");
 			}
 			if (confirmProjectAgents && ctx.hasUI) {
-				const names = projectAgentsRequested.map((a) => a.name).join(", ");
-				const dir = discovery.projectAgentsDir ?? "(unknown)";
+				const names = projectAgentsRequested
+					.map((agent) => safeTerminalLine(agent.name, 256))
+					.join(", ");
+				const dir = safeTerminalLine(discovery.projectAgentsDir ?? "(unknown)");
 				const ok = await ctx.ui.confirm(
 					"Run project-local agents?",
 					`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
 				);
+				if (signal?.aborted) {
+					const error = new Error("Subagent call was aborted during project-agent confirmation");
+					error.name = "AbortError";
+					throw error;
+				}
 				if (!ok) {
 					return {
 						content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
@@ -213,18 +258,24 @@ export async function executeSubagent(
 						}
 					: undefined;
 
-				const result = await runSingleAgent(
-					ctx.cwd,
-					agents,
-					step.agent,
-					taskWithContext,
-					step.cwd,
-					i + 1,
-					signal,
-					resolveThinkingLevel(step.agent, step.thinkingLevel),
-					resolveTimeoutMs(step.agent, step.timeoutMs),
-					chainUpdate,
-					makeDetails("chain"),
+				const target = chainTargets[i];
+				const result = attachTarget(
+					await runSingleAgent(
+						ctx.cwd,
+						agents,
+						step.agent,
+						taskWithContext,
+						target.cwd,
+						i + 1,
+						signal,
+						resolveThinkingLevel(step.agent, step.thinkingLevel),
+						resolveTimeoutMs(step.agent, step.timeoutMs),
+						chainUpdate,
+						makeDetails("chain"),
+						undefined,
+						launchPolicy(target),
+					),
+					target,
 				);
 				results.push(result);
 
@@ -346,24 +397,30 @@ export async function executeSubagent(
 				params.tasks,
 				MAX_CONCURRENCY,
 				async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						resolveThinkingLevel(t.agent, t.thinkingLevel),
-						resolveTimeoutMs(t.agent, t.timeoutMs),
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = { ...partial.details.results[0], exitCode: -1 };
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
+					const target = parallelTargets[index];
+					const result = attachTarget(
+						await runSingleAgent(
+							ctx.cwd,
+							agents,
+							t.agent,
+							t.task,
+							target.cwd,
+							undefined,
+							signal,
+							resolveThinkingLevel(t.agent, t.thinkingLevel),
+							resolveTimeoutMs(t.agent, t.timeoutMs),
+							// Per-task update callback
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = { ...partial.details.results[0], exitCode: -1 };
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel"),
+							undefined,
+							launchPolicy(target),
+						),
+						target,
 					);
 					allResults[index] = result;
 					doneCount += 1;
@@ -399,26 +456,32 @@ export async function executeSubagent(
 						: `${aggregator.task}\n\nParallel task outputs:\n\n${fanInContext}`,
 					DEFAULT_MAX_CONTEXT_BYTES,
 				).text;
-				aggregatorResult = await runSingleAgent(
-					ctx.cwd,
-					agents,
-					aggregator.agent,
-					aggregatorTask,
-					aggregator.cwd,
-					undefined,
-					signal,
-					resolveThinkingLevel(aggregator.agent, aggregator.thinkingLevel),
-					resolveTimeoutMs(aggregator.agent, aggregator.timeoutMs),
-					(partial) => {
-						status.update(fanInStatus(aggregator.agent));
-						if (onUpdate && partial.details?.results[0]) {
-							onUpdate({
-								content: partial.content,
-								details: makeDetails("parallel")(results, partial.details.results[0]),
-							});
-						}
-					},
-					makeDetails("parallel"),
+				const target = aggregatorTarget as ResolvedSubagentTarget;
+				aggregatorResult = attachTarget(
+					await runSingleAgent(
+						ctx.cwd,
+						agents,
+						aggregator.agent,
+						aggregatorTask,
+						target.cwd,
+						undefined,
+						signal,
+						resolveThinkingLevel(aggregator.agent, aggregator.thinkingLevel),
+						resolveTimeoutMs(aggregator.agent, aggregator.timeoutMs),
+						(partial) => {
+							status.update(fanInStatus(aggregator.agent));
+							if (onUpdate && partial.details?.results[0]) {
+								onUpdate({
+									content: partial.content,
+									details: makeDetails("parallel")(results, partial.details.results[0]),
+								});
+							}
+						},
+						makeDetails("parallel"),
+						undefined,
+						launchPolicy(target),
+					),
+					target,
 				);
 			}
 
@@ -463,18 +526,24 @@ export async function executeSubagent(
 		const status = startSubagentStatus(ctx, toolCallId, singleStatus(params.agent));
 
 		try {
-			const result = await runSingleAgent(
-				ctx.cwd,
-				agents,
-				params.agent,
-				params.task,
-				params.cwd,
-				undefined,
-				signal,
-				resolveThinkingLevel(params.agent, params.thinkingLevel),
-				resolveTimeoutMs(params.agent, params.timeoutMs),
-				onUpdate,
-				makeDetails("single"),
+			const target = singleTarget as ResolvedSubagentTarget;
+			const result = attachTarget(
+				await runSingleAgent(
+					ctx.cwd,
+					agents,
+					params.agent,
+					params.task,
+					target.cwd,
+					undefined,
+					signal,
+					resolveThinkingLevel(params.agent, params.thinkingLevel),
+					resolveTimeoutMs(params.agent, params.timeoutMs),
+					onUpdate,
+					makeDetails("single"),
+					undefined,
+					launchPolicy(target),
+				),
+				target,
 			);
 			const isError = isResultError(result);
 			if (isError) {

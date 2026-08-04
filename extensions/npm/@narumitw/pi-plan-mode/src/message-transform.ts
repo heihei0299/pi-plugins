@@ -128,7 +128,7 @@ export function messageContainsPlanModeImplementationHandoff(message: unknown) {
 	);
 }
 
-function messageContainsExactPlanModeImplementationHandoff(message: unknown, plan: string) {
+export function messageContainsExactPlanModeImplementationHandoff(message: unknown, plan: string) {
 	const candidate = unwrapSessionMessage(message);
 	if (candidate.role !== "user") return false;
 	return (

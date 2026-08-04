@@ -4,7 +4,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -41,6 +41,29 @@ export type SubagentTransportKind = "subprocess" | "in-process";
 
 export type CompletionDelivery = "next-turn" | "auto-resume";
 
+export const CONSULT_RESOURCE_POLICIES = ["project-context", "none", "all"] as const;
+
+export type ConsultResourcePolicy = (typeof CONSULT_RESOURCE_POLICIES)[number];
+
+export interface SubagentConsultSettings {
+	resources?: ConsultResourcePolicy;
+}
+
+export const CONSULTATION_CWD_POLICIES = ["anywhere", "current-workspace"] as const;
+export type ConsultationCwdPolicy = (typeof CONSULTATION_CWD_POLICIES)[number];
+
+export const DELEGATION_CWD_POLICIES = [
+	"trusted-targets",
+	"current-workspace",
+	"anywhere",
+] as const;
+export type DelegationCwdPolicy = (typeof DELEGATION_CWD_POLICIES)[number];
+
+export interface SubagentCwdPolicySettings {
+	consultation?: ConsultationCwdPolicy;
+	delegation?: DelegationCwdPolicy;
+}
+
 export interface SubagentBlockingSettings {
 	enabled?: boolean;
 }
@@ -64,6 +87,8 @@ export interface SubagentSettings {
 	agents?: Record<string, SubagentAgentConfig>;
 	blocking?: SubagentBlockingSettings;
 	stateful?: SubagentRuntimeSettings;
+	consult?: SubagentConsultSettings;
+	cwdPolicy?: SubagentCwdPolicySettings;
 }
 
 const BUILT_IN_AGENTS: AgentConfig[] = [
@@ -238,20 +263,36 @@ function loadAgentsFromDir(
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(loaded.content);
+		const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(loaded.content);
 
-		if (!frontmatter.name || !frontmatter.description) continue;
+		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") {
+			continue;
+		}
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
+		const hasTools = hasOwn(frontmatter, "tools");
+		const rawTools = frontmatter.tools;
+		let tools: string[] | undefined;
+		if (hasTools) {
+			if (rawTools === null) {
+				tools = [];
+			} else if (Array.isArray(rawTools)) {
+				if (!rawTools.every((tool): tool is string => typeof tool === "string")) continue;
+				tools = rawTools.map((tool) => tool.trim()).filter(Boolean);
+			} else if (typeof rawTools === "string") {
+				tools = rawTools
+					.split(",")
+					.map((tool) => tool.trim())
+					.filter(Boolean);
+			} else {
+				continue;
+			}
+		}
 
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
-			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model,
+			...(hasTools ? { tools: tools ?? [] } : {}),
+			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 			thinkingLevel: isThinkingLevel(frontmatter.thinkingLevel)
 				? frontmatter.thinkingLevel
 				: undefined,
@@ -275,7 +316,7 @@ function isDirectory(p: string): boolean {
 function findNearestProjectAgentsDir(cwd: string): string | null {
 	let currentDir = cwd;
 	while (true) {
-		const candidate = path.join(currentDir, ".pi", "agents");
+		const candidate = path.join(currentDir, CONFIG_DIR_NAME, "agents");
 		if (isDirectory(candidate)) return candidate;
 
 		const parentDir = path.dirname(currentDir);

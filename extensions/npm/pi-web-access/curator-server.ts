@@ -13,7 +13,7 @@ export interface CuratorServerOptions {
 	queries: string[];
 	sessionToken: string;
 	timeout: number;
-	availableProviders: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; serpdive: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean };
+	availableProviders: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; serpdive: boolean; kagi: boolean; ollama: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean };
 	defaultProvider: string;
 	searchProvider: string;
 	summaryModels: Array<{ value: string; label: string }>;
@@ -275,11 +275,16 @@ export function startCuratorServer(
 		if (provider === "querit") return availableProviders.querit;
 		if (provider === "tavily") return availableProviders.tavily;
 		if (provider === "serpdive") return availableProviders.serpdive;
+		if (provider === "kagi") return availableProviders.kagi;
+		if (provider === "ollama") return availableProviders.ollama;
 		if (provider === "searxng") return availableProviders.searxng;
 		if (provider === "perplexity") return availableProviders.perplexity;
 		if (provider === "exa") return availableProviders.exa;
 		if (provider === "gemini") return availableProviders.gemini;
 		if (provider === "anysearch") return availableProviders.anysearch;
+		if (provider === "xai") return availableProviders.xai;
+		if (provider === "brightdata") return availableProviders.brightdata;
+		if (provider === "serpbase") return availableProviders.serpbase;
 		return false;
 	}
 

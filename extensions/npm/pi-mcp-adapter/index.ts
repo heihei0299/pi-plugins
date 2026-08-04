@@ -17,6 +17,7 @@ import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolR
 import { toolErrorOverride } from "./error-signal.ts";
 import { createMcpRuntimeOwner, createOwnedUi, isAbortError, type McpRuntimeOwner } from "./runtime-owner.ts";
 import { publishMcpStatusShutdown } from "./mcp-status.ts";
+import { runMcpScript } from "./mcp-code.ts";
 
 export type { McpAdapterOptions } from "./types.ts";
 export {
@@ -106,6 +107,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   const fallbackDeactivatedTools = new Set<string>();
   let proxyToolRegistered = false;
   let proxyToolDescription: string | null = null;
+  let directToolsFrozen = false;
 
   // OMP remaps `typebox` to a host shim that historically lacked Type.Unsafe.
   // Prefer Unsafe when present (real TypeBox / fixed OMP shim); otherwise pass
@@ -278,12 +280,20 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       nextState.onToolMetadataUpdated = (_serverName, _reason) => {
         if (state !== nextState || !owner.isActive()) return;
         syncPromptCommands();
+        if (directToolsFrozen) {
+          logger.debug(`MCP: metadata update for ${_serverName} (${_reason}) skipped — directTools frozen`);
+          return;
+        }
         syncToolSurface(ctx);
       };
       syncPromptCommands();
       syncToolSurface(ctx);
       updateStatusBar(nextState);
       initPromise = null;
+      if (earlyConfig.settings?.freezeDirectTools === true) {
+        directToolsFrozen = true;
+        logger.info("MCP: direct tools frozen after initial sync — reconnects won't rebuild the system prompt; use mcp({ connect: \"server\" }) to rediscover");
+      }
     }).catch(async err => {
       if (!owner.isActive() || generation !== lifecycleGeneration) {
         return;
@@ -462,6 +472,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         case "reconnect":
           commandOwner?.throwIfInactive();
           await reconnectServers(state, commandCtx, targetServer);
+          if (directToolsFrozen) syncToolSurface(commandCtx);
           break;
         case "tools":
           await showTools(state, commandCtx);
@@ -596,12 +607,58 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     },
   });
 
+  if (earlyConfig.settings?.scriptMode !== false) {
+    (pi.registerTool as (tool: unknown) => unknown)({
+      name: "mcp_script",
+      label: "MCP Script",
+      description: "Run trusted JavaScript that makes multiple MCP tool calls in one request — loop, filter, chain, or fan out between calls. For a single MCP call, search, describe, status check, or auth action, use the mcp tool instead. Discover with await tools.search({ query }) — resolves to { items: [{ path, name, server, description? }], total, hasMore, nextOffset }, not an { ok, data } envelope. Inspect with await tools.describe({ path }) — resolves to the tool descriptor with inputTypeScript, or { path, error: { code, message, suggestions } }. Then call tools.call(path, args) — resolves to { ok: true, data } or { ok: false, error: { code, message } } — or use direct flat calls when the name is already known; use emit(value) for user-visible output. Load the mcp-scripting skill for the full workflow guide.",
+      promptSnippet: "Batch multiple MCP tool calls in one JavaScript request (loop, filter, chain)",
+      parameters: Type.Object({
+        code: Type.String({ description: "Trusted JavaScript MCP script. Use tools.<prefixedToolName>(args) and emit(value)." }),
+        // Raw JSON schema: host TypeBox shims may omit Type.Number (see index-lifecycle shim test).
+        timeoutMs: Type.Optional({ type: "number", minimum: 1, description: "Execution timeout in milliseconds (default: 30000)" } as any),
+      }),
+      renderResult: renderMcpToolResult,
+      async execute(_toolCallId, params: { code: string; timeoutMs?: number }, signal) {
+        const executeOwner = currentOwner;
+        if (!state && initPromise) {
+          try {
+            const initialized = await awaitWithTimeout(initPromise, INIT_WAIT_TIMEOUT_MS);
+            if (initialized === INIT_WAIT_TIMED_OUT) {
+              return {
+                content: [{ type: "text" as const, text: "MCP initialization is still in progress. Try again shortly." }],
+                details: { mode: "script", error: "init_timeout", timeoutMs: INIT_WAIT_TIMEOUT_MS },
+              };
+            }
+            executeOwner?.throwIfInactive();
+            state = initialized;
+          } catch (error) {
+            if (executeOwner && isAbortError(error, executeOwner.signal)) throw error;
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+              content: [{ type: "text" as const, text: `MCP initialization failed: ${message}` }],
+              details: { mode: "script", error: "init_failed", message },
+            };
+          }
+        }
+        if (!state) {
+          return {
+            content: [{ type: "text" as const, text: "MCP not initialized" }],
+            details: { mode: "script", error: "not_initialized" },
+          };
+        }
+        executeOwner?.throwIfInactive();
+        return runMcpScript(state, params.code, params.timeoutMs, getPiTools, signal);
+      },
+    });
+  }
+
   function registerProxyTool(description: string): void {
     (pi.registerTool as (tool: unknown) => unknown)({
       name: "mcp",
       label: "MCP",
       description,
-      promptSnippet: "MCP gateway - connect to MCP servers and call their tools",
+      promptSnippet: "MCP gateway — status, search, describe, auth, and single MCP tool calls",
       renderCall: renderMcpProxyToolCall,
       parameters: Type.Object({
         tool: Type.Optional(Type.String({ description: "Tool name to call (e.g., 'xcodebuild_list_sims')" })),
@@ -618,6 +675,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         search: Type.Optional(Type.String({ description: "Search tools by name/description" })),
         regex: Type.Optional(Type.Boolean({ description: "Treat search as regex (default: substring match)" })),
         includeSchemas: Type.Optional(Type.Boolean({ description: "Include parameter schemas in search results (default: true)" })),
+        // Raw JSON schema: host TypeBox shims may omit Type.Number (see index-lifecycle shim test).
+        limit: Type.Optional({ type: "number", minimum: 1, description: "Maximum search results to return (default: 12)" } as any),
+        offset: Type.Optional({ type: "number", minimum: 0, description: "Search result offset (default: 0)" } as any),
         server: Type.Optional(Type.String({ description: "Filter to specific server (also disambiguates tool calls)" })),
         action: Type.Optional(Type.String({ description: "Action: 'ui-messages', 'auth-start', or 'auth-complete'" })),
       }),
@@ -631,6 +691,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         search?: string;
         regex?: boolean;
         includeSchemas?: boolean;
+        limit?: number;
+        offset?: number;
         server?: string;
         action?: string;
       }, signal, _onUpdate, _ctx) {
@@ -732,8 +794,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         if (params.instructions) {
           return executeInstructions(state, params.instructions);
         }
-        if (params.search) {
-          return executeSearch(state, params.search, params.regex, params.server, params.includeSchemas);
+        if (params.search !== undefined) {
+          return executeSearch(state, params.search, params.regex, params.server, params.includeSchemas, params.limit, params.offset);
         }
         if (params.server) {
           return executeList(state, params.server);

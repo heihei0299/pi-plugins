@@ -8,13 +8,14 @@ Use it when you want to ask a temporary question, inspect context, or get a shor
 
 ## ✨ Features
 
-- Adds a `/btw` side-thread command to Pi, with an optional initial question.
+- Adds a `/btw` menu for starting a side thread or changing pi-btw settings.
+- Keeps `/btw <question>` as a direct fast path.
 - Answers side questions in a temporary, scrollable UI.
 - Supports follow-up questions in the same ephemeral side thread.
 - Optionally brings the latest answer, a question-to-end suffix, an exact line range, or the entire side thread into the main editor.
 - Uses the current session branch as context.
 - Uses Pi's current model or an independent model selected in `pi-btw.json`.
-- Inherits Pi's current thinking level or uses a fixed level from `pi-btw.json`.
+- Uses a pi-btw thinking level that can be changed with Pi's configured thinking shortcut and remembered for next time.
 - Does not append the side question or answer to the main conversation.
 - Works as an independently installable npm Pi extension package.
 
@@ -38,7 +39,7 @@ pi -e ./extensions/pi-btw
 
 ## 🚀 Usage
 
-Start an empty side thread or provide its first question immediately:
+Open the pi-btw menu or provide the first question immediately:
 
 ```text
 /btw
@@ -54,16 +55,23 @@ Examples:
 /btw is this API name idiomatic?
 ```
 
-Running `/btw` alone opens an empty ephemeral side thread with its editor ready. When an
-initial question is provided, its answer opens above the same editor. A compact
-`btw · side thread` header stays fixed above the content so the ephemeral workspace remains
-recognizable while scrolling. Messages use Pi's normal user and assistant presentation without
-numbered turns or role labels. Type each question and press `Enter`; no follow-up shortcut is
-required.
+Running `/btw` alone opens a two-row menu. **Start side thread** is selected first, so pressing
+`Enter` opens an empty ephemeral side thread; **Settings** changes the starting thinking level
+and whether shortcut changes are remembered. `/btw <question>` bypasses this menu, and its answer
+opens above the side-thread editor. A compact `btw · side thread` header stays fixed above the
+content so the ephemeral workspace remains recognizable while scrolling. Messages use Pi's normal
+user and assistant presentation without numbered turns or role labels. Type each question and press
+`Enter`; no follow-up shortcut is required.
 Previous side questions and answers remain available to the model and visible for that
-invocation. While a response is running, the transcript stays visible above a compact
-`Answering…` status. The footer shows `PgUp`/`PgDn` only when history can scroll; press
-`Ctrl+C` to cancel an in-progress answer or leave the side thread.
+invocation. The side-thread header shows its current thinking level. Press Pi's configured
+`app.thinking.cycle` shortcut (`Shift+Tab` by default) in the composer to cycle the levels
+supported by the side-thread model; every later question uses the displayed level until it is
+changed again. By default, each shortcut change is also written to `pi-btw.json` for the next
+invocation. Turn **Remember thinking level changes** off in Settings to keep changes local to the
+current side thread. Neither path changes the main session's thinking level. While a response is
+running, the transcript stays visible above a compact `Answering…` status.
+The footer shows `PgUp`/`PgDn` only when history can scroll; press `Ctrl+C` to cancel an
+in-progress answer or leave the side thread.
 
 After at least one successful answer, press `Ctrl+R` to bring selected context to the main
 editor. The scope menu shows the size of the latest question and answer and the entire side
@@ -106,7 +114,8 @@ setting; pi-btw does not add any environment variables.
 ```json
 {
   "model": "anthropic/claude-sonnet-4-5",
-  "thinkingLevel": "low"
+  "thinkingLevel": "low",
+  "rememberThinkingLevelChanges": true
 }
 ```
 
@@ -117,17 +126,26 @@ cannot be found or authenticated, pi-btw warns and falls back to the current ses
 If neither model is available, `/btw` reports an error and stops. This selection affects only
 `/btw`; it does not change the main session model.
 
-Pi calls its reasoning setting the **thinking level**. By default, `/btw` inherits the
-current runtime level, including changes made through `/settings` or `Shift+Tab`. It does
-not read or change `defaultThinkingLevel` directly. Supported fixed values are `off`,
-`minimal`, `low`, `medium`, `high`, and `xhigh`. The selected value applies to the model
-actually used by `/btw` and does not change the main session. Pi's provider layer may clamp
-a requested level when that model does not support it.
+Pi calls its reasoning setting the **thinking level**. `thinkingLevel` sets pi-btw's starting
+level; accepted values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. When the
+field is absent for backward compatibility, the next invocation starts from the current session
+level. The initial value and shortcut cycle are clamped to the selected side model's capabilities
+using Pi's model rules. Pi-btw does not read, write, or change the main session's
+`defaultThinkingLevel`.
 
-The settings file is optional and is never created automatically. A missing file, `{}`, or
-omitted fields silently inherit the current Pi model and thinking level. The file is read for
-each `/btw` invocation, so edits apply to the next side question without `/reload`. Invalid
-or unreadable settings produce a warning and fall back to the current Pi defaults.
+`rememberThinkingLevelChanges` controls only persistence and defaults to `true` when omitted. A
+side-thread shortcut always changes that side thread immediately. When remembering is on, the
+concrete level is written for the next invocation; when off, `pi-btw.json` stays unchanged. If a
+shortcut write fails, the local change remains active and pi-btw warns that it was not remembered.
+A failed Settings-screen save instead restores the previous displayed value.
+
+A missing settings file is a side-effect-free read: pi-btw creates it only after a Settings change
+or a remembered shortcut change. Saves are ordered within the Pi process and published atomically
+with a same-directory temporary file and rename. They preserve `model` and unknown fields; malformed
+or invalid files block saves and remain unchanged. Settings must be valid UTF-8 and no larger than
+64 KiB, so unexpectedly large or invalidly encoded files are rejected without being rewritten.
+Separate Pi processes and external editors are outside this in-process ordering boundary. The file
+is read for each `/btw` invocation, so edits apply without `/reload`.
 
 ## 🧠 Why use pi-btw?
 
@@ -141,7 +159,10 @@ extensions/pi-btw/
 │   ├── index.ts
 │   ├── btw.ts
 │   ├── bring-to-main.ts
+│   ├── menu.ts
+│   ├── settings.ts
 │   ├── side-thread.ts
+│   ├── text.ts
 │   └── transcript-pager.ts
 ├── README.md
 ├── LICENSE

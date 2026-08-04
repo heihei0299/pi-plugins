@@ -19,7 +19,13 @@ import { valAccess } from "./validation";
 const R_DESC = loadP("../prompts/read.md");
 
 const R_SNIPPET = loadP("../prompts/read-snippet.md");
-const R_GUIDE = loadGuide("../prompts/read-guidelines.md");
+
+function readGuide(autoRead: boolean): string[] {
+	const note = "- `read`: call again after any edit to that file — changed lines get new anchors.";
+	return loadGuide("../prompts/read-guidelines.md", {
+		AUTO_READ_NOTE: autoRead ? "" : note,
+	});
+}
 
 function normPosInt(
 	value: number | undefined,
@@ -30,7 +36,7 @@ function normPosInt(
 	}
 
 	if (!Number.isInteger(value) || value < 1) {
-		throw new Error(`Read request field "${name}" must be a positive integer.`);
+		throw new Error(`[E_BAD_SHAPE] Read request field "${name}" must be a positive integer.`);
 	}
 
 	return value;
@@ -113,13 +119,13 @@ export async function fmtReadPreview(
 	};
 }
 
-export function regRead(pi: ExtensionAPI): void {
+export function regRead(pi: ExtensionAPI, opts?: { autoRead?: boolean }): void {
 	pi.registerTool({
 		name: "read",
 		label: "Read",
 		description: R_DESC,
 		promptSnippet: R_SNIPPET,
-		promptGuidelines: R_GUIDE,
+		promptGuidelines: readGuide(opts?.autoRead ?? true),
 		parameters: Type.Object({
 			path: Type.String({
 				description: "Path to the file to read (relative or absolute)",

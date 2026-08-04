@@ -89,7 +89,6 @@ export interface LspServerAdapter {
 	name: string;
 	isDefault: boolean;
 	defaultCommand: ServerCommand;
-	commandEnvVar: string;
 	missingCommandHint: string;
 	extensions: string[];
 	env?: Record<string, string>;

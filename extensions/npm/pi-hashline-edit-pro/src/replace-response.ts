@@ -1,6 +1,6 @@
 import type { ReplaceDetails } from "./replace";
 import { genDiff } from "./replace-diff";
-import { visLines } from "./utils";
+import { visLines, clipLine } from "./utils";
 
 type TResult = {
 	content: Array<{ type: "text"; text: string }>;
@@ -28,14 +28,13 @@ export type RMeta = {
 };
 
 type NEditEntry = {
-	editIndex: number;
 	loc: string;
 	currentContent: string;
 };
 
 export interface NoopInput {
 	path: string;
-	noopEdits: NEditEntry[] | undefined;
+	noopEdit: NEditEntry | undefined;
 	snapshotId: string;
 	editMeta: RMeta;
 	warnings: string[] | undefined;
@@ -92,20 +91,15 @@ function warnBlock(warnings: string[] | undefined): string {
 export function buildNoop(input: NoopInput): TResult {
 	const {
 		path,
-		noopEdits,
+		noopEdit,
 		snapshotId,
 		editMeta,
 		warnings,
 	} = input;
 
-	const noopDetailsText = noopEdits?.length
-		? noopEdits
-				.map(
-					(edit) =>
-						`Edit ${edit.editIndex}: replacement for ${edit.loc} is identical to current content:\n  ${edit.loc}: ${edit.currentContent}`,
-				)
-				.join("\n")
-		: "The edits produced identical content.";
+	const noopDetailsText = noopEdit
+		? `Replacement for ${noopEdit.loc} is identical to current content:\n  ${noopEdit.loc}: ${clipLine(noopEdit.currentContent)}`
+		: "The edit produced identical content.";
 
 	const text = `No changes made to ${path}\nClassification: noop\n${noopDetailsText}`;
 
@@ -129,10 +123,10 @@ export function buildNoop(input: NoopInput): TResult {
 }
 
 export function buildChanged(input: SuccessInput): TResult {
-  const { path, result, warnings, snapshotId, originalNormalized, originalHashes, editMeta, resultHashes } = input;
+  const { path, result, warnings, snapshotId, originalNormalized, editMeta, resultHashes } = input;
 
   const resultLines = visLines(result);
-  const diffResult = genDiff(originalNormalized, result, 2, resultHashes, originalHashes);
+  const diffResult = genDiff(originalNormalized, result, 2, resultHashes);
   const addedLines = editMeta.addedLines;
   const removedLines = editMeta.removedLines;
   const warningsBlock = warnBlock(warnings);

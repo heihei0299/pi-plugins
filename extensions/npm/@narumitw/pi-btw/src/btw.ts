@@ -1,22 +1,21 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	clampThinkingLevel,
+	getSupportedThinkingLevels,
+	type Model,
+} from "@earendil-works/pi-ai";
 import {
 	BorderedLoader,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
-	getAgentDir,
 	type KeybindingsManager,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
+import { defineMenu, type MenuContext, type RunMenuResult, runMenu } from "@narumitw/pi-tui-kit";
 import {
-	BtwBringToMainPreview,
-	type BtwBringToMainPreviewAction,
 	type BtwBringToMainSegment,
 	type BtwBringToMainSummary,
-	BtwMenuSelector,
-	type BtwMenuSelectorAction,
 	BtwTextRangeSelector,
 	type BtwTextRangeSelectorState,
 	buildQuickBringToMainSegments,
@@ -26,6 +25,18 @@ import {
 	summarizeBringToMain,
 } from "./bring-to-main.js";
 import {
+	type BtwCommandMenuResult,
+	runBtwMenuPreservingEditor,
+	showBtwCommandMenu,
+} from "./menu.js";
+import {
+	type BtwSettings,
+	effectiveRememberThinkingLevelChanges,
+	parseBtwModelReference,
+	readBtwSettings,
+	updateBtwSettings,
+} from "./settings.js";
+import {
 	BTW_THINKING_LEVELS,
 	type BtwThinkingLevel,
 	completeSideThreadTurn,
@@ -33,12 +44,22 @@ import {
 	type SideQuestionAuth,
 	type SideThread,
 } from "./side-thread.js";
+import { sanitizeSingleLine } from "./text.js";
 import {
 	BtwAnsweringView,
+	type BtwThinkingControl,
 	BtwTranscriptPager,
 	type TranscriptPagerAction,
 } from "./transcript-pager.js";
 
+export {
+	BTW_SETTINGS_FILE,
+	type BtwSettings,
+	type BtwSettingsLoadResult,
+	normalizeBtwSettings,
+	parseBtwModelReference,
+	readBtwSettings,
+} from "./settings.js";
 export {
 	BTW_THINKING_LEVELS,
 	type BtwThinkingLevel,
@@ -46,19 +67,9 @@ export {
 	completeSideQuestion,
 	loadCompleteSimple,
 } from "./side-thread.js";
+export { sanitizeSingleLine } from "./text.js";
 
 const MAX_CONTEXT_CHARS = 40_000;
-export const BTW_SETTINGS_FILE = "pi-btw.json";
-
-export interface BtwSettings {
-	model?: string;
-	thinkingLevel?: BtwThinkingLevel;
-}
-
-export type BtwSettingsLoadResult =
-	| { kind: "missing" }
-	| { kind: "invalid"; reason: string }
-	| { kind: "loaded"; settings: BtwSettings };
 
 interface LoadBtwThinkingLevelOptions {
 	settingsPath?: string;
@@ -87,50 +98,25 @@ export interface ResolvedBtwModel {
 	auth: SideQuestionAuth;
 }
 
-export function normalizeBtwSettings(value: unknown): BtwSettings | undefined {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-
-	const settings: BtwSettings = {};
-	if (Object.hasOwn(value, "model")) {
-		const model = Reflect.get(value, "model");
-		if (typeof model !== "string" || !parseBtwModelReference(model)) return undefined;
-		settings.model = model;
-	}
-	if (Object.hasOwn(value, "thinkingLevel")) {
-		const thinkingLevel = Reflect.get(value, "thinkingLevel");
-		if (!isBtwThinkingLevel(thinkingLevel)) return undefined;
-		settings.thinkingLevel = thinkingLevel;
-	}
-	return settings;
-}
-
-export function parseBtwModelReference(
-	reference: string,
-): { provider: string; modelId: string } | undefined {
-	if (/\s/.test(reference)) return undefined;
-	const separator = reference.indexOf("/");
-	if (separator <= 0 || separator === reference.length - 1) return undefined;
-	return { provider: reference.slice(0, separator), modelId: reference.slice(separator + 1) };
-}
-
 export async function resolveBtwModel({
 	settings,
 	currentModel,
 	modelRegistry,
 	warn,
 }: ResolveBtwModelOptions): Promise<ResolvedBtwModel | undefined> {
+	const reportWarning = (message: string) => warn?.(sanitizeSingleLine(message));
 	if (settings.model) {
 		const fallback = currentModel
 			? `${currentModel.provider}/${currentModel.id}`
 			: "the current model";
 		const reference = parseBtwModelReference(settings.model);
 		if (!reference) {
-			warn?.(`pi-btw model ${settings.model} is invalid; falling back to ${fallback}.`);
-			return resolveBtwModel({ settings: {}, currentModel, modelRegistry, warn });
+			reportWarning(`pi-btw model ${settings.model} is invalid; falling back to ${fallback}.`);
+			return resolveBtwModel({ settings: {}, currentModel, modelRegistry, warn: reportWarning });
 		}
 		const configuredModel = modelRegistry.find(reference.provider, reference.modelId);
 		if (!configuredModel) {
-			warn?.(`pi-btw model ${settings.model} was not found; falling back to ${fallback}.`);
+			reportWarning(`pi-btw model ${settings.model} was not found; falling back to ${fallback}.`);
 		} else {
 			const sameAsCurrent =
 				configuredModel === currentModel ||
@@ -143,9 +129,11 @@ export async function resolveBtwModel({
 				const auth = await modelRegistry.getApiKeyAndHeaders(configuredModel);
 				if (auth.ok && hasRequestAuth(auth)) return { model: configuredModel, auth };
 				const reason = auth.ok ? "has no request credentials" : auth.error;
-				warn?.(`pi-btw model ${settings.model} is unavailable (${reason}); ${fallbackAction}.`);
+				reportWarning(
+					`pi-btw model ${settings.model} is unavailable (${reason}); ${fallbackAction}.`,
+				);
 			} catch (error: unknown) {
-				warn?.(
+				reportWarning(
 					`pi-btw model ${settings.model} credentials failed (${formatError(error)}); ${fallbackAction}.`,
 				);
 			}
@@ -171,26 +159,6 @@ function hasRequestAuth(auth: SideQuestionAuth): boolean {
 	);
 }
 
-export async function readBtwSettings(
-	settingsPath = join(getAgentDir(), BTW_SETTINGS_FILE),
-): Promise<BtwSettingsLoadResult> {
-	let contents: string;
-	try {
-		contents = await readFile(settingsPath, "utf8");
-	} catch (error: unknown) {
-		if (isNodeError(error) && error.code === "ENOENT") return { kind: "missing" };
-		return { kind: "invalid", reason: `${settingsPath}: ${formatError(error)}` };
-	}
-
-	try {
-		const settings = normalizeBtwSettings(JSON.parse(contents) as unknown);
-		if (settings) return { kind: "loaded", settings };
-		return { kind: "invalid", reason: `${settingsPath}: invalid settings shape` };
-	} catch (error: unknown) {
-		return { kind: "invalid", reason: `${settingsPath}: ${formatError(error)}` };
-	}
-}
-
 export async function loadBtwThinkingLevel(
 	currentThinkingLevel: BtwThinkingLevel,
 	options: LoadBtwThinkingLevelOptions = {},
@@ -202,24 +170,44 @@ export async function loadBtwThinkingLevel(
 	}
 
 	options.warn?.(
-		`pi-btw settings ignored: ${settings.reason}; expected optional model "provider/model-id" and thinkingLevel "${BTW_THINKING_LEVELS.join('" | "')}". Using current Pi thinking level.`,
+		sanitizeSingleLine(
+			`pi-btw settings ignored: ${settings.reason}; expected optional model "provider/model-id", thinkingLevel "${BTW_THINKING_LEVELS.join('" | "')}", and boolean rememberThinkingLevelChanges. Using current Pi thinking level.`,
+		),
 	);
 	return currentThinkingLevel;
-}
-
-function isBtwThinkingLevel(value: unknown): value is BtwThinkingLevel {
-	return BTW_THINKING_LEVELS.includes(value as BtwThinkingLevel);
-}
-
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-	return error instanceof Error && "code" in error;
 }
 
 function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-export default function btw(pi: ExtensionAPI) {
+function notifySafely(
+	ctx: ExtensionCommandContext,
+	message: string,
+	level: Parameters<ExtensionCommandContext["ui"]["notify"]>[1],
+): void {
+	try {
+		ctx.ui.notify(sanitizeSingleLine(message), level);
+	} catch {
+		// Async command continuations may finish after their ExtensionContext is replaced.
+	}
+}
+
+export interface BtwExtensionDependencies {
+	showCommandMenu?: (
+		pi: ExtensionAPI,
+		ctx: ExtensionCommandContext,
+	) => Promise<BtwCommandMenuResult>;
+	loadSettings?: typeof loadSettingsForCommand;
+	resolveModel?: typeof resolveBtwModelWithLoader;
+	runThread?: typeof runBtwThread;
+}
+
+export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependencies = {}) {
+	const showCommandMenu = dependencies.showCommandMenu ?? showCommandMenuForBtw;
+	const loadSettings = dependencies.loadSettings ?? loadSettingsForCommand;
+	const resolveModel = dependencies.resolveModel ?? resolveBtwModelWithLoader;
+	const runThread = dependencies.runThread ?? runBtwThread;
 	pi.registerCommand("btw", {
 		description: "Ask a quick side question without adding it to the main conversation",
 		handler: async (args, ctx) => {
@@ -228,25 +216,49 @@ export default function btw(pi: ExtensionAPI) {
 				ctx.ui.notify("/btw requires interactive TUI mode", "error");
 				return;
 			}
+			if (!question && (await showCommandMenu(pi, ctx)) !== "start") return;
 
-			const settings = await loadSettingsForCommand(ctx);
-			const resolution = await resolveBtwModelWithLoader(settings, ctx);
+			const settings = await loadSettings(ctx);
+			const resolution = await resolveModel(settings, ctx);
 			if (resolution.kind === "cancelled") {
-				ctx.ui.notify("Cancelled", "info");
+				notifySafely(ctx, "Cancelled", "info");
 				return;
 			}
 			if (resolution.kind === "unavailable") {
-				ctx.ui.notify("No available model for /btw", "error");
+				notifySafely(ctx, "No available model for /btw", "error");
 				return;
 			}
 
-			await runBtwThread({
+			await runThread({
 				initialQuestion: question || undefined,
 				selected: resolution.selected,
 				thinkingLevel: settings.thinkingLevel ?? pi.getThinkingLevel(),
+				rememberThinkingLevelChanges: effectiveRememberThinkingLevelChanges(settings),
 				ctx,
 			});
 		},
+	});
+}
+
+async function showCommandMenuForBtw(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+): Promise<BtwCommandMenuResult> {
+	const currentModel = ctx.model;
+	const availableModels = ctx.modelRegistry.getAll();
+	const currentThinkingLevel = pi.getThinkingLevel();
+	const loaded = await readBtwSettings();
+	const settings = loaded.kind === "loaded" ? loaded.settings : {};
+	const configured = settings.model ? parseBtwModelReference(settings.model) : undefined;
+	const configuredModel = configured
+		? availableModels.find(
+				(model) => model.provider === configured.provider && model.id === configured.modelId,
+			)
+		: undefined;
+	const model = configuredModel ?? currentModel;
+	return showBtwCommandMenu(ctx, {
+		currentThinkingLevel,
+		availableThinkingLevels: model ? getSupportedThinkingLevels(model) : BTW_THINKING_LEVELS,
 	});
 }
 
@@ -254,7 +266,7 @@ async function loadSettingsForCommand(ctx: ExtensionCommandContext): Promise<Btw
 	const settingsResult = await readBtwSettings();
 	if (settingsResult.kind === "loaded") return settingsResult.settings;
 	if (settingsResult.kind === "invalid") {
-		ctx.ui.notify(`pi-btw settings ignored: ${settingsResult.reason}`, "warning");
+		notifySafely(ctx, `pi-btw settings ignored: ${settingsResult.reason}`, "warning");
 	}
 	return {};
 }
@@ -282,7 +294,7 @@ async function resolveBtwModelWithLoader(
 			currentModel: ctx.model,
 			modelRegistry: ctx.modelRegistry,
 			warn: (message) => {
-				if (!settled) ctx.ui.notify(message, "warning");
+				if (!settled) notifySafely(ctx, message, "warning");
 			},
 		})
 			.then((selected) => {
@@ -305,9 +317,12 @@ interface RunBtwThreadDependencies {
 	interact?: typeof showThreadComposer;
 	chooseBringToMain?: typeof chooseBringToMain;
 	deliverBringToMain?: typeof loadBringToMainDraft;
+	persistThinkingLevel?: (level: BtwThinkingLevel) => Promise<unknown>;
 }
 
 export type BtwThreadResult = { kind: "closed" };
+
+type BtwThreadThinkingControl = Omit<BtwThinkingControl, "keybindings">;
 
 type BtwBringToMainChoice =
 	| BtwThreadResult
@@ -325,6 +340,8 @@ interface RunBtwThreadOptions {
 	initialQuestion?: string;
 	selected: ResolvedBtwModel;
 	thinkingLevel: BtwThinkingLevel;
+	rememberThinkingLevelChanges?: boolean;
+	settingsPath?: string;
 	ctx: ExtensionCommandContext;
 	dependencies?: RunBtwThreadDependencies;
 }
@@ -333,6 +350,8 @@ export async function runBtwThread({
 	initialQuestion,
 	selected,
 	thinkingLevel,
+	rememberThinkingLevelChanges = false,
+	settingsPath,
 	ctx,
 	dependencies = {},
 }: RunBtwThreadOptions): Promise<BtwThreadResult> {
@@ -340,44 +359,82 @@ export async function runBtwThread({
 	const interact = dependencies.interact ?? showThreadComposer;
 	const chooseBringToMainAction = dependencies.chooseBringToMain ?? chooseBringToMain;
 	const deliverBringToMainDraft = dependencies.deliverBringToMain ?? loadBringToMainDraft;
+	const persistThinkingLevel =
+		dependencies.persistThinkingLevel ??
+		((level: BtwThinkingLevel) => updateBtwSettings({ thinkingLevel: level }, { settingsPath }));
 	const thread = createSideThread(buildConversationContext(ctx.sessionManager.getBranch()));
+	const thinkingLevels = getSupportedThinkingLevels(selected.model);
+	const pendingWrites = new Set<Promise<void>>();
+	let activeThinkingLevel = clampThinkingLevel(selected.model, thinkingLevel);
 	let pendingQuestion = initialQuestion;
 	let composerDraft: string | undefined;
 
-	while (true) {
-		if (!pendingQuestion) {
-			const action = await interact(thread, thread.turns.length > 0, ctx, composerDraft);
-			if (action.kind === "close") return { kind: "closed" };
-			if (action.kind === "bringToMain") {
-				const choice = await chooseBringToMainAction(thread, ctx);
-				if (choice.kind === "closed") return choice;
-				if (choice.kind === "back") {
+	try {
+		while (true) {
+			if (!pendingQuestion) {
+				const thinking: BtwThreadThinkingControl = {
+					level: activeThinkingLevel,
+					levels: thinkingLevels,
+					onChange: (level) => {
+						if (!thinkingLevels.includes(level)) return;
+						activeThinkingLevel = level;
+						if (!rememberThinkingLevelChanges) return;
+						let write!: Promise<void>;
+						write = Promise.resolve()
+							.then(() => persistThinkingLevel(level))
+							.then(() => undefined)
+							.catch((error: unknown) => {
+								notifySafely(
+									ctx,
+									`Thinking level changed to ${level}, but could not be remembered in pi-btw.json: ${formatError(error)}`,
+									"warning",
+								);
+							})
+							.finally(() => pendingWrites.delete(write));
+						pendingWrites.add(write);
+					},
+				};
+				const action = await interact(
+					thread,
+					thread.turns.length > 0,
+					ctx,
+					composerDraft,
+					thinking,
+				);
+				if (action.kind === "close") return { kind: "closed" };
+				if (action.kind === "bringToMain") {
+					const choice = await chooseBringToMainAction(thread, ctx);
+					if (choice.kind === "closed") return choice;
+					if (choice.kind === "back") {
+						composerDraft = action.questionDraft;
+						continue;
+					}
+					const delivery = await deliverBringToMainDraft(choice.draft, ctx, choice.summary);
+					if (delivery === "loaded" || delivery === "closed") return { kind: "closed" };
 					composerDraft = action.questionDraft;
 					continue;
 				}
-				const delivery = await deliverBringToMainDraft(choice.draft, ctx, choice.summary);
-				if (delivery === "loaded" || delivery === "closed") return { kind: "closed" };
-				composerDraft = action.questionDraft;
-				continue;
+				composerDraft = undefined;
+				pendingQuestion = action.question;
 			}
-			composerDraft = undefined;
-			pendingQuestion = action.question;
-		}
 
-		const result = await ask(thread, pendingQuestion, selected, thinkingLevel, ctx);
-		if (result.kind === "aborted") {
-			ctx.ui.notify("Cancelled", "info");
-			return { kind: "closed" };
-		}
-		if (result.kind === "error") {
-			thread.turns.push({
-				kind: "error",
-				question: pendingQuestion,
-				answer: result.message,
-			});
-		}
+			const result = await ask(thread, pendingQuestion, selected, activeThinkingLevel, ctx);
+			if (result.kind === "aborted") {
+				notifySafely(ctx, "Cancelled", "info");
+				return { kind: "closed" };
+			}
+			if (result.kind === "error") {
+				thread.turns.push({
+					kind: "error",
+					question: pendingQuestion,
+					answer: result.message,
+				});
+			}
 
-		pendingQuestion = undefined;
+			pendingQuestion = undefined;
+		}
+	} finally {
+		await Promise.allSettled([...pendingWrites]);
 	}
 }
 
@@ -391,15 +448,27 @@ type BtwCustomFactory<T> = (
 async function showBtwCustomPreservingEditor<T>(
 	ctx: ExtensionCommandContext,
 	factory: BtwCustomFactory<T>,
-): Promise<T> {
+): Promise<T | undefined> {
 	let liveEditorText = ctx.ui.getEditorText();
+	let completed = false;
 	const result = await ctx.ui.custom<T>((tui, theme, keybindings, done) =>
 		factory(tui, theme, keybindings, (value) => {
-			liveEditorText = ctx.ui.getEditorText();
+			try {
+				liveEditorText = ctx.ui.getEditorText();
+			} catch {
+				// Keep completion finite if session replacement invalidates the editor context.
+			}
+			completed = true;
 			done(value);
 		}),
 	);
-	if (ctx.ui.getEditorText() !== liveEditorText) ctx.ui.setEditorText(liveEditorText);
+	if (completed) {
+		try {
+			if (ctx.ui.getEditorText() !== liveEditorText) ctx.ui.setEditorText(liveEditorText);
+		} catch {
+			// A replaced context owns a different editor and must not receive stale restoration.
+		}
+	}
 	return result;
 }
 
@@ -501,6 +570,7 @@ export async function chooseBringToMain(
 					return selector;
 				},
 			);
+			if (!selectedRange) return { kind: "closed" };
 			if (selectedRange.kind === "closed") return selectedRange;
 			if (selectedRange.kind === "back") break;
 			const preview = await showPreview(ctx, selectedRange.draft, selectedRange.summary);
@@ -518,16 +588,47 @@ export async function chooseBringToMain(
 	}
 }
 
+type BtwMenuSelectorAction =
+	| { kind: "select"; value: string }
+	| { kind: "back" }
+	| { kind: "close" };
+
+type BtwBringToMainPreviewAction = { kind: "bring" } | { kind: "back" } | { kind: "close" };
+
 async function showBringToMainPreview(
 	ctx: ExtensionCommandContext,
 	draft: string,
 	summary: BtwBringToMainSummary,
 ): Promise<BtwBringToMainPreviewAction> {
-	return showBtwCustomPreservingEditor<BtwBringToMainPreviewAction>(
-		ctx,
-		(tui, theme, keybindings, done) =>
-			new BtwBringToMainPreview(tui, theme, keybindings, draft, summary, done),
+	let confirmed = false;
+	const count = summary.messages === 1 ? "1 message" : `${summary.messages} messages`;
+	const lineCount = summary.lines === 1 ? "1 line" : `${summary.lines} lines`;
+	const menu = defineMenu<void, "preview", "bring", MenuContext>({
+		start: "preview",
+		screens: {
+			preview: () => ({
+				kind: "review",
+				title: `Preview · ${count} · ${lineCount} · ~${summary.tokens} tokens`,
+				content: draft,
+				viewportSize: "adaptive",
+				hint: "back",
+				confirm: { id: "bring", label: "Bring", action: "bring" },
+			}),
+		},
+		actions: {
+			bring: async () => {
+				confirmed = true;
+				return { kind: "close" } as const;
+			},
+		},
+	});
+	const result = await runBtwMenuPreservingEditor(ctx, (menuContext) =>
+		runMenu(menuContext, menu, { getState: () => undefined }),
 	);
+	if (confirmed && result.kind === "closed" && result.reason === "close") {
+		return { kind: "bring" };
+	}
+	return terminalBtwMenuAction(result);
 }
 
 async function showBtwMenu(
@@ -536,11 +637,43 @@ async function showBtwMenu(
 	options: readonly string[],
 	initialValue?: string,
 ): Promise<BtwMenuSelectorAction> {
-	return showBtwCustomPreservingEditor<BtwMenuSelectorAction>(
-		ctx,
-		(tui, theme, keybindings, done) =>
-			new BtwMenuSelector(tui, theme, keybindings, title, options, done, initialValue),
+	const items = options.map((label, index) => ({ id: `option-${index}`, label }));
+	const initialIndex = initialValue === undefined ? -1 : options.indexOf(initialValue);
+	let selectedValue: string | undefined;
+	const menu = defineMenu<void, "choices", "select", MenuContext>({
+		start: "choices",
+		screens: {
+			choices: () => ({
+				kind: "choice",
+				title,
+				items,
+				action: "select",
+				initialItemId: initialIndex >= 0 ? `option-${initialIndex}` : undefined,
+				hint: "back",
+			}),
+		},
+		actions: {
+			select: async ({ itemId }: { itemId: string }) => {
+				const index = Number.parseInt(itemId.slice("option-".length), 10);
+				selectedValue = options[index];
+				return selectedValue === undefined
+					? ({ kind: "stay" } as const)
+					: ({ kind: "close" } as const);
+			},
+		},
+	});
+	const result = await runBtwMenuPreservingEditor(ctx, (menuContext) =>
+		runMenu(menuContext, menu, { getState: () => undefined }),
 	);
+	return selectedValue !== undefined && result.kind === "closed" && result.reason === "close"
+		? { kind: "select", value: selectedValue }
+		: terminalBtwMenuAction(result);
+}
+
+function terminalBtwMenuAction(result: RunMenuResult): { kind: "back" } | { kind: "close" } {
+	if (result.kind === "closed") return { kind: result.reason };
+	if (result.kind === "error") throw result.error;
+	return { kind: "close" };
 }
 
 export async function loadBringToMainDraft(
@@ -621,11 +754,18 @@ async function askThreadQuestion(
 	return ctx.ui.custom<Awaited<ReturnType<typeof completeSideThreadTurn>>>(
 		(tui, theme, _keybindings, done) => {
 			let settled = false;
-			const view = new BtwAnsweringView(tui, theme, thread.turns, question, () => {
-				if (settled) return;
-				settled = true;
-				done({ kind: "aborted" });
-			});
+			const view = new BtwAnsweringView(
+				tui,
+				theme,
+				thread.turns,
+				question,
+				() => {
+					if (settled) return;
+					settled = true;
+					done({ kind: "aborted" });
+				},
+				thinkingLevel,
+			);
 			completeSideThreadTurn({
 				thread,
 				question,
@@ -648,26 +788,17 @@ async function showThreadComposer(
 	thread: SideThread,
 	startAtBottom: boolean,
 	ctx: ExtensionCommandContext,
-	initialQuestion?: string,
+	initialQuestion: string | undefined,
+	thinking: BtwThreadThinkingControl,
 ): Promise<TranscriptPagerAction> {
 	return ctx.ui.custom<TranscriptPagerAction>(
-		(tui, theme, _keybindings, done) =>
+		(tui, theme, keybindings, done) =>
 			new BtwTranscriptPager(tui, theme, thread.turns, done, {
 				startAtBottom,
 				initialQuestion,
+				thinking: { ...thinking, keybindings },
 			}),
 	);
-}
-
-export function sanitizeSingleLine(text: string) {
-	return [...text.replace(/[\r\n\t]/g, " ")]
-		.filter((character) => {
-			const code = character.charCodeAt(0);
-			return code > 31 && (code < 127 || code > 159);
-		})
-		.join("")
-		.replace(/ +/g, " ")
-		.trim();
 }
 
 type MessageContentBlock = {

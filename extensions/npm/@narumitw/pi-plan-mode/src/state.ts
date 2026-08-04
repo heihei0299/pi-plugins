@@ -3,7 +3,12 @@ import {
 	PLAN_MODE_COMPLETE_TOOL_NAME,
 	planFromCompletionDetails,
 } from "./completion-tool.js";
-import { PLAN_MODE_THINKING_LEVELS, type PlanModeFixedThinkingLevel } from "./settings.js";
+import {
+	IMPLEMENTATION_PLAN_RETENTIONS,
+	type ImplementationPlanRetention,
+	PLAN_MODE_THINKING_LEVELS,
+	type PlanModeFixedThinkingLevel,
+} from "./settings.js";
 
 export type PlanCompletionSource = typeof PLAN_MODE_COMPLETE_TOOL_NAME | "legacy_proposed_plan";
 
@@ -12,6 +17,12 @@ export interface ActiveImplementationPlan {
 	plan: string;
 	source: PlanCompletionSource;
 	startedAt: number;
+	retention?: ImplementationPlanRetention;
+}
+
+export interface SavedPlan {
+	plan: string;
+	source: PlanCompletionSource;
 }
 
 export interface PlanModeState {
@@ -19,6 +30,7 @@ export interface PlanModeState {
 	latestPlan?: string;
 	latestPlanSource?: PlanCompletionSource;
 	awaitingAction: boolean;
+	savedPlan?: SavedPlan;
 	activeImplementation?: ActiveImplementationPlan;
 	selectedToolNames?: string[];
 	selectedToolKeys?: string[];
@@ -60,6 +72,8 @@ export function restorePlanModeState(entries: unknown[], stateEntryType: string)
 	const activeImplementation = enabled
 		? undefined
 		: normalizeActiveImplementation(entry.data.activeImplementation);
+	const savedPlan =
+		enabled || activeImplementation ? undefined : normalizeSavedPlan(entry.data.savedPlan);
 	return {
 		enabled,
 		latestPlan,
@@ -68,6 +82,7 @@ export function restorePlanModeState(entries: unknown[], stateEntryType: string)
 				(recoveredPlan ? PLAN_MODE_COMPLETE_TOOL_NAME : undefined))
 			: undefined,
 		awaitingAction: enabled && latestPlan !== undefined,
+		savedPlan,
 		activeImplementation,
 		selectedToolNames: stringArray(entry.data.selectedToolNames),
 		selectedToolKeys: stringArray(entry.data.selectedToolKeys),
@@ -77,6 +92,14 @@ export function restorePlanModeState(entries: unknown[], stateEntryType: string)
 		appliedThinkingLevel: enabled ? fixedThinkingLevel(entry.data.appliedThinkingLevel) : undefined,
 		manualThinkingLevel: enabled ? fixedThinkingLevel(entry.data.manualThinkingLevel) : undefined,
 	};
+}
+
+function normalizeSavedPlan(value: unknown): SavedPlan | undefined {
+	if (!isRecord(value)) return undefined;
+	const source = planCompletionSource(value.source);
+	const normalized = normalizePlanModeCompletion({ plan: value.plan });
+	if (!source || !normalized.ok) return undefined;
+	return { plan: normalized.plan, source };
 }
 
 function normalizeActiveImplementation(value: unknown): ActiveImplementationPlan | undefined {
@@ -94,7 +117,12 @@ function normalizeActiveImplementation(value: unknown): ActiveImplementationPlan
 			? value.startedAt
 			: undefined;
 	if (!id || !source || !normalized.ok || startedAt === undefined) return undefined;
-	return { id, plan: normalized.plan, source, startedAt };
+	const retention = IMPLEMENTATION_PLAN_RETENTIONS.includes(
+		value.retention as ImplementationPlanRetention,
+	)
+		? (value.retention as ImplementationPlanRetention)
+		: "keep";
+	return { id, plan: normalized.plan, source, startedAt, retention };
 }
 
 function normalizePersistedPlan(value: unknown) {

@@ -1,7 +1,7 @@
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { consumeLspConfigNotice, loadRuntime } from "./adapters.js";
-import { commandExists, commandFromEnv, commandPathValue } from "./command.js";
+import { commandExists, commandPathValue } from "./command.js";
 import { resolveRoot } from "./files.js";
 import { selectDiagnosticRoutes, selectFixRoute } from "./routes.js";
 import { DEFAULT_FILE_LIMIT, runDiagnostics, runFix, textResult } from "./runner.js";
@@ -54,7 +54,7 @@ const lspDiagnosticsTool = defineTool({
 	promptGuidelines: [
 		"Use lsp_diagnostics when files need diagnostics from a configured LSP server.",
 		"Use the server parameter only when the user asks for a specific configured LSP server or multiple servers match the same extension.",
-		"If a configured server command is missing, report the configuration error and suggest installing the command or setting its PI_<SERVER>_LSP_COMMAND environment variable.",
+		"If a configured server command is missing, report the configuration error and suggest installing it or updating the server's command in pi-lsp.json.",
 	],
 	parameters: DiagnosticsParameters,
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -189,7 +189,7 @@ function textFromResult(result: { content?: Array<{ type?: string; text?: string
 function buildStatusMessage(adapters: ReturnType<typeof loadRuntime>["adapters"], cwd: string) {
 	return adapters
 		.flatMap((adapter) => {
-			const command = commandFromEnv(adapter.commandEnvVar, adapter.defaultCommand);
+			const command = adapter.defaultCommand;
 			return [
 				`${adapter.name} LSP command: ${command.command} ${command.args.join(" ")}`.trim(),
 				`${adapter.name} status: ${
@@ -204,7 +204,7 @@ function buildStatusMessage(adapters: ReturnType<typeof loadRuntime>["adapters"]
 
 function statusLevel(adapters: ReturnType<typeof loadRuntime>["adapters"], cwd: string) {
 	return adapters.every((adapter) => {
-		const command = commandFromEnv(adapter.commandEnvVar, adapter.defaultCommand);
+		const command = adapter.defaultCommand;
 		return commandExists(command.command, cwd, commandPathValue(adapter.env));
 	})
 		? "info"

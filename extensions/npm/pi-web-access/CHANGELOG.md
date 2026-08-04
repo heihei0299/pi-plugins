@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-08-03
+
+### Added
+- `fetch_content` can now return the original text response with `mode: "raw"`, which is useful for JSON APIs, error pages, and debugging what a server actually sent.
+- `fetch_content` can now answer a question about a single fetched page with `mode: "answer"`, while still saving the original page text so you can inspect it later.
+- Direct image links now work for PNG, JPEG, WebP, and GIF files. The tool downloads them safely, resizes large images, and returns an inline image result.
+- `get_search_content` now accepts `findText` and `findMode`, so you can search saved content for the passage you need instead of paging through a long page by hand. Inspired by `@xl0`'s `pi-lovely-web` project.
+- Added optional `searxngHeaders` so self-hosted SearXNG requests can carry reverse-proxy or Zero Trust auth headers. Thanks `@preinpost` for PR #202.
+- Added explicit-only xAI/Grok search with `xaiApiKey` / `XAI_API_KEY`, Pi model-registry auth, and optional `xaiSearchModel`. Thanks `@join3r` for PR #196.
+- Added explicit-only Bright Data SERP search with `brightdataApiKey` / `BRIGHTDATA_API_KEY` credentials and a required `brightdataSerpZone` / `BRIGHTDATA_SERP_ZONE` zone of Bright Data type `serp`. Bright Data is never chosen by `auto` and never participates in `provider: "all"`. Thanks `@mo-root` for PR #198.
+- Added Bright Data Web Unlocker as a paid `fetch_content` extraction fallback with `brightdataApiKey` / `BRIGHTDATA_API_KEY` credentials and a required `brightdataUnlockerZone` / `BRIGHTDATA_UNLOCKER_ZONE` zone of Bright Data type `unblocker`. Thanks `@mo-root` for PR #199.
+- Added Kagi Search API support with `kagiApiKey` / `KAGI_API_KEY`, plus Kagi Extract as a `fetch_content` fallback. Thanks `@imlonghao` for issue #197.
+- Added Ollama Cloud Web Search support with `ollamaApiKey` / `OLLAMA_API_KEY`, plus Ollama Web Fetch as a `fetch_content` fallback. Thanks `@bradley-holt` for issue #203.
+- Added explicit-only SerpBase Google SERP search with `serpbaseApiKey` / `SERPBASE_API_KEY`, domain filters as `site:` clauses, and recency mapped to Google `tbs`. Thanks `@gefsikatsinelou` for issue #195.
+
+### Changed
+- Long `fetch_content` results are easier to continue reading. The first response now stops on cleaner line boundaries and tells you the character, byte, and line totals plus the exact offset to request next.
+
+### Fixed
+- Fixed the `fetch_content` call header showing `fetch (no URL)` when Pi supplied `url` together with an empty `urls` array. Thanks `@Vergil824` for issue #192.
+- Resolve preferred summary and query-rewrite models through routed provider registrations such as OpenRouter, preserving the registered provider and model ID instead of falling back when the native provider is unavailable. Thanks `@robzolkos` for issue #200 and PR #201.
+- GitHub clone subprocesses now disable interactive credential prompts and terminate their process trees on timeout or cancellation, preventing orphaned Git helpers from capturing terminal input. Thanks `@MDGChamomile` for PR #193.
+
+
 ## [0.17.1] - 2026-07-31
 
 ### Fixed

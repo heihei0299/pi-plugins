@@ -9,16 +9,18 @@ import { constants } from "fs";
 import {
   genDiff,
   restoreEndings,
+  type LineEnding,
 } from "./replace-diff";
 import { readNormFile } from "./file-reader";
 import { normReq, normalizeFilePath, tryParseContentLines } from "./replace-normalize";
 import { isRec, has, rejectUnknownFields, abortIf } from "./utils";
 import { resolveTarget, writeAtomic } from "./fs-write";
-import { applyEdits,
+import { applyEdit,
   lineHashes,
-  resEdits,
+  resEdit,
   MAX_HASH_LINES,
-  type HTEdit,
+  type HEdit,
+  type NEdit,
 } from "./hashline";
 import { toCwd } from "./paths";
 import { fileSnap } from "./file-reader";
@@ -45,46 +47,30 @@ import { loadHashStore, type HashStore } from "./hash-store";
 
 const contentLinesSchema = Type.Array(Type.String(), {
   description:
-    "Literal file content, one string per line."
+    "Replacement content, one string per line. Use [] to delete the range."
 });
 
 const hashRangeInclSchema = Type.Array(
   Type.String({ description: "A 3-char HASH from read output" }),
   {
-    description: "Inclusive [start_hash, end_hash] — pair of 3-char hashes from read output.",
+    description: "Pair of 3-char hashes from read output marking the first and last line of the range to replace (inclusive).",
     minItems: 2,
     maxItems: 2,
   },
 );
 
-const changeItemSchema = Type.Object(
-  {
-    content_lines: contentLinesSchema,
-    hash_range_inclusive: hashRangeInclSchema,
-  },
-  { additionalProperties: false },
-);
-
 export const editToolSchema = Type.Object(
   {
-    changes: Type.Array(changeItemSchema, { description: "Array of edits applied atomically against the same pre-edit snapshot." }),
     path: Type.String({ description: "Path to edit" }),
-  },
-  { additionalProperties: false },
-);
-
-export const flatEditToolSchema = Type.Object(
-  {
-    content_lines: contentLinesSchema,
     hash_range_inclusive: hashRangeInclSchema,
-    path: Type.String({ description: "Path to edit" }),
+    content_lines: contentLinesSchema,
   },
   { additionalProperties: false },
 );
-
 export type ReqParams = {
   path: string;
-  changes: HTEdit[];
+  hash_range_inclusive: [string, string];
+  content_lines: string[];
 };
 
 export type ReplaceDetails = {
@@ -98,14 +84,13 @@ export type ReplaceDetails = {
 
 interface PipelineResult {
   path: string;
-  toolEdits: HTEdit[];
   originalNormalized: string;
   result: string;
   bom: string;
-  originalEnding: "\r\n" | "\n";
+  originalEnding: LineEnding;
   hadUtf8DecodeErrors: boolean;
   warnings: string[];
-  noopEdits?: { editIndex: number; loc: string; currentContent: string }[];
+  noopEdit?: NEdit;
   firstChangedLine?: number;
   lastChangedLine?: number;
   originalHashes: string[];
@@ -114,7 +99,7 @@ interface PipelineResult {
   totalRemovedLines: number;
 }
 
-const ROOT_KS = new Set(["path", "changes", "content_lines", "hash_range_inclusive"]);
+const ROOT_KS = new Set(["path", "content_lines", "hash_range_inclusive"]);
 
 const LEGACY_KS = ["oldText", "newText", "old_text", "new_text", "old_range", "start", "end", "lines"];
 
@@ -123,7 +108,7 @@ export function assertNoLegacyKeys(request: unknown): void {
   for (const legacyKey of LEGACY_KS) {
     if (has(request, legacyKey)) {
       throw new Error(
-        `[E_LEGACY_SHAPE] "${legacyKey}" is not supported. Use {content_lines: [...], hash_range_inclusive: ["<START>", "<END>"]}.`
+        `[E_LEGACY_SHAPE] "${legacyKey}" is not supported. Use {hash_range_inclusive: ["<START>", "<END>"], content_lines: [...]}.`
       );
     }
   }
@@ -131,7 +116,6 @@ export function assertNoLegacyKeys(request: unknown): void {
 
 export function assertReq(
   request: unknown,
-  flat?: boolean
 ): asserts request is ReqParams {
   if (!isRec(request)) {
     throw new Error("[E_BAD_SHAPE] Edit request must be an object.");
@@ -145,13 +129,10 @@ export function assertReq(
     throw new Error('[E_BAD_SHAPE] Edit request requires a non-empty "path" string.');
   }
 
-  if (!Array.isArray(request.changes)) {
-    if (flat) {
-      throw new Error(
-        '[E_BAD_SHAPE] Edit request requires both "content_lines" and "hash_range_inclusive" at the top level.',
-      );
-    }
-    throw new Error('[E_BAD_SHAPE] Edit request requires a "changes" array. Each change is { content_lines: [...], hash_range_inclusive: ["<START>", "<END>"] }.');
+  if (!Array.isArray(request.hash_range_inclusive) || !Array.isArray(request.content_lines)) {
+    throw new Error(
+      '[E_BAD_SHAPE] Edit request requires both "hash_range_inclusive" and "content_lines" at the top level.',
+    );
   }
 }
 
@@ -163,45 +144,41 @@ export interface ExecPipelineOptions {
 }
 
 function collectRemovedHashes(
-  resolved: { hash_range_inclusive: [{ hash: string }, { hash: string }] }[],
+  edit: HEdit,
   originalHashes: string[],
-  skipIndices?: Set<number>,
 ): Set<string> {
   const removedHashes = new Set<string>();
-  for (const [index, edit] of resolved.entries()) {
-    if (skipIndices?.has(index)) continue;
-    const startHash = edit.hash_range_inclusive[0].hash;
-    const endHash = edit.hash_range_inclusive[1].hash;
-    const startLine = originalHashes.indexOf(startHash);
-    const endLine = originalHashes.indexOf(endHash);
-    if (startLine >= 0 && endLine >= 0) {
-      for (let i = startLine; i <= endLine; i++) {
-        removedHashes.add(originalHashes[i]!);
-      }
+  const startHash = edit.hash_range_inclusive[0].hash;
+  const endHash = edit.hash_range_inclusive[1].hash;
+  const startLine = originalHashes.indexOf(startHash);
+  const endLine = originalHashes.indexOf(endHash);
+  if (startLine >= 0 && endLine >= 0) {
+    const firstLine = Math.min(startLine, endLine);
+    const lastLine = Math.max(startLine, endLine);
+    for (let i = firstLine; i <= lastLine; i++) {
+      removedHashes.add(originalHashes[i]!);
     }
   }
   return removedHashes;
 }
 
 function countLineChanges(
-  resolved: { hash_range_inclusive: [{ hash: string }, { hash: string }]; content_lines: string[] }[],
+  edit: HEdit,
   originalHashes: string[],
-  noopEdits: { editIndex: number }[] | undefined,
+  isNoop: boolean,
+  removedAutoFixes: number,
 ): { totalAddedLines: number; totalRemovedLines: number } {
-  let totalAddedLines = 0;
+  if (isNoop) return { totalAddedLines: 0, totalRemovedLines: 0 };
   let totalRemovedLines = 0;
-  const noopIndices = new Set(noopEdits?.map((n) => n.editIndex) ?? []);
-  for (let i = 0; i < resolved.length; i++) {
-    if (noopIndices.has(i)) continue;
-    const edit = resolved[i]!;
-    const startLine = originalHashes.indexOf(edit.hash_range_inclusive[0].hash);
-    const endLine = originalHashes.indexOf(edit.hash_range_inclusive[1].hash);
-    if (startLine >= 0 && endLine >= 0) {
-      totalRemovedLines += endLine - startLine + 1;
-    }
-    totalAddedLines += edit.content_lines.length;
+  const startLine = originalHashes.indexOf(edit.hash_range_inclusive[0].hash);
+  const endLine = originalHashes.indexOf(edit.hash_range_inclusive[1].hash);
+  if (startLine >= 0 && endLine >= 0) {
+    totalRemovedLines = Math.abs(endLine - startLine) + 1;
   }
-  return { totalAddedLines, totalRemovedLines };
+  return {
+    totalAddedLines: Math.max(0, edit.content_lines.length - removedAutoFixes),
+    totalRemovedLines,
+  };
 }
 
 export async function execPipeline(
@@ -211,13 +188,6 @@ export async function execPipeline(
 ): Promise<PipelineResult> {
 
   const path = params.path;
-  const toolEdits = Array.isArray(params.changes)
-    ? (params.changes as HTEdit[])
-    : [];
-
-  if (toolEdits.length === 0) {
-    throw new Error('[E_BAD_SHAPE] Edit request requires a non-empty "changes" array.');
-  }
 
   const hashStore = options?.store ?? await loadHashStore();
 
@@ -225,10 +195,13 @@ export async function execPipeline(
     path, cwd, { signal: options?.signal, accessMode: options?.accessMode, maxLines: MAX_HASH_LINES, store: hashStore },
   );
 
-  const resolved = resEdits(toolEdits);
-  const anchorResult = applyEdits(
+  const edit = resEdit({
+    hash_range_inclusive: params.hash_range_inclusive,
+    content_lines: params.content_lines,
+  });
+  const anchorResult = applyEdit(
     originalNormalized,
-    resolved,
+    edit,
     options?.signal,
     originalHashes,
     path,
@@ -238,10 +211,9 @@ export async function execPipeline(
   const isNoop = result === originalNormalized;
 
   const noPersist = options?.noPersist;
-  const noopIndices = new Set(anchorResult.noopEdits?.map((n) => n.editIndex) ?? []);
   const removedHashes = isNoop
     ? undefined
-    : collectRemovedHashes(resolved, originalHashes, noopIndices);
+    : collectRemovedHashes(edit, originalHashes);
   const resultHashes = isNoop
     ? originalHashes
     : await lineHashes(result, absolutePath, {
@@ -252,19 +224,18 @@ export async function execPipeline(
   const warnings = [...(anchorResult.warnings ?? [])];
 
   const { totalAddedLines, totalRemovedLines } = countLineChanges(
-    resolved, originalHashes, anchorResult.noopEdits,
+    edit, originalHashes, isNoop, anchorResult.autoFixes?.length ?? 0,
   );
 
   return {
     path,
-    toolEdits,
     originalNormalized,
     result,
     bom,
     originalEnding,
     hadUtf8DecodeErrors,
     warnings,
-    noopEdits: anchorResult.noopEdits,
+    noopEdit: anchorResult.noopEdit,
     firstChangedLine: anchorResult.firstChangedLine,
     lastChangedLine: anchorResult.lastChangedLine,
     resultHashes,
@@ -277,17 +248,16 @@ export async function execPipeline(
 export async function compPreview(
   request: unknown,
   cwd: string,
-  flat?: boolean
 ): Promise<RPreview> {
   try {
     const normalized = normReq(request);
-    if (flat && isRec(request) && Array.isArray(request.changes)) {
+    if (isRec(request) && Array.isArray(request.changes)) {
       return {
-        error: `[E_BAD_SHAPE] Flat mode does not accept a "changes" array. Send content_lines and hash_range_inclusive at the top level (one edit per call), or use bulk mode for multiple edits per call.`
+        error: `[E_BAD_SHAPE] The replace tool does not accept a "changes" array. Send hash_range_inclusive and content_lines at the top level (one edit per call).`
       };
     }
-    assertReq(normalized, flat);
-    const { path, originalNormalized, originalHashes, result, resultHashes } = await execPipeline(
+    assertReq(normalized);
+    const { path, originalNormalized, result, resultHashes } = await execPipeline(
       normalized,
       cwd,
       { accessMode: constants.R_OK, noPersist: true },
@@ -295,11 +265,11 @@ export async function compPreview(
 
     if (originalNormalized === result) {
       return {
-        error: `No changes made to ${path}. The edits produced identical content.`,
+        error: `No changes made to ${path}. The edit produced identical content.`,
       };
     }
 
-    return { diff: genDiff(originalNormalized, result, 4, resultHashes, originalHashes).diff };
+    return { diff: genDiff(originalNormalized, result, 4, resultHashes).diff };
   } catch (error: unknown) {
     return { error: error instanceof Error ? error.message : String(error) };
   }
@@ -327,26 +297,12 @@ export function reuseMarkdown(context: any, content: string, theme: any): Markdo
   return m;
 }
 
-const MODE_CFG = {
-  flat: {
-    prefix: "performing one edit per call",
-  },
-  bulk: {
-    prefix: "batching all changes to a file in one call",
-  },
-} as const;
-
-export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolDef {
-  const cfg = MODE_CFG[opts.flat ? "flat" : "bulk"];
-
+export function buildToolDef(): ToolDef {
   const E_DESC = loadP("../prompts/replace.md");
-  const E_SNIPPET = loadP("../prompts/replace-snippet.md", {
-    MODE_PREFIX: cfg.prefix,
-  });
+  const E_SNIPPET = loadP("../prompts/replace-snippet.md");
   const E_GUIDE = loadGuide("../prompts/replace-guidelines.md");
 
-  const parameters = opts.flat ? flatEditToolSchema : editToolSchema;
-
+  const parameters = editToolSchema;
   return {
     name: "replace",
     label: "Replace",
@@ -354,21 +310,16 @@ export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolD
     parameters,
     promptSnippet: E_SNIPPET,
     promptGuidelines: E_GUIDE,
-    prepareArguments: opts.flat
-      ? (args: unknown) => {
-          assertNoLegacyKeys(args);
-          if (!isRec(args)) return args as any;
-          const record = { ...args };
-          normalizeFilePath(record);
-          if (has(record, "content_lines") && typeof record.content_lines === "string") {
-            tryParseContentLines(record, "content_lines");
-          }
-          return record;
-        }
-      : (args: unknown) => {
-          assertNoLegacyKeys(args);
-          return normReq(args) as ReqParams;
-        },
+    prepareArguments: (args: unknown) => {
+      assertNoLegacyKeys(args);
+      if (!isRec(args)) return args as any;
+      const record = { ...args };
+      normalizeFilePath(record);
+      if (has(record, "content_lines") && typeof record.content_lines === "string") {
+        tryParseContentLines(record, "content_lines");
+      }
+      return record;
+    },
     renderShell: "default",
     renderCall(args, theme, context) {
       const previewInput = getPreviewInput(args);
@@ -389,7 +340,7 @@ export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolD
           context.state.preview = undefined;
           const previewGeneration = (context.state.previewGeneration ?? 0) + 1;
           context.state.previewGeneration = previewGeneration;
-          compPreview(previewInput, context.cwd, opts.flat)
+          compPreview(args, context.cwd)
             .then((preview) => {
               if (
                 context.state.argsKey === argsKey &&
@@ -460,7 +411,7 @@ export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolD
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const canonical = normReq(params);
 
-      const normalizedParams = canonical as { path: string; changes: HTEdit[] };
+      const normalizedParams = canonical as ReqParams;
       const path = normalizedParams.path;
       const absolutePath = toCwd(path, ctx.cwd);
       const mutationTargetPath = await resolveTarget(absolutePath);
@@ -475,7 +426,7 @@ export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolD
           originalEnding,
           hadUtf8DecodeErrors,
           warnings,
-          noopEdits,
+          noopEdit,
           firstChangedLine,
           lastChangedLine,
           resultHashes,
@@ -487,21 +438,16 @@ export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolD
           { accessMode: constants.R_OK | constants.W_OK, signal },
         );
 
-        const editsAttempted = opts.flat
-          ? 1
-          : Array.isArray(normalizedParams.changes)
-            ? normalizedParams.changes.length
-            : 0;
-
+        const editsAttempted = 1;
         if (originalNormalized === result) {
           const noopSnapshotId = (await fileSnap(absolutePath)).snapshotId;
           return buildNoop({
             path,
-            noopEdits,
+            noopEdit,
             snapshotId: noopSnapshotId,
             editMeta: {
               editsAttempted,
-              noopEditsCount: noopEdits?.length ?? 0,
+              noopEditsCount: noopEdit ? 1 : 0,
               addedLines: 0,
               removedLines: 0,
             },
@@ -520,18 +466,24 @@ export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolD
           absolutePath,
           bom + restoreEndings(result, originalEnding),
         );
-        saveUndo(mutationTargetPath, {
+        const undoPersisted = await saveUndo(mutationTargetPath, {
           content: originalNormalized,
           bom,
           originalEnding,
           hashes: originalHashes,
+          resultContent: result,
         });
+        if (!undoPersisted) {
+          warnings.push(
+            "Undo history could not be persisted; undo_last_replace will not be available for this edit.",
+          );
+        }
         const updatedSnapshotId = (await fileSnap(absolutePath))
           .snapshotId;
 
         const editMeta: RMeta = {
           editsAttempted,
-          noopEditsCount: noopEdits?.length ?? 0,
+          noopEditsCount: noopEdit ? 1 : 0,
           firstChangedLine,
           lastChangedLine,
           addedLines: totalAddedLines,
@@ -554,14 +506,6 @@ export function buildToolDef(opts: { flat: boolean; autoRead?: boolean }): ToolD
   };
 }
 
-export function regReplace(pi: ExtensionAPI, autoRead?: boolean): void {
-  pi.registerTool(buildToolDef({ flat: false, autoRead }));
-}
-
-export function buildToolDefFlat(autoRead?: boolean) {
-  return buildToolDef({ flat: true, autoRead });
-}
-
-export function regReplaceFlat(pi: ExtensionAPI, autoRead?: boolean): void {
-  pi.registerTool(buildToolDef({ flat: true, autoRead }));
+export function regReplace(pi: ExtensionAPI): void {
+  pi.registerTool(buildToolDef());
 }

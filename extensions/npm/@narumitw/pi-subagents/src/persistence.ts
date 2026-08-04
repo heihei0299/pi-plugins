@@ -167,6 +167,8 @@ function isStoredState(value: unknown): value is StoredState {
 			Number.isFinite(record.updatedAt) &&
 			(record.parentId === undefined || typeof record.parentId === "string") &&
 			(record.thinkingLevel === undefined || isThinkingLevel(record.thinkingLevel)) &&
+			(record.workspaceMode === undefined || record.workspaceMode === "worktree") &&
+			(record.target === undefined || isTargetPolicyAudit(record.target)) &&
 			(record.children === undefined ||
 				(Array.isArray(record.children) &&
 					record.children.every((id) => typeof id === "string"))) &&
@@ -176,6 +178,33 @@ function isStoredState(value: unknown): value is StoredState {
 				(Array.isArray(record.mailbox) && record.mailbox.every(isMailboxMessage)))
 		);
 	});
+}
+
+function isTargetPolicyAudit(value: unknown): boolean {
+	if (!value || typeof value !== "object") return false;
+	const target = value as Record<string, unknown>;
+	if (
+		typeof target.cwd !== "string" ||
+		(target.boundary !== "current-workspace" && target.boundary !== "external") ||
+		!target.trust ||
+		typeof target.trust !== "object"
+	) {
+		return false;
+	}
+	const trust = target.trust as Record<string, unknown>;
+	return (
+		[
+			"session-trusted",
+			"session-untrusted",
+			"saved-trusted",
+			"saved-denied",
+			"unsaved",
+			"trust-error",
+		].includes(String(trust.kind)) &&
+		typeof trust.projectTrusted === "boolean" &&
+		(trust.sourcePath === undefined || typeof trust.sourcePath === "string") &&
+		(trust.warning === undefined || typeof trust.warning === "string")
+	);
 }
 
 function isAgentTurn(value: unknown): boolean {

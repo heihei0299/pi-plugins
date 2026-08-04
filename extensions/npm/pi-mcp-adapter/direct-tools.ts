@@ -17,6 +17,7 @@ import { authenticate, supportsOAuth } from "./mcp-auth-flow.ts";
 import { formatAuthRequiredMessage, resolveServerUrl, truncateAtWord } from "./utils.ts";
 import { SessionRecoveryAuthRequiredError, withSessionRecovery } from "./session-recovery.ts";
 import { combineAbortSignals, isAbortError } from "./runtime-owner.ts";
+import { ensureToolCallApproved } from "./tool-approval.ts";
 
 const BUILTIN_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
 const INSTRUCTIONS_SNIPPET_LENGTH = 150;
@@ -206,7 +207,7 @@ export function buildProxyDescription(
   directSpecs: DirectToolSpec[],
 ): string {
   const prefix = config.settings?.toolPrefix ?? "server";
-  let desc = `MCP gateway - connect to MCP servers and call their tools. Non-MCP Pi tools should be called directly, not through mcp.\n`;
+  let desc = `MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. When one request needs several MCP calls with logic between them, use mcp_script. Non-MCP Pi tools should be called directly, not through mcp.\n`;
 
   const directByServer = new Map<string, number>();
   for (const spec of directSpecs) {
@@ -369,6 +370,30 @@ export function createDirectToolExecutor(
       return {
         content: [{ type: "text" as const, text: `MCP server "${spec.serverName}" not connected` }],
         details: { error: "not_connected", server: spec.serverName },
+      };
+    }
+
+    const approval = await ensureToolCallApproved(state, spec.serverName, {
+      name: spec.prefixedName,
+      originalName: spec.originalName,
+      description: spec.description,
+      inputSchema: spec.inputSchema,
+      resourceUri: spec.resourceUri,
+      uiResourceUri: spec.uiResourceUri,
+      uiStreamMode: spec.uiStreamMode,
+    }, params, ownedSignal);
+    if (approval.ok === false) {
+      const denied = approval.reason === "denied";
+      const message = denied
+        ? `The user declined approval to run MCP tool "${spec.originalName}" on server "${spec.serverName}".`
+        : `MCP tool "${spec.originalName}" on server "${spec.serverName}" is approval-gated and requires an interactive session.`;
+      return {
+        content: [{ type: "text" as const, text: message }],
+        details: {
+          error: denied ? "approval_denied" : "approval_required",
+          server: spec.serverName,
+          tool: spec.originalName,
+        },
       };
     }
 

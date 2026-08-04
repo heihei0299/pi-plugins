@@ -121,13 +121,17 @@ export function readCommand(input: unknown) {
 	return typeof command?.command === "string" ? command.command : "";
 }
 
-export function isSafeCommand(command: string, safeSubcommands: SafeSubcommands = {}) {
+export function findBlockedCommandSegment(
+	command: string,
+	safeSubcommands: SafeSubcommands = {},
+): string | undefined {
 	const segments = splitShellSegments(command);
-	return (
-		segments !== undefined &&
-		segments.length > 0 &&
-		segments.every((segment) => isSafeSegment(segment, safeSubcommands))
-	);
+	if (!segments || segments.length === 0) return command.trim() || "(empty command)";
+	return segments.find((segment) => !isSafeSegment(segment, safeSubcommands));
+}
+
+export function isSafeCommand(command: string, safeSubcommands: SafeSubcommands = {}) {
+	return findBlockedCommandSegment(command, safeSubcommands) === undefined;
 }
 
 function splitShellSegments(command: string): string[] | undefined {
@@ -344,9 +348,9 @@ type ArgumentValidator = (args: string[]) => boolean;
 const allowReadOnlyArguments: ArgumentValidator = () => true;
 const BUILTIN_GIT_VALIDATORS: Record<BuiltinSafeGitSubcommand, ArgumentValidator> = {
 	status: allowReadOnlyArguments,
-	log: isSafeGitLogArguments,
-	diff: isSafeGitDiffArguments,
-	show: requiresNoTextconv,
+	log: allowReadOnlyArguments,
+	diff: allowReadOnlyArguments,
+	show: allowReadOnlyArguments,
 	branch: isSafeGitBranchArguments,
 	remote: isSafeGitRemoteArguments,
 	"ls-files": allowReadOnlyArguments,
@@ -354,7 +358,7 @@ const BUILTIN_GIT_VALIDATORS: Record<BuiltinSafeGitSubcommand, ArgumentValidator
 };
 const CONFIGURABLE_GIT_VALIDATORS: Record<ConfigurableSafeGitSubcommand, ArgumentValidator> = {
 	"rev-parse": allowReadOnlyArguments,
-	blame: requiresNoTextconv,
+	blame: allowReadOnlyArguments,
 	describe: allowReadOnlyArguments,
 	"merge-base": allowReadOnlyArguments,
 	"ls-tree": allowReadOnlyArguments,
@@ -482,43 +486,6 @@ function isSafeGitGrepArguments(args: string[]) {
 function matchesLongOptionPrefix(argument: string, option: string, shortest: string) {
 	const optionName = argument.split("=", 1)[0] ?? "";
 	return optionName.length >= shortest.length && option.startsWith(optionName);
-}
-
-function isSafeGitDiffArguments(args: string[]) {
-	return (
-		args.includes("--check") || (args.includes("--no-ext-diff") && args.includes("--no-textconv"))
-	);
-}
-
-function isSafeGitLogArguments(args: string[]) {
-	if (args.includes("--no-textconv")) return true;
-	return !args.some(requiresTextconvGuardForGitLog);
-}
-
-function requiresTextconvGuardForGitLog(argument: string) {
-	return (
-		argument === "-p" ||
-		argument.startsWith("-p") ||
-		argument === "-u" ||
-		argument.startsWith("-U") ||
-		argument === "-c" ||
-		argument === "--patch" ||
-		argument.startsWith("--patch=") ||
-		argument.startsWith("--patch-with-") ||
-		argument === "--unified" ||
-		argument.startsWith("--unified=") ||
-		argument === "--binary" ||
-		argument === "--cc" ||
-		argument === "--remerge-diff" ||
-		argument.startsWith("-S") ||
-		argument.startsWith("-G") ||
-		argument === "--find-object" ||
-		argument.startsWith("--find-object=")
-	);
-}
-
-function requiresNoTextconv(args: string[]) {
-	return args.includes("--no-textconv");
 }
 
 function isSafeGitBranchArguments(args: string[]) {

@@ -1,17 +1,6 @@
 import { accessSync, constants, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import type { ServerCommand } from "./types.js";
-
-export function commandFromEnv(envVar: string, fallback: ServerCommand): ServerCommand {
-	const customCommand = process.env[envVar]?.trim();
-	if (customCommand) {
-		const [command, ...args] = splitCommand(customCommand);
-		if (command) return { command, args };
-	}
-
-	return fallback;
-}
 
 export function commandExists(
 	command: string,
@@ -100,50 +89,4 @@ function isRunnableFile(filePath: string, platform: NodeJS.Platform) {
 	} catch {
 		return false;
 	}
-}
-
-export function splitCommand(input: string) {
-	const parts: string[] = [];
-	let current = "";
-	let quote: '"' | "'" | undefined;
-
-	for (let index = 0; index < input.length; index += 1) {
-		const char = input[index];
-		const next = input[index + 1];
-
-		if (char === "\\" && next !== undefined && shouldEscapeNextCharacter(next, quote)) {
-			current += next;
-			index += 1;
-			continue;
-		}
-
-		if ((char === '"' || char === "'") && !quote) {
-			quote = char;
-			continue;
-		}
-
-		if (char === quote) {
-			quote = undefined;
-			continue;
-		}
-
-		if (/\s/.test(char) && !quote) {
-			if (current) {
-				parts.push(current);
-				current = "";
-			}
-			continue;
-		}
-
-		current += char;
-	}
-
-	if (current) parts.push(current);
-	return parts;
-}
-
-function shouldEscapeNextCharacter(next: string, quote: '"' | "'" | undefined) {
-	if (next === "\\") return true;
-	if (quote) return next === quote;
-	return next === '"' || next === "'" || /\s/.test(next);
 }

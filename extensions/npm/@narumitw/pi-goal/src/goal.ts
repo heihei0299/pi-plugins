@@ -775,6 +775,9 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 		runtime.markAgentToolAttempted();
 		if (runtime.queueFrozen) {
 			if (!isGoalToolName(event.toolName)) return;
+			// Blocking alone feeds an error tool result back to the model. Abort too so
+			// stale Goal calls cannot loop while the experimental queue remains frozen.
+			abortCurrentTurn(ctx);
 			return {
 				block: true,
 				reason:
@@ -799,6 +802,10 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
 			clearStaleGoalToolCallBlock();
 			return;
 		}
+		// A blocked tool result would normally trigger another model call. Abort the
+		// current turn so a tool-seeking model cannot create an unbounded loop that
+		// burns provider quota while the goal is stopped.
+		abortCurrentTurn(ctx);
 		return {
 			block: true,
 			reason: "Blocked stale /goal tool call after the goal stopped or was interrupted.",
