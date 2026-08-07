@@ -34,7 +34,7 @@ pi -e npm:@narumitw/pi-btw
 Try this package locally from the repository root:
 
 ```bash
-pi -e ./extensions/pi-btw
+pi -e ./packages/pi-btw
 ```
 
 ## 🚀 Usage
@@ -154,7 +154,7 @@ Normal assistant messages become part of the main Pi conversation and can distra
 ## 🗂️ Package layout
 
 ```txt
-extensions/pi-btw/
+packages/pi-btw/
 ├── src/
 │   ├── index.ts
 │   ├── btw.ts

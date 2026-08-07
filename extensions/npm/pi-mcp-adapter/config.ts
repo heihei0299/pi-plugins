@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import stripJsonComments from "strip-json-comments";
 import { getAgentPath } from "./agent-dir.ts";
+import { getAgentPluginSummaries, loadAgentPluginConfigs, type AgentPluginSummary } from "./agent-plugin-loader.ts";
 import { isServerDisabled, type HostConfigDiscovery, type McpConfig, type ServerEntry, type McpSettings, type ImportKind, type ServerProvenance } from "./types.ts";
 import { toStringRecord } from "./utils.ts";
 
@@ -32,31 +33,31 @@ export const KNOWN_SERVER_PRESETS: readonly KnownServerPreset[] = [
     id: "deepwiki",
     name: "DeepWiki",
     summary: "Ask questions about public GitHub repositories.",
-    entry: { url: "https://mcp.deepwiki.com/mcp" },
+    entry: { url: "https://mcp.deepwiki.com/mcp", protocolVersion: "auto" },
   },
   {
     id: "context7",
     name: "Context7",
     summary: "Look up current library documentation and examples.",
-    entry: { url: "https://mcp.context7.com/mcp" },
+    entry: { url: "https://mcp.context7.com/mcp", protocolVersion: "auto" },
   },
   {
     id: "notion",
     name: "Notion",
     summary: "Search and work with your Notion workspace.",
-    entry: { url: "https://mcp.notion.com/mcp", auth: "oauth" },
+    entry: { url: "https://mcp.notion.com/mcp", auth: "oauth", protocolVersion: "auto" },
   },
   {
     id: "github",
     name: "GitHub",
     summary: "Work with GitHub through your Copilot account.",
-    entry: { url: "https://api.githubcopilot.com/mcp", auth: "oauth" },
+    entry: { url: "https://api.githubcopilot.com/mcp", auth: "oauth", protocolVersion: "auto" },
   },
   {
     id: "chrome-devtools",
     name: "Chrome DevTools",
     summary: "Inspect and automate a local Chrome browser.",
-    entry: { command: "npx", args: ["-y", "chrome-devtools-mcp@latest"] },
+    entry: { command: "npx", args: ["-y", "chrome-devtools-mcp@1.6.0"] },
   },
 ];
 
@@ -137,6 +138,7 @@ export interface McpDiscoverySummary {
   imports: ImportConfigSummary[];
   hostConfigs: HostConfigSummary[];
   hostConfigDiscovery: HostConfigDiscovery;
+  agentPlugins: AgentPluginSummary[];
   conflicts: McpConfigConflict[];
   hasAnyConfig: boolean;
   hasAnyDetectedPaths: boolean;
@@ -145,6 +147,12 @@ export interface McpDiscoverySummary {
   totalServerCount: number;
   fingerprint: string;
   repoPrompt: RepoPromptDiscovery;
+}
+
+export interface McpStandardConfigSummary {
+  sources: ConfigDiscoverySource[];
+  hasSharedServers: boolean;
+  fingerprint: string;
 }
 
 export interface ConfigWritePreview {
@@ -193,9 +201,8 @@ export function findAvailableImportConfigs(cwd = process.cwd()): DiscoveredImpor
   return discovered;
 }
 
-export function getMcpDiscoverySummary(overridePath?: string, cwd = process.cwd()): McpDiscoverySummary {
-  const sourceSpecs = getConfigSources(overridePath, cwd);
-  const sources = sourceSpecs.map((source) => {
+function getConfigSourceSummaries(sourceSpecs: ConfigSourceSpec[]): ConfigDiscoverySource[] {
+  return sourceSpecs.map((source) => {
     const loaded = readValidatedConfig(source.readPath, `MCP config from ${source.readPath}`);
     return {
       id: source.id,
@@ -207,24 +214,47 @@ export function getMcpDiscoverySummary(overridePath?: string, cwd = process.cwd(
       serverCount: loaded ? Object.keys(loaded.mcpServers).length : 0,
     } satisfies ConfigDiscoverySource;
   });
+}
 
-  const imports = (Object.keys(IMPORT_PATHS) as ImportKind[])
-    .map((kind) => {
-      const imported = loadImportedConfig(kind, cwd, `Failed to inspect imported MCP config from ${kind}:`);
-      if (!imported) return null;
-      return {
-        kind,
-        path: imported.path,
-        serverCount: Object.keys(extractServers(imported.value, kind)).length,
-      } satisfies ImportConfigSummary;
-    })
-    .filter((value): value is ImportConfigSummary => value !== null);
+export function getMcpStandardConfigSummary(overridePath?: string, cwd = process.cwd()): McpStandardConfigSummary {
+  const sources = getConfigSourceSummaries(getConfigSources(overridePath, cwd));
+  return {
+    sources,
+    hasSharedServers: sources.some((source) => source.kind === "shared" && source.serverCount > 0),
+    fingerprint: JSON.stringify({ sources: sources.map((source) => [source.id, source.exists, source.serverCount]) }),
+  };
+}
+
+export function getMcpDiscoverySummary(
+  overridePath?: string,
+  cwd = process.cwd(),
+  options: { includeHostConfigs?: boolean } = {},
+): McpDiscoverySummary {
+  const sourceSpecs = getConfigSources(overridePath, cwd);
+  const sources = getConfigSourceSummaries(sourceSpecs);
+  const includeHostConfigs = options.includeHostConfigs !== false;
+
+  const imports = includeHostConfigs
+    ? (Object.keys(IMPORT_PATHS) as ImportKind[])
+      .map((kind) => {
+        const imported = loadImportedConfig(kind, cwd, `Failed to inspect imported MCP config from ${kind}:`);
+        if (!imported) return null;
+        return {
+          kind,
+          path: imported.path,
+          serverCount: Object.keys(extractServers(imported.value, kind)).length,
+        } satisfies ImportConfigSummary;
+      })
+      .filter((value): value is ImportConfigSummary => value !== null)
+    : [];
   const hostConfigDiscovery = getConfiguredHostConfigDiscovery(overridePath, cwd);
   const hostConfigs = imports.map((entry) => ({ ...entry, active: hostConfigDiscovery === "on" }));
-  const totalServerCount = sources.reduce((sum, source) => sum + source.serverCount, 0);
-  const hasSharedServers = sources.some((source) => source.kind === "shared" && source.serverCount > 0);
+  const settings = getMergedSettings(overridePath, cwd);
+  const agentPlugins = getAgentPluginSummaries(settings?.agentPluginPaths, cwd);
+  const totalServerCount = sources.reduce((sum, source) => sum + source.serverCount, 0) + agentPlugins.reduce((sum, plugin) => sum + plugin.serverCount, 0);
+  const hasSharedServers = sources.some((source) => source.kind === "shared" && source.serverCount > 0) || agentPlugins.some(plugin => plugin.serverCount > 0);
   const hasPiOwnedServers = sources.some((source) => source.kind === "pi" && source.serverCount > 0);
-  const hasAnyDetectedPaths = sources.some((source) => source.exists) || imports.length > 0;
+  const hasAnyDetectedPaths = sources.some((source) => source.exists) || imports.length > 0 || agentPlugins.length > 0;
   const hasAnyConfig = totalServerCount > 0 || imports.some((entry) => entry.serverCount > 0) || hasAnyDetectedPaths;
 
   const summaryWithoutRepoPrompt = {
@@ -232,6 +262,7 @@ export function getMcpDiscoverySummary(overridePath?: string, cwd = process.cwd(
     imports,
     hostConfigs,
     hostConfigDiscovery,
+    agentPlugins,
     conflicts: getConfigConflicts(sourceSpecs, imports, cwd),
     hasAnyConfig,
     hasAnyDetectedPaths,
@@ -243,6 +274,7 @@ export function getMcpDiscoverySummary(overridePath?: string, cwd = process.cwd(
   const fingerprint = JSON.stringify({
     sources: sources.map((source) => [source.id, source.exists, source.serverCount]),
     imports: imports.map((entry) => [entry.kind, entry.path, entry.serverCount]),
+    agentPlugins: agentPlugins.map((entry) => [entry.path, entry.name, entry.serverCount]),
     hostConfigDiscovery,
     conflicts: summaryWithoutRepoPrompt.conflicts,
   });
@@ -274,16 +306,24 @@ export function loadMcpConfig(overridePath?: string, cwd = process.cwd()): McpCo
     config = mergeConfigs(config, expandImports(loaded, cwd));
   }
 
-  return config;
+  const pluginConfig = loadAgentPluginConfigs(config.settings?.agentPluginPaths, cwd);
+  return mergeConfigs(pluginConfig, config);
+}
+
+function getMergedSettings(overridePath?: string, cwd = process.cwd()): McpSettings | undefined {
+  let settings: McpSettings | undefined;
+  for (const source of getConfigSources(overridePath, cwd)) {
+    const loaded = readValidatedConfig(source.readPath, `MCP config from ${source.readPath}`);
+    if (loaded?.settings) settings = { ...settings, ...loaded.settings };
+  }
+  return settings;
 }
 
 function getConfiguredHostConfigDiscovery(overridePath?: string, cwd = process.cwd()): HostConfigDiscovery {
   let configured: HostConfigDiscovery = "off";
-  for (const source of getConfigSources(overridePath, cwd)) {
-    const loaded = readValidatedConfig(source.readPath, `MCP config from ${source.readPath}`);
-    const value = loaded?.settings?.hostConfigDiscovery;
-    if (value === "off" || value === "prompt" || value === "on") configured = value;
-  }
+  const settings = getMergedSettings(overridePath, cwd);
+  const value = settings?.hostConfigDiscovery;
+  if (value === "off" || value === "prompt" || value === "on") configured = value;
   return configured;
 }
 
@@ -417,10 +457,12 @@ function getConfigSources(overridePath?: string, cwd = process.cwd()): ConfigSou
 }
 
 function mergeConfigs(base: McpConfig, next: McpConfig): McpConfig {
+  const imports = mergeImports(base.imports, next.imports);
+  const settings = next.settings ? { ...base.settings, ...next.settings } : base.settings;
   return {
     mcpServers: mergeServerMaps(base.mcpServers, next.mcpServers),
-    imports: mergeImports(base.imports, next.imports),
-    settings: next.settings ? { ...base.settings, ...next.settings } : base.settings,
+    ...(imports !== undefined ? { imports } : {}),
+    ...(settings !== undefined ? { settings } : {}),
   };
 }
 
@@ -499,7 +541,7 @@ function expandImports(config: McpConfig, cwd = process.cwd()): McpConfig {
 
   return {
     imports: config.imports,
-    settings: config.settings,
+    ...(config.settings !== undefined ? { settings: config.settings } : {}),
     mcpServers: mergeServerMaps(importedServers, config.mcpServers),
   };
 }
@@ -609,8 +651,8 @@ function validateConfig(raw: unknown): McpConfig {
 
   return {
     mcpServers: servers as Record<string, ServerEntry>,
-    imports: Array.isArray(obj.imports) ? (obj.imports as ImportKind[]) : undefined,
-    settings: obj.settings as McpSettings | undefined,
+    ...(Array.isArray(obj.imports) ? { imports: obj.imports as ImportKind[] } : {}),
+    ...(obj.settings !== undefined ? { settings: obj.settings as McpSettings } : {}),
   };
 }
 
@@ -708,8 +750,10 @@ function extractServers(config: unknown, kind: ImportKind): Record<string, Serve
 
       if (raw.type === "local" && Array.isArray(raw.command) && raw.command.length > 0 && raw.command.every((value): value is string => typeof value === "string")) {
         const env = toStringRecord(raw.environment);
+        const command = raw.command[0];
+        if (command === undefined) continue;
         const mapped: ServerEntry = {
-          command: raw.command[0],
+          command,
           args: raw.command.slice(1),
           ...(env ? { env } : {}),
           ...(typeof raw.cwd === "string" ? { cwd: raw.cwd } : {}),
@@ -733,6 +777,9 @@ function extractServers(config: unknown, kind: ImportKind): Record<string, Serve
             ...(typeof oauth.clientId === "string" ? { clientId: oauth.clientId } : {}),
             ...(typeof oauth.clientSecret === "string" ? { clientSecret: oauth.clientSecret } : {}),
             ...(typeof oauth.scope === "string" ? { scope: oauth.scope } : {}),
+            ...(typeof oauth.skipIssuerMetadataValidation === "boolean"
+              ? { skipIssuerMetadataValidation: oauth.skipIssuerMetadataValidation }
+              : {}),
           };
         }
         mappedServers[name] = mapped;
@@ -789,9 +836,12 @@ function buildUnifiedDiff(beforeText: string, afterText: string): string {
 
   for (let i = rows - 1; i >= 0; i--) {
     for (let j = cols - 1; j >= 0; j--) {
-      lcs[i][j] = before[i] === after[j]
-        ? lcs[i + 1][j + 1] + 1
-        : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+      const row = lcs[i];
+      const nextRow = lcs[i + 1];
+      if (!row || !nextRow) continue;
+      row[j] = before[i] === after[j]
+        ? (nextRow[j + 1] ?? 0) + 1
+        : Math.max(nextRow[j] ?? 0, row[j + 1] ?? 0);
     }
   }
 
@@ -805,7 +855,7 @@ function buildUnifiedDiff(beforeText: string, afterText: string): string {
       j++;
       continue;
     }
-    if (j < cols && (i === rows || lcs[i][j + 1] >= lcs[i + 1][j])) {
+    if (j < cols && (i === rows || (lcs[i]?.[j + 1] ?? 0) >= (lcs[i + 1]?.[j] ?? 0))) {
       lines.push(`+ ${after[j]}`);
       j++;
       continue;
@@ -1108,7 +1158,7 @@ export function getServerProvenance(overridePath?: string, cwd = process.cwd()):
       provenance.set(name, {
         path: source.writePath,
         kind: source.kind,
-        importKind: source.importKind,
+        ...(source.importKind !== undefined ? { importKind: source.importKind } : {}),
       });
     }
   }

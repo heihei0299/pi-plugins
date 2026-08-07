@@ -267,8 +267,9 @@ This extension maps Codex's `ModeKind::Plan` behavior onto Pi's extension API:
 extensions/pi-plan-mode/
 ├── src/
 │   ├── index.ts      # Pi package entrypoint
-│   ├── plan-mode.ts  # Extension registration and mode state
-│   └── *.ts          # Package-local prompt, policy, question, and message modules
+│   ├── plan-mode.ts      # Extension registration, mode state, and UI loading boundary
+│   ├── interactive-ui.ts # Lazily loaded interactive menu surface
+│   └── *.ts              # Package-local prompt, policy, question, and message modules
 ├── README.md
 ├── LICENSE
 ├── tsconfig.json

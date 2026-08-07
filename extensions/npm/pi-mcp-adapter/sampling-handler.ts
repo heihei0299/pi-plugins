@@ -2,15 +2,14 @@ import { complete, type Api, type AssistantMessage, type Message, type Model, ty
 import { truncateAtWord } from "./utils.ts";
 import { throwIfAborted } from "./abort.ts";
 import type { ExtensionUIContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { Client } from "@modelcontextprotocol/client";
 import {
-  CreateMessageRequestSchema,
   type CreateMessageRequest,
   type CreateMessageResult,
   type ModelPreferences,
   type SamplingMessage,
   type SamplingMessageContentBlock,
-} from "@modelcontextprotocol/sdk/types.js";
+} from "@modelcontextprotocol/client";
 
 export interface SamplingHandlerOptions {
   serverName: string;
@@ -24,7 +23,7 @@ export interface SamplingHandlerOptions {
 export type ServerSamplingConfig = Omit<SamplingHandlerOptions, "serverName">;
 
 export function registerSamplingHandler(client: Client, options: SamplingHandlerOptions): void {
-  client.setRequestHandler(CreateMessageRequestSchema, request => {
+  client.setRequestHandler("sampling/createMessage", request => {
     return handleSamplingRequest(options, request);
   });
 }
@@ -66,16 +65,16 @@ export async function handleSamplingRequest(
   const result = await complete(
     model,
     {
-      systemPrompt: params.systemPrompt,
+      ...(params.systemPrompt !== undefined ? { systemPrompt: params.systemPrompt } : {}),
       messages,
     },
     {
-      apiKey,
-      headers,
+      ...(apiKey !== undefined ? { apiKey } : {}),
+      ...(headers !== undefined ? { headers } : {}),
       maxTokens: params.maxTokens,
-      temperature: params.temperature,
-      metadata: params.metadata as Record<string, unknown> | undefined,
-      signal,
+      ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
+      ...(params.metadata !== undefined ? { metadata: params.metadata as Record<string, unknown> } : {}),
+      ...(signal ? { signal } : {}),
     },
   );
 
@@ -160,7 +159,11 @@ async function resolveSamplingModel(
       errors.push(`${model.provider}/${model.id}: ${auth.error}`);
       continue;
     }
-    return { model, apiKey: auth.apiKey, headers: auth.headers };
+    return {
+      model,
+      ...(auth.apiKey !== undefined ? { apiKey: auth.apiKey } : {}),
+      ...(auth.headers !== undefined ? { headers: auth.headers } : {}),
+    };
   }
 
   if (errors.length > 0) {

@@ -1,4 +1,4 @@
-import { checkpointGoalActiveTime, currentTokenTotal } from "./accounting.js";
+import { checkpointGoalActiveTime, currentTokenTotal, formatTokenCount } from "./accounting.js";
 import { validateObjective } from "./command.js";
 import { safeGoalMenuText } from "./menu.js";
 import type { ActiveGoal } from "./persistence.js";
@@ -13,7 +13,6 @@ import {
 	skipGoal as skipQueuedGoal,
 } from "./queue.js";
 import {
-	abortCurrentTurn,
 	blocksStaleGoalToolCalls,
 	createGoal,
 	editedGoalStatus,
@@ -46,7 +45,9 @@ export class GoalCommandController {
 		ctx: StatusContext,
 		onActivated?: (goal: ActiveGoal) => void,
 		isActivationCurrent?: (goal: ActiveGoal) => boolean,
+		isRequestCurrent?: () => boolean,
 	) {
+		if (isRequestCurrent && !isRequestCurrent()) return;
 		const validationError = validateObjective(objective);
 		if (validationError) {
 			ctx.ui.notify(validationError, "warning");
@@ -76,6 +77,7 @@ export class GoalCommandController {
 				ctx.ui.notify(`Goal kept: ${existingGoal.text}`, "info");
 				return;
 			}
+			if (isRequestCurrent && !isRequestCurrent()) return;
 			if (
 				goalQueueIdentity(
 					this.runtime.activeGoal,
@@ -90,9 +92,10 @@ export class GoalCommandController {
 
 		// Unlock lazy visibility only for a real activation. In always mode, a
 		// missing tool means another policy or allowlist intentionally removed it.
-		const goalToolVisibilityBeforeActivation = this.runtime.snapshotGoalToolVisibility();
+		if (isRequestCurrent && !isRequestCurrent()) return;
+		const goalToolVisibilityBeforeActivation = this.runtime.toolPolicy.snapshot();
 		try {
-			this.runtime.prepareGoalToolsForActivation(ctx);
+			this.runtime.toolPolicy.prepareActivation(this.runtime.settings.toolVisibility, ctx);
 		} catch (error) {
 			ctx.ui.notify(`Cannot start /goal: ${formatError(error)}`, "error");
 			if (existingGoal?.status === "active") this.runtime.pauseGoalForUnavailableTools(ctx);
@@ -121,7 +124,7 @@ export class GoalCommandController {
 			startedGoal.id,
 			buildGoalPrompt(startedGoal),
 			true,
-			() => isActivationCurrent?.(startedGoal) ?? true,
+			() => (isRequestCurrent?.() ?? true) && (isActivationCurrent?.(startedGoal) ?? true),
 		);
 		if (isActivationCurrent && !isActivationCurrent(startedGoal)) return;
 		if (!sent) {
@@ -132,9 +135,12 @@ export class GoalCommandController {
 					this.runtime.queuedGoals = existingQueuedGoals;
 					this.runtime.recordGoalUsage(existingGoal, ctx);
 					if (existingGoal.status === "active") {
-						abortCurrentTurn(ctx);
-						this.runtime.activeGoal = transitionGoal(existingGoal, "paused");
-						this.runtime.blockStaleGoalToolCalls();
+						this.runtime.stopActiveGoal(ctx, {
+							kind: "activation_rollback",
+							expectedGoalId: startedGoal.id,
+							restoreGoal: existingGoal,
+							abortTurn: true,
+						});
 					} else {
 						this.runtime.activeGoal = existingGoal;
 						if (blocksStaleGoalToolCalls(this.runtime.activeGoal.status)) {
@@ -142,15 +148,15 @@ export class GoalCommandController {
 						} else {
 							this.runtime.clearStaleGoalToolCallBlock();
 						}
+						this.runtime.persistGoal(this.runtime.activeGoal);
+						this.runtime.updateStatus(ctx, this.runtime.activeGoal);
 					}
-					this.runtime.persistGoal(this.runtime.activeGoal);
-					this.runtime.updateStatus(ctx, this.runtime.activeGoal);
 				} else {
 					this.runtime.clearActiveGoal(ctx);
 				}
 			}
 			if (rolledBackStartedGoal) {
-				this.runtime.restoreGoalToolVisibility(goalToolVisibilityBeforeActivation);
+				this.runtime.toolPolicy.restore(goalToolVisibilityBeforeActivation);
 			}
 			return;
 		}
@@ -160,9 +166,18 @@ export class GoalCommandController {
 		) {
 			return;
 		}
+		const automaticLimit = this.runtime.settings.continuationLimits.automaticTurns;
 		ctx.ui.notify(
-			existingGoal ? `Goal replaced: ${objective}` : `Goal started: ${objective}`,
-			"info",
+			`${existingGoal ? "Goal replaced" : "Goal started"}: ${objective}. ${
+				startedGoal.tokenBudget === undefined
+					? ""
+					: `Token budget: ${formatTokenCount(startedGoal.tokenBudget)} cumulative; the final model call may exceed it. `
+			}${
+				automaticLimit === null
+					? "Automatic work is Unlimited; tool loops may consume substantial tokens and provider cost. Open /goal to monitor."
+					: `Automatic work pauses after ${automaticLimit} responses; open /goal to monitor progress.`
+			}`,
+			automaticLimit === null ? "warning" : "info",
 		);
 	}
 
@@ -342,12 +357,14 @@ export class GoalCommandController {
 		}
 
 		try {
-			this.runtime.prepareGoalToolsForActivation(ctx);
+			this.runtime.toolPolicy.prepareActivation(this.runtime.settings.toolVisibility, ctx);
 		} catch (error) {
-			this.runtime.activeGoal = transitionGoal(this.runtime.activeGoal, "paused");
-			this.runtime.blockStaleGoalToolCalls();
-			this.runtime.persistGoal(this.runtime.activeGoal);
-			this.runtime.updateStatus(ctx, this.runtime.activeGoal);
+			this.runtime.stopActiveGoal(ctx, {
+				kind: "activation_rollback",
+				expectedGoalId: this.runtime.activeGoal.id,
+				restoreGoal: this.runtime.activeGoal,
+				abortTurn: false,
+			});
 			ctx.ui.notify(`Cannot start the next /goal: ${formatError(error)}`, "error");
 			return false;
 		}
@@ -359,10 +376,12 @@ export class GoalCommandController {
 			false, // Queue reactivation preserves its persisted safety epoch.
 		);
 		if (!sent && this.runtime.activeGoal?.id === activatedGoal.id) {
-			this.runtime.activeGoal = transitionGoal(activatedGoal, "paused");
-			this.runtime.blockStaleGoalToolCalls();
-			this.runtime.persistGoal(this.runtime.activeGoal);
-			this.runtime.updateStatus(ctx, this.runtime.activeGoal);
+			this.runtime.stopActiveGoal(ctx, {
+				kind: "activation_rollback",
+				expectedGoalId: activatedGoal.id,
+				restoreGoal: activatedGoal,
+				abortTurn: false,
+			});
 			ctx.ui.notify(
 				`Next goal paused after prompt delivery failed: ${activatedGoal.text}`,
 				"warning",
@@ -395,15 +414,11 @@ export class GoalCommandController {
 			);
 			return;
 		}
-		this.runtime.recordGoalUsage(this.runtime.activeGoal, ctx);
-		this.runtime.cancelContinuationWork();
-		this.runtime.clearBudgetWrapUp();
-		this.runtime.blockStaleGoalToolCalls();
-		abortCurrentTurn(ctx);
-		this.runtime.activeGoal = transitionGoal(this.runtime.activeGoal, "paused");
-		this.runtime.persistGoal(this.runtime.activeGoal);
-		this.runtime.updateStatus(ctx, this.runtime.activeGoal);
-		ctx.ui.notify(`Goal paused: ${this.runtime.activeGoal.text}`, "info");
+		const stoppedGoal = this.runtime.stopActiveGoal(ctx, {
+			kind: "explicit_pause",
+			expectedGoalId: this.runtime.activeGoal.id,
+		});
+		if (stoppedGoal) ctx.ui.notify(`Goal paused: ${stoppedGoal.text}`, "info");
 	}
 
 	async resumeGoal(ctx: StatusContext) {
@@ -428,9 +443,9 @@ export class GoalCommandController {
 			);
 			return;
 		}
-		const goalToolVisibilityBeforeActivation = this.runtime.snapshotGoalToolVisibility();
+		const goalToolVisibilityBeforeActivation = this.runtime.toolPolicy.snapshot();
 		try {
-			this.runtime.prepareGoalToolsForActivation(ctx);
+			this.runtime.toolPolicy.prepareActivation(this.runtime.settings.toolVisibility, ctx);
 		} catch (error) {
 			ctx.ui.notify(`Cannot resume /goal: ${formatError(error)}`, "error");
 			return;
@@ -470,13 +485,18 @@ export class GoalCommandController {
 				if (blocksStaleGoalToolCalls(this.runtime.activeGoal.status)) {
 					this.runtime.blockStaleGoalToolCalls();
 				}
-				this.runtime.restoreGoalToolVisibility(goalToolVisibilityBeforeActivation);
+				this.runtime.toolPolicy.restore(goalToolVisibilityBeforeActivation);
 			}
 			return;
 		}
+		const automaticLimit = this.runtime.settings.continuationLimits.automaticTurns;
 		ctx.ui.notify(
-			`Goal resumed from ${stoppedStatusLabel(stoppedStatus)}: ${resumedGoal.text}`,
-			"info",
+			`Goal resumed from ${stoppedStatusLabel(stoppedStatus)}: ${resumedGoal.text}. ${
+				automaticLimit === null
+					? "Automatic work remains Unlimited; goal progress and cumulative usage are preserved."
+					: `The automatic-work counter will reset to 0 of ${automaticLimit} when the resumed prompt starts; goal progress and cumulative usage are preserved.`
+			}`,
+			automaticLimit === null ? "warning" : "info",
 		);
 	}
 
@@ -528,10 +548,10 @@ export class GoalCommandController {
 				? queueGoalSafetyReset(transitionedGoal)
 				: transitionedGoal;
 		const goalToolVisibilityBeforeActivation =
-			nextGoal.status === "active" ? this.runtime.snapshotGoalToolVisibility() : undefined;
+			nextGoal.status === "active" ? this.runtime.toolPolicy.snapshot() : undefined;
 		if (nextGoal.status === "active") {
 			try {
-				this.runtime.prepareGoalToolsForActivation(ctx);
+				this.runtime.toolPolicy.prepareActivation(this.runtime.settings.toolVisibility, ctx);
 			} catch (error) {
 				ctx.ui.notify(`Cannot reactivate /goal: ${formatError(error)}`, "error");
 				if (this.runtime.activeGoal?.status === "active") {
@@ -555,9 +575,12 @@ export class GoalCommandController {
 			if (!sent) {
 				if (this.runtime.activeGoal?.id === editedGoal.id) {
 					if (previousStatus === "active") {
-						abortCurrentTurn(ctx);
-						this.runtime.activeGoal = transitionGoal(previousGoal, "paused");
-						this.runtime.blockStaleGoalToolCalls();
+						this.runtime.stopActiveGoal(ctx, {
+							kind: "activation_rollback",
+							expectedGoalId: editedGoal.id,
+							restoreGoal: previousGoal,
+							abortTurn: true,
+						});
 					} else {
 						this.runtime.activeGoal = previousGoal;
 						if (blocksStaleGoalToolCalls(this.runtime.activeGoal.status)) {
@@ -565,11 +588,11 @@ export class GoalCommandController {
 						} else {
 							this.runtime.clearStaleGoalToolCallBlock();
 						}
+						this.runtime.persistGoal(this.runtime.activeGoal);
+						this.runtime.updateStatus(ctx, this.runtime.activeGoal);
 					}
-					this.runtime.persistGoal(this.runtime.activeGoal);
-					this.runtime.updateStatus(ctx, this.runtime.activeGoal);
 					if (goalToolVisibilityBeforeActivation) {
-						this.runtime.restoreGoalToolVisibility(goalToolVisibilityBeforeActivation);
+						this.runtime.toolPolicy.restore(goalToolVisibilityBeforeActivation);
 					}
 				}
 				return;
@@ -602,6 +625,7 @@ export class GoalCommandController {
 				this.runtime.settings.experimental.goals,
 				this.runtime.queueFrozen,
 				this.runtime.pendingQueueAction,
+				this.runtime.settings.continuationLimits.automaticTurns,
 			),
 		);
 	}
@@ -631,9 +655,9 @@ export class GoalCommandController {
 		}
 		const previousGoal = { ...currentGoal };
 		const previousQueue = [...this.runtime.queuedGoals];
-		const visibilityBeforeActivation = this.runtime.snapshotGoalToolVisibility();
+		const visibilityBeforeActivation = this.runtime.toolPolicy.snapshot();
 		try {
-			this.runtime.prepareGoalToolsForActivation(ctx);
+			this.runtime.toolPolicy.prepareActivation(this.runtime.settings.toolVisibility, ctx);
 		} catch (error) {
 			ctx.ui.notify(`Cannot prioritize /goal: ${formatError(error)}`, "error");
 			if (currentGoal.status === "complete") {
@@ -682,9 +706,12 @@ export class GoalCommandController {
 		if (!sent && this.runtime.activeGoal.id === prioritized.id) {
 			this.runtime.queuedGoals = previousQueue;
 			if (previousGoal.status === "active") {
-				abortCurrentTurn(ctx);
-				this.runtime.activeGoal = transitionGoal(previousGoal, "paused");
-				this.runtime.blockStaleGoalToolCalls();
+				this.runtime.stopActiveGoal(ctx, {
+					kind: "activation_rollback",
+					expectedGoalId: prioritized.id,
+					restoreGoal: previousGoal,
+					abortTurn: true,
+				});
 			} else {
 				this.runtime.activeGoal = previousGoal;
 				if (previousGoal.status === "complete") {
@@ -692,10 +719,10 @@ export class GoalCommandController {
 				} else if (blocksStaleGoalToolCalls(previousGoal.status)) {
 					this.runtime.blockStaleGoalToolCalls();
 				}
+				this.runtime.persistGoal(this.runtime.activeGoal);
+				this.runtime.updateStatus(ctx, this.runtime.activeGoal);
 			}
-			this.runtime.persistGoal(this.runtime.activeGoal);
-			this.runtime.updateStatus(ctx, this.runtime.activeGoal);
-			this.runtime.restoreGoalToolVisibility(visibilityBeforeActivation);
+			this.runtime.toolPolicy.restore(visibilityBeforeActivation);
 			return false;
 		}
 		ctx.ui.notify(`Goal prioritized: ${objective}`, "info");

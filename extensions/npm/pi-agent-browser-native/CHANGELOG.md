@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+## 0.3.0 - 2026-08-06
+
+### Changed
+
+- Raised the minimum supported Pi runtime to 0.84.0 with no compatibility shims for older Pi releases, bumped the package from 0.2.x to 0.3.0 for the breaking support-floor change, pinned direct Pi development dependencies and the fleet marker to 0.84.0, and retained optional wildcard Pi peer dependencies per Pi package guidance.
+- Audited the extension factory, native tool registration, schemas, Pi `tool_result` patching, TUI rendering, SDK/package harnesses, browser/session/profile lifecycle, artifacts, lookups, Electron paths, build/package scripts, docs, fixtures, and tests against all Pi 0.84.0 breaking changes. The package does not consume the renamed model transform, RPC delta accumulator, provider header/refresh/auth APIs, pi-agent-core harness repositories or custom filesystem, or remote-session summary APIs; the existing coding-agent `ModelRuntime`, `createAgentSession`, `SessionManager`, extension, and tool contracts remain valid on 0.84.0.
+- Added Pi 0.84.0's `scrollbarThumb` background color to the complete test theme fixture and refreshed the lockfile against the released 0.84.0 packages and TypeBox 1.3.7.
+- Updated the `protobufjs` safety override to 7.6.5, clearing the advisory carried by the previous 7.6.4 pin.
+
+### Fixed
+
+- Result `outputPath` writes now fail validation instead of overwriting a screenshot, download, recording, or other browser artifact when both destinations resolve to the same file; the browser artifact and its verified metadata remain intact, including through filesystem aliases such as hard links.
+
+- Headed wrapper-managed launches now disable upstream periodic restore autosave by default and retain that launch environment across every follow-up subprocess, including still-owned off-current sessions, transcript-restored sessions whose replacement cleanup failed, and Electron cleanup closes, preventing agent-browser 0.33.2's multi-origin storage collector from flashing temporary tabs, blocking daemon policy probes, or triggering daemon-configuration mismatches; native close still saves, while direct window close can lose newer state because headed browsers are exempt from idle shutdown. The effective launch-time interval, including an explicit `AGENT_BROWSER_AUTOSAVE_INTERVAL_MS`, is persisted across transcript resume; changing it in either direction on a running wrapper-owned headed session is rejected until close plus a fresh launch. Slow valid daemon inspections now receive the full 35-second policy budget instead of failing after five seconds.
+- `--headed` and `--headed false` are now enforced as launch-scoped choices instead of being silently sent to an already-running managed session.
+- Bare, review-only, fenced-reference, conditional, permissive/uncertain, directly negated, and Pi clipboard/attachment image/video paths no longer become requested output artifacts that block browser close; output enforcement now requires a direct artifact-creation phrase with a destination, carries that intent across contiguous plain or Markdown path-list lines, handles delimited paths, preserves subordinate requirements such as “do not close until you save,” scopes availability-qualified recordings before, within, or after their list, leaves explicitly optional artifacts unenforced, applies recording availability per path clause, makes required duplicate paths take precedence, handles Markdown-link destinations, scans single-line and multiline path lists once instead of once per path, and avoids pathological backtracking on slash-heavy non-path text.
+
+## 0.2.78 - 2026-08-04
+
+### Changed
+
+- Removed zero-behavior maintainer bloat: Purpose/Responsibilities file banners, barrel-only `lib/results.ts` and `lib/input-modes.ts` facades, the synthetic efficiency benchmark script/tests/verify mode, the completed Electron plan ADR, and the `AgentBrowserNextActionCollector` class (plain array helpers remain).
+- Folded tiny one-liner modules (`session-artifacts`, `artifact-state`, `electron/text`) into neighboring owners; pending-recording predicates live in `artifact-manifest.ts`.
+- Trimmed docs that only existed to index or advertise the removed surfaces (`AGENTS.md`, `RELEASE.md`, `SUPPORT_MATRIX.md`, `ARCHITECTURE.md`, `ELECTRON.md`, `TOOL_CONTRACT.md`, `COMMAND_REFERENCE.md`, README).
+
+## 0.2.77 - 2026-08-04
+
+### Fixed
+
+- Successful `connect`, `--cdp`, and `--auto-connect` sessions, including environment-configured and wrapper-launched Electron attachments, now keep their attached browser across native-tool follow-ups and cleanup instead of resending local-launch defaults that made upstream replace the connection and prompt again. Content-bearing first use is blocked until the attachment URL is verified, established attachments live-check `get url` before later page reads or interactions so external tab drift cannot expose a local target, and every child clears the file-access environment override even when attached reuse omits the canonical launch flags.
+
+## 0.2.76 - 2026-08-04
+
+### Fixed
+
+- Wrapper-managed compatibility sessions now pin the normal Chrome user agent at browser launch as well as on the active page. New tabs and SSO popups therefore inherit it instead of reverting to `HeadlessChrome` and falling back into Cloudflare Turnstile, while caller-selected raw-argument, headed, attached, provider, custom-UA, and non-Chrome modes remain untouched.
+
+## 0.2.75 - 2026-08-04
+
+### Fixed
+
+- Headless `dash.cloudflare.com` now uses the same normal-Chrome user-agent compatibility path as OpenAI web properties, bypassing the Turnstile loop caused by `HeadlessChrome`. Wrapper-managed sessions retain that wrapper-owned user agent across follow-up calls and Pi reload/resume while preserving checkout-managed authentication restore.
+
 ## 0.2.74 - 2026-08-03
 
 ### Changed

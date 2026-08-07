@@ -1,8 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { showPlanModeMenu, showReadyPlanMenu } from "./plan-action-menus.js";
 import type { PlanExportDestination } from "./plan-export.js";
-import { showSavedPlanMenu } from "./saved-plan-menu.js";
 import type { PlanModeState } from "./state.js";
+
+type InteractiveUi = typeof import("./interactive-ui.js");
 
 interface MenuLifecycle {
 	signal: AbortSignal;
@@ -10,6 +10,7 @@ interface MenuLifecycle {
 }
 
 interface PlanActionControllerOptions {
+	loadInteractiveUi(): Promise<InteractiveUi>;
 	getState(): PlanModeState;
 	captureLifecycle(): MenuLifecycle;
 	statusText(): string;
@@ -39,7 +40,10 @@ export function createPlanActionController(options: PlanActionControllerOptions)
 	return {
 		async showSaved(ctx: ExtensionContext) {
 			const lifecycle = options.captureLifecycle();
-			await showSavedPlanMenu(ctx, {
+			if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
+			const ui = await options.loadInteractiveUi();
+			if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
+			await ui.showSavedPlanMenu(ctx, {
 				statusText: options.statusText(),
 				implementationOutcome: options.implementationOutcome,
 				getExportDestination: () => options.getExportDestination(ctx),
@@ -59,7 +63,10 @@ export function createPlanActionController(options: PlanActionControllerOptions)
 				return;
 			}
 			const lifecycle = options.captureLifecycle();
-			await showPlanModeMenu(ctx, {
+			if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
+			const ui = await options.loadInteractiveUi();
+			if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
+			await ui.showPlanModeMenu(ctx, {
 				statusText: options.statusText(),
 				hasReadyPlan: options.getState().latestPlan !== undefined,
 				implementationOutcome: options.implementationOutcome,
@@ -77,7 +84,10 @@ export function createPlanActionController(options: PlanActionControllerOptions)
 		},
 		async showReady(ctx: ExtensionContext) {
 			const lifecycle = options.captureLifecycle();
-			await showReadyPlanMenu(ctx, {
+			if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
+			const ui = await options.loadInteractiveUi();
+			if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
+			await ui.showReadyPlanMenu(ctx, {
 				...lifecycle,
 				implementationOutcome: options.implementationOutcome,
 				getExportDestination: () => options.getExportDestination(ctx),

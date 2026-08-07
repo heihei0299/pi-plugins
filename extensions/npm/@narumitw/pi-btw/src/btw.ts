@@ -3,6 +3,7 @@ import {
 	clampThinkingLevel,
 	getSupportedThinkingLevels,
 	type Model,
+	type ProviderHeaders,
 } from "@earendil-works/pi-ai";
 import {
 	BorderedLoader,
@@ -12,7 +13,7 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import { defineMenu, type MenuContext, type RunMenuResult, runMenu } from "@narumitw/pi-tui-kit";
+import type { MenuContext, RunMenuResult } from "@narumitw/pi-tui-kit";
 import {
 	type BtwBringToMainSegment,
 	type BtwBringToMainSummary,
@@ -39,6 +40,7 @@ import {
 import {
 	BTW_THINKING_LEVELS,
 	type BtwThinkingLevel,
+	type CompleteSimpleFunction,
 	completeSideThreadTurn,
 	createSideThread,
 	type SideQuestionAuth,
@@ -65,7 +67,6 @@ export {
 	type BtwThinkingLevel,
 	buildUserPrompt,
 	completeSideQuestion,
-	loadCompleteSimple,
 } from "./side-thread.js";
 export { sanitizeSingleLine } from "./text.js";
 
@@ -76,14 +77,21 @@ interface LoadBtwThinkingLevelOptions {
 	warn?: (message: string) => void;
 }
 
-interface BtwModelRegistry {
-	find(provider: string, modelId: string): Model<Api> | undefined;
-	getApiKeyAndHeaders(
-		model: Model<Api>,
-	): Promise<
-		| { ok: true; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }
-		| { ok: false; error: string }
-	>;
+type BtwModelRegistry = Pick<
+	ExtensionCommandContext["modelRegistry"],
+	"find" | "getApiKeyAndHeaders"
+>;
+
+type BtwProviderRegistry = Pick<ExtensionCommandContext["modelRegistry"], "getProvider">;
+
+export function createModelRegistryCompleteSimple(
+	modelRegistry: BtwProviderRegistry,
+): CompleteSimpleFunction {
+	return async (model, context, options) => {
+		const provider = modelRegistry.getProvider(model.provider);
+		if (!provider) throw new Error(`No provider registered for model provider: ${model.provider}`);
+		return provider.streamSimple(model, context, options).result();
+	};
 }
 
 interface ResolveBtwModelOptions {
@@ -154,9 +162,13 @@ export async function resolveBtwModel({
 function hasRequestAuth(auth: SideQuestionAuth): boolean {
 	return Boolean(
 		auth.apiKey ||
-			(auth.headers && Object.keys(auth.headers).length > 0) ||
+			providerHeadersHaveValue(auth.headers) ||
 			(auth.env && Object.keys(auth.env).length > 0),
 	);
+}
+
+function providerHeadersHaveValue(headers: ProviderHeaders | undefined): boolean {
+	return headers !== undefined && Object.values(headers).some((value) => value !== null);
 }
 
 export async function loadBtwThinkingLevel(
@@ -600,6 +612,8 @@ async function showBringToMainPreview(
 	draft: string,
 	summary: BtwBringToMainSummary,
 ): Promise<BtwBringToMainPreviewAction> {
+	const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
+	if (ctx.signal?.aborted) return { kind: "close" };
 	let confirmed = false;
 	const count = summary.messages === 1 ? "1 message" : `${summary.messages} messages`;
 	const lineCount = summary.lines === 1 ? "1 line" : `${summary.lines} lines`;
@@ -637,6 +651,8 @@ async function showBtwMenu(
 	options: readonly string[],
 	initialValue?: string,
 ): Promise<BtwMenuSelectorAction> {
+	const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
+	if (ctx.signal?.aborted) return { kind: "close" };
 	const items = options.map((label, index) => ({ id: `option-${index}`, label }));
 	const initialIndex = initialValue === undefined ? -1 : options.indexOf(initialValue);
 	let selectedValue: string | undefined;
@@ -773,6 +789,7 @@ async function askThreadQuestion(
 				thinkingLevel,
 				auth: selected.auth,
 				signal: view.signal,
+				completeSimple: createModelRegistryCompleteSimple(ctx.modelRegistry),
 			}).then((result) => {
 				if (settled) return;
 				settled = true;

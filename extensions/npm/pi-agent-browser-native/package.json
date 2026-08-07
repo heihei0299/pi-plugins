@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-browser-native",
-  "version": "0.2.74",
+  "version": "0.3.0",
   "description": "pi extension that exposes agent-browser as a native tool for browser automation",
   "type": "module",
   "author": "Mitch Fultz (https://github.com/fitchmultz)",
@@ -63,9 +63,9 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.80.9",
-    "@earendil-works/pi-coding-agent": "^0.80.9",
-    "@earendil-works/pi-tui": "^0.80.9",
+    "@earendil-works/pi-ai": "0.84.0",
+    "@earendil-works/pi-coding-agent": "0.84.0",
+    "@earendil-works/pi-tui": "0.84.0",
     "@types/node": "^25.9.3",
     "tsx": "^4.21.0",
     "typebox": "^1.1.38",
@@ -74,12 +74,11 @@
   "overrides": {
     "basic-ftp": "6.0.1",
     "esbuild": "0.28.1",
-    "protobufjs": "7.6.4"
+    "protobufjs": "7.6.5"
   },
   "scripts": {
     "docs": "node ./scripts/project.mjs docs",
     "doctor": "node ./scripts/doctor.mjs",
-    "benchmark:agent-browser": "node ./scripts/agent-browser-efficiency-benchmark.mjs",
     "check:platform-smoke": "node --check platform-smoke.config.mjs && node --check scripts/platform-smoke.mjs && node --check scripts/platform-smoke/doctor.mjs && node --check scripts/platform-smoke/crabbox-runner.mjs && node --check scripts/platform-smoke/targets.mjs && node --check scripts/platform-smoke/artifacts.mjs && tsx --test test/platform-smoke.test.ts",
     "smoke:platform": "node scripts/platform-smoke.mjs",
     "smoke:platform:doctor": "node scripts/platform-smoke.mjs doctor",

@@ -47,7 +47,7 @@ import { loadHashStore, type HashStore } from "./hash-store";
 
 const contentLinesSchema = Type.Array(Type.String(), {
   description:
-    "Replacement content, one string per line. Use [] to delete the range."
+    "Replacement content, one string per line; entries must not contain line breaks. Use [] to delete the range."
 });
 
 const hashRangeInclSchema = Type.Array(
@@ -78,7 +78,6 @@ export type ReplaceDetails = {
   firstChangedLine?: number;
   snapshotId?: string;
   classification?: "noop";
-  structureOutline?: string[];
   metrics?: RMetrics;
 };
 
@@ -99,9 +98,11 @@ interface PipelineResult {
   totalRemovedLines: number;
 }
 
+const PREVIEW_DEBOUNCE_MS = 150;
+
 const ROOT_KS = new Set(["path", "content_lines", "hash_range_inclusive"]);
 
-const LEGACY_KS = ["oldText", "newText", "old_text", "new_text", "old_range", "start", "end", "lines"];
+const LEGACY_KS = ["oldText", "newText", "old_text", "new_text", "old_range", "start", "end", "lines", "changes"];
 
 export function assertNoLegacyKeys(request: unknown): void {
   if (!isRec(request)) return;
@@ -251,11 +252,6 @@ export async function compPreview(
 ): Promise<RPreview> {
   try {
     const normalized = normReq(request);
-    if (isRec(request) && Array.isArray(request.changes)) {
-      return {
-        error: `[E_BAD_SHAPE] The replace tool does not accept a "changes" array. Send hash_range_inclusive and content_lines at the top level (one edit per call).`
-      };
-    }
     assertReq(normalized);
     const { path, originalNormalized, result, resultHashes } = await execPipeline(
       normalized,
@@ -323,12 +319,20 @@ export function buildToolDef(): ToolDef {
     renderShell: "default",
     renderCall(args, theme, context) {
       const previewInput = getPreviewInput(args);
+      const cancelPendingPreview = () => {
+        if (context.state.previewTimer) {
+          clearTimeout(context.state.previewTimer);
+          context.state.previewTimer = undefined;
+        }
+      };
       if (context.executionStarted) {
+        cancelPendingPreview();
         context.state.argsKey = undefined;
         context.state.preview = undefined;
         context.state.previewGeneration =
           (context.state.previewGeneration ?? 0) + 1;
       } else if (!context.argsComplete || !previewInput) {
+        cancelPendingPreview();
         context.state.argsKey = undefined;
         context.state.preview = undefined;
         context.state.previewGeneration =
@@ -336,31 +340,35 @@ export function buildToolDef(): ToolDef {
       } else {
         const argsKey = JSON.stringify(previewInput);
         if (context.state.argsKey !== argsKey) {
+          cancelPendingPreview();
           context.state.argsKey = argsKey;
           context.state.preview = undefined;
           const previewGeneration = (context.state.previewGeneration ?? 0) + 1;
           context.state.previewGeneration = previewGeneration;
-          compPreview(args, context.cwd)
-            .then((preview) => {
-              if (
-                context.state.argsKey === argsKey &&
-                context.state.previewGeneration === previewGeneration
-              ) {
-                context.state.preview = preview;
-                context.invalidate();
-              }
-            })
-            .catch((err: unknown) => {
-              if (
-                context.state.argsKey === argsKey &&
-                context.state.previewGeneration === previewGeneration
-              ) {
-                context.state.preview = {
-                  error: err instanceof Error ? err.message : String(err),
-                };
-                context.invalidate();
-              }
-            });
+          context.state.previewTimer = setTimeout(() => {
+            context.state.previewTimer = undefined;
+            compPreview(args, context.cwd)
+              .then((preview) => {
+                if (
+                  context.state.argsKey === argsKey &&
+                  context.state.previewGeneration === previewGeneration
+                ) {
+                  context.state.preview = preview;
+                  context.invalidate();
+                }
+              })
+              .catch((err: unknown) => {
+                if (
+                  context.state.argsKey === argsKey &&
+                  context.state.previewGeneration === previewGeneration
+                ) {
+                  context.state.preview = {
+                    error: err instanceof Error ? err.message : String(err),
+                  };
+                  context.invalidate();
+                }
+              });
+          }, PREVIEW_DEBOUNCE_MS);
         }
       }
       const text =
@@ -389,6 +397,10 @@ export function buildToolDef(): ToolDef {
 
       const renderState = context.state as RRState | undefined;
       if (renderState) {
+        if (renderState.previewTimer) {
+          clearTimeout(renderState.previewTimer);
+          renderState.previewTimer = undefined;
+        }
         renderState.preview = undefined;
         renderState.previewGeneration = (renderState.previewGeneration ?? 0) + 1;
       }
@@ -410,8 +422,9 @@ export function buildToolDef(): ToolDef {
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const canonical = normReq(params);
+      assertReq(canonical);
 
-      const normalizedParams = canonical as ReqParams;
+      const normalizedParams = canonical;
       const path = normalizedParams.path;
       const absolutePath = toCwd(path, ctx.cwd);
       const mutationTargetPath = await resolveTarget(absolutePath);
@@ -440,7 +453,12 @@ export function buildToolDef(): ToolDef {
 
         const editsAttempted = 1;
         if (originalNormalized === result) {
-          const noopSnapshotId = (await fileSnap(absolutePath)).snapshotId;
+          let noopSnapshotId: string | undefined;
+          try {
+            noopSnapshotId = (await fileSnap(absolutePath)).snapshotId;
+          } catch (error) {
+            console.error("Failed to compute snapshot for noop edit:", error);
+          }
           return buildNoop({
             path,
             noopEdit,
@@ -462,24 +480,34 @@ export function buildToolDef(): ToolDef {
         }
 
         abortIf(signal);
-        await writeAtomic(
-          absolutePath,
-          bom + restoreEndings(result, originalEnding),
-        );
-        const undoPersisted = await saveUndo(mutationTargetPath, {
+        const undo = await saveUndo(mutationTargetPath, {
           content: originalNormalized,
           bom,
           originalEnding,
           hashes: originalHashes,
           resultContent: result,
         });
-        if (!undoPersisted) {
-          warnings.push(
-            "Undo history could not be persisted; undo_last_replace will not be available for this edit.",
+        if (!undo.persisted) {
+          throw new Error(
+            `[E_UNDO_UNAVAILABLE] Cannot persist undo history to the hash store; the edit was NOT applied and ${path} is unchanged. Retry the replace, or use write if the store cannot be recovered.`
           );
         }
-        const updatedSnapshotId = (await fileSnap(absolutePath))
-          .snapshotId;
+        try {
+          abortIf(signal);
+          await writeAtomic(
+            absolutePath,
+            bom + restoreEndings(result, originalEnding),
+          );
+        } catch (error) {
+          await undo.restore();
+          throw error;
+        }
+        let updatedSnapshotId: string | undefined;
+        try {
+          updatedSnapshotId = (await fileSnap(absolutePath)).snapshotId;
+        } catch (error) {
+          console.error("Failed to compute post-edit snapshot:", error);
+        }
 
         const editMeta: RMeta = {
           editsAttempted,

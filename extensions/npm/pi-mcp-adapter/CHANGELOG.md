@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.0] - 2026-08-06
+
+### Added
+- Added MCP 2026-07-28 endpoint probing and defaulted curated remote setup presets to automatic protocol negotiation for stateless MCP servers.
+- Added `resolveServerFromToolName` so permission brokers can map prefixed MCP tool names back to their owning server. Thanks @jagaliano for PR #295.
+- Added per-server `oauth.skipIssuerMetadataValidation` for known-misconfigured OAuth servers. Thanks @embik for issue #297.
+- Added a configurable `mcp.panel.save` keybinding for the MCP panel Save action. Thanks @tim-hilde for issue #299.
+- Added `settings.agentPluginPaths` to load MCP servers from Agent Plugins 1.0 packages.
+
+### Changed
+- Refined MCP endpoint probing internals with typed strategies while preserving request order, fallback behavior, and diagnostics.
+
+### Fixed
+- Rejected Agent Plugin command paths that escape the plugin directory and skipped normalized server-name collisions instead of overwriting servers.
+- Stopped `/mcp` from inspecting host-specific config files when host config discovery is disabled. Thanks @rtfmkiesel for issue #292.
+- Stopped optional numeric `mcp` and `mcpScript` tool parameters from leaking TypeBox internal markers into serialized schemas. Thanks @RainbowXie for issue #289 and PR #290.
+- Forwarded RFC 9207 OAuth callback issuers to the MCP SDK during manual authorization completion. Thanks @tkoenig for issue #293 and PR #294, and @ugur-murat-alt for independent live verification.
+- Kept `mcpScript` `tools.describe()` from omitting parameter information when TypeScript shape rendering falls back. Thanks @sheurich for issue #288.
+- Reduced repeated collapsed MCP result rendering allocation after large or truncated tool outputs. Thanks @cp-yu for issue #291.
+
+## [2.20.1] - 2026-08-04
+
+### Fixed
+- Stopped server-side MCP app helper imports from requiring the legacy `@modelcontextprotocol/sdk` peer at extension load time, fixing peerless Pi installs of 2.20.0. Thanks @aryzing for issue #285 and @DevDominic, @Shinkicast, and @marceloid for confirmations.
+
+## [2.20.0] - 2026-08-04
+
+### Added
+- Added an MCP tool approval broker event so permission extensions can allow, deny, or abstain on proxy, direct, `mcpScript`, resource, and iframe-originated MCP calls before the built-in `approveTools` prompt runs. Thanks @geshido for issue #279.
+- Added opt-in per-server MCP protocol selection with `protocolVersion: "legacy" | "auto" | "2026-07-28"`. Legacy remains the default; auto negotiates the modern era with conservative legacy fallback, while the pinned mode fails instead of falling back. Thanks @mjfaga for PR #272.
+- Added a strict TypeScript typecheck command and CI gate.
+
+### Changed
+- Migrated the MCP client from the monolithic SDK v1 package to the stable modular `@modelcontextprotocol/client` and `@modelcontextprotocol/core` v2 packages. The stable release restores conservative legacy discovery fallback and declared JSON Schema dialect support while retaining strict OAuth issuer validation.
+
+### Fixed
+- Renamed the MCP scripting tool to camel-case `mcpScript` because Anthropic rejects the previous underscore-form name. Thanks @ritvij14 for issue #278 and @wierdbytes for confirmation and the workaround.
+- Pinned the Chrome DevTools setup preset and README examples to `chrome-devtools-mcp@1.6.0` instead of `@latest`, so reviewed scaffolded commands stay stable. Thanks @fitchmultz for issue #274.
+- Removed the adapter's throwaway Streamable HTTP initialize probe. HTTP connections now initialize once on the real client and use narrowly classified SSE fallback, avoiding duplicate sessions and preventing authentication, cancellation, timeout, negotiation, and server failures from being misclassified as transport incompatibility.
+- Stopped tokenless discovery requests, sandboxed MCP app documents, unrelated child windows, and app-opened popups from gaining session authority; discovery now serves a non-sensitive landing page, app HTML loads with a separate resource-only token, host messages accept only the app frame as their source, and the app response enforces sandboxing even when opened as a top-level page.
+
 ## [2.19.0] - 2026-08-03
 
 ### Added

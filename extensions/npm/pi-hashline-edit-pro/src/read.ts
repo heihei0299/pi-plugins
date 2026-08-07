@@ -6,6 +6,7 @@ import {
 	type TruncationResult,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { MAX_READ_LINE_BYTES } from "./constants";
 import { loadFileKindAndText } from "./file-kind";
 import { readNormFile } from "./file-reader";
 import { lineHashes, fmtRegion, HASH_SEP, MAX_HASH_LINES } from "./hashline";
@@ -20,11 +21,8 @@ const R_DESC = loadP("../prompts/read.md");
 
 const R_SNIPPET = loadP("../prompts/read-snippet.md");
 
-function readGuide(autoRead: boolean): string[] {
-	const note = "- `read`: call again after any edit to that file — changed lines get new anchors.";
-	return loadGuide("../prompts/read-guidelines.md", {
-		AUTO_READ_NOTE: autoRead ? "" : note,
-	});
+function readGuide(): string[] {
+	return loadGuide("../prompts/read-guidelines.md");
 }
 
 function normPosInt(
@@ -58,6 +56,7 @@ export async function fmtReadPreview(
 	options: { offset?: number; limit?: number },
 	precomputedHashes?: string[],
 	path?: string,
+	maxLineBytes = MAX_READ_LINE_BYTES,
 ): Promise<{ text: string; truncation?: TruncationResult; nextOffset?: number }> {
 	const allLines = visLines(text);
 	const totalLines = allLines.length;
@@ -88,14 +87,41 @@ export async function fmtReadPreview(
 	const allHashes = precomputedHashes ?? await (path ? lineHashes(text, path) : lineHashes(text));
 	const selectedHashes = allHashes.slice(startLine - 1, endIdx);
 	const formatted = fmtRegion(selectedHashes, selected);
-
-	const truncation = truncateHead(formatted);
-	if (truncation.firstLineExceedsLimit) {
+	const maxBytes = maxLineBytes;
+	const rowSizes = selected.map((line, index) => ({
+		lineNumber: startLine + index,
+		bytes: Buffer.byteLength(`${selectedHashes[index]}${HASH_SEP}${line}`, "utf-8"),
+	}));
+	if (rowSizes.some((row) => row.bytes > maxBytes)) {
+		const oversized = rowSizes.filter((row) => row.bytes > maxBytes);
+		const rows = rowSizes.map((row, index) =>
+			row.bytes > maxBytes
+				? `[Line ${row.lineNumber} is ${formatSize(row.bytes)}, exceeds ${formatSize(maxBytes)}; content not shown. Use bash: sed -n '${row.lineNumber}p' <path> | head -c ${maxBytes}]`
+				: fmtRegion([selectedHashes[index]!], [selected[index]!]),
+		);
+		const skippedTruncation = truncateHead(rows.join("\n"), { maxBytes });
+		const shownRowCount = skippedTruncation.content === "" ? 0 : skippedTruncation.content.split("\n").length;
+		const lastShownLine = shownRowCount > 0 ? startLine + shownRowCount - 1 : startLine - 1;
+		const lineLabel = oversized.length === 1 ? `Line ${oversized[0]!.lineNumber}` : `Lines ${oversized.map((row) => row.lineNumber).join(", ")}`;
+		const verb = oversized.length === 1 ? "exceeds" : "exceed";
+		const addresses = oversized.map((row) => `${row.lineNumber}p`).join(";");
+		const warning = `[${lineLabel} ${verb} ${formatSize(maxBytes)}; content not shown because hashline anchors require full lines. Inspect with bash: sed -n '${addresses}' <path> | head -c ${maxBytes}]`;
+		let preview = skippedTruncation.content;
+		let nextOffset: number | undefined;
+		if (shownRowCount > 0 && (skippedTruncation.truncated || lastShownLine < totalLines)) {
+			nextOffset = lastShownLine + 1;
+			preview += `\n\n${warning}\n${formatPaginationHint(startLine, lastShownLine, totalLines, nextOffset, skippedTruncation.truncated ? skippedTruncation.maxBytes : undefined)}`;
+		} else {
+			preview += `\n\n${warning}`;
+		}
 		return {
-			text: `[Line ${startLine} exceeds ${formatSize(truncation.maxBytes)}. Hashline output requires full lines; cannot compute hashes for a truncated preview.]`,
-			truncation,
+			text: preview,
+			truncation: skippedTruncation.truncated ? skippedTruncation : undefined,
+			...(nextOffset !== undefined ? { nextOffset } : {}),
 		};
 	}
+
+	const truncation = truncateHead(formatted, { maxBytes });
 
 	let preview = truncation.content;
 	let nextOffset: number | undefined;
@@ -119,13 +145,13 @@ export async function fmtReadPreview(
 	};
 }
 
-export function regRead(pi: ExtensionAPI, opts?: { autoRead?: boolean }): void {
+export function regRead(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "read",
 		label: "Read",
 		description: R_DESC,
 		promptSnippet: R_SNIPPET,
-		promptGuidelines: readGuide(opts?.autoRead ?? true),
+		promptGuidelines: readGuide(),
 		parameters: Type.Object({
 			path: Type.String({
 				description: "Path to the file to read (relative or absolute)",
@@ -152,7 +178,7 @@ export function regRead(pi: ExtensionAPI, opts?: { autoRead?: boolean }): void {
 			await valAccess(absolutePath, rawPath);
 
 			abortIf(signal);
-			const file = await loadFileKindAndText(absolutePath);
+			const file = await loadFileKindAndText(absolutePath, { maxLines: MAX_HASH_LINES, displayPath: rawPath });
 			if (file.kind === "image") {
 				const builtinRead = createReadTool(ctx.cwd);
 				const executeBuiltinRead = builtinRead.execute as unknown as (

@@ -19,6 +19,9 @@ export async function valAccess(
 			const accessLabel = accessMode & constants.W_OK ? "not writable" : "not readable";
 			throw new Error(`[E_ACCESS] File is ${accessLabel}: ${path}`);
 		}
+		if (code === "ELOOP") {
+			throw new Error(`[E_ACCESS] Too many symbolic links while resolving: ${path}`);
+		}
 		throw new Error(`[E_ACCESS] Cannot access file: ${path}`);
 	}
 }
@@ -33,10 +36,5 @@ export function valKind(file: LFile, path: string): asserts file is { kind: "tex
 	if (file.kind === "image") {
 		throw new Error(`[E_NOT_TEXT] Path is an image file: ${path}. Hashline edit only supports text files.`);
 	}
-}
-
-
-export function isText(file: LFile): file is { kind: "text"; text: string; hadUtf8DecodeErrors?: true } {
-	return file.kind === "text";
 }
 

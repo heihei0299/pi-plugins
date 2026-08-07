@@ -43,10 +43,10 @@ function hashAt(idx: number): string {
 }
 
 export const HL_PREFIX_PLUS_RE = new RegExp(
-	`^\\+\\s*${HASH_CLASS}│`,
+	`^\\+${HASH_CLASS}│`,
 );
 export const HL_PREFIX_MINUS_RE = new RegExp(
-	`^-(?:\\s*${HASH_CLASS}│| {${ANCHOR_LEN}}│)`,
+	`^-(?:${HASH_CLASS}│| {${ANCHOR_LEN}}│)`,
 );
 
 export const HL_BARE_PREFIX_RE = new RegExp(`^\\s*(${HASH_CLASS})│`);
@@ -143,6 +143,7 @@ export async function lineHashes(
   store?: HashStore,
   persist?: boolean,
 ): Promise<string[]> {
+  await initHasher();
   if (!path) {
     return _lineHashesPure(content);
   }
@@ -156,19 +157,32 @@ export async function lineHashes(
       previous.removedHashes,
     );
     if (persist !== false) {
-      upsertSnapshot(hashStore, path, contentChecksum(content), splitLines(content).length, newHashes);
+      try {
+        upsertSnapshot(hashStore, path, contentChecksum(content), splitLines(content).length, newHashes);
+      } catch (error) {
+        console.error("Failed to persist hash snapshot:", error);
+      }
     }
     return newHashes;
   }
 
-  const cached = getSnapshot(hashStore, path, content);
+  let cached: string[] | undefined;
+  try {
+    cached = getSnapshot(hashStore, path, content);
+  } catch (error) {
+    console.error("Failed to read hash store snapshot:", error);
+  }
   if (cached) {
     return cached;
   }
 
   const newHashes = _lineHashesPure(content);
   if (persist !== false) {
-    upsertSnapshot(hashStore, path, contentChecksum(content), splitLines(content).length, newHashes);
+    try {
+      upsertSnapshot(hashStore, path, contentChecksum(content), splitLines(content).length, newHashes);
+    } catch (error) {
+      console.error("Failed to persist hash snapshot:", error);
+    }
   }
   return newHashes;
 }
@@ -233,6 +247,16 @@ function mapStableHashes(
     if (idx !== undefined) removedIndexes.add(idx);
   }
 
+  let spanStart = oldLines.length;
+  let spanEnd = -1;
+  for (const idx of removedIndexes) {
+    if (idx < spanStart) spanStart = idx;
+    if (idx > spanEnd) spanEnd = idx;
+  }
+  const spanLen = spanEnd >= spanStart ? spanEnd - spanStart + 1 : 0;
+  const replacementLen = newLines.length - oldLines.length + spanLen;
+  const shiftAfterSpan = spanEnd >= spanStart ? replacementLen - spanLen : 0;
+
   const survivors: { index: number; hash: string }[] = [];
   const removedEntries: { index: number; hash: string }[] = [];
   for (let i = 0; i < oldLines.length; i++) {
@@ -260,7 +284,8 @@ function mapStableHashes(
   for (const entry of survivors) {
     const candidates = newByContent.get(canon(oldLines[entry.index]!));
     if (!candidates || candidates.length === 0) continue;
-    const pos = nearestNew(candidates, entry.index);
+    const target = entry.index > spanEnd ? entry.index + shiftAfterSpan : entry.index;
+    const pos = nearestNew(candidates, target);
     if (pos < 0) continue;
     const newIdx = candidates.splice(pos, 1)[0]!;
     newHashes[newIdx] = entry.hash;

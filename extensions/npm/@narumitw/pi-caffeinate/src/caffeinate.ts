@@ -5,7 +5,6 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
 import { startInhibitorProcess, stopInhibitorProcess } from "./inhibitor-process.js";
 import { formatMode, getInhibitorCommand, type InhibitorCommand } from "./inhibitors.js";
 import {
@@ -171,6 +170,10 @@ async function runCaffeinateMenu(ctx: CommandContext, generation: number, start:
 				: `The pi-caffeinate menu requires TUI or RPC mode.\n\n${buildCommandGuide()}\n\n${describeState()}`,
 		);
 	}
+	const menuSignal = state.menuController.signal;
+	const isCurrent = () => generation === state.sessionGeneration && !menuSignal.aborted;
+	const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
+	if (!isCurrent()) return;
 	type Screen = "main" | "mode";
 	type Action = "display" | "sleep" | "status" | "stop" | "help";
 	const menu = defineMenu<undefined, Screen, Action>({
@@ -223,8 +226,8 @@ async function runCaffeinateMenu(ctx: CommandContext, generation: number, start:
 	});
 	await runMenu(ctx, menu, {
 		getState: () => undefined,
-		signal: state.menuController.signal,
-		isCurrent: () => generation === state.sessionGeneration,
+		signal: menuSignal,
+		isCurrent,
 	});
 }
 

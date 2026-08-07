@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import process from "node:process";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	isNonNegativeFiniteNumber,
 	nonNegativeFiniteNumber,
@@ -10,10 +10,7 @@ import type { GoalStatus } from "./prompts.js";
 
 const GOAL_STATE_ENTRY_TYPE = "goal-state";
 const LEGACY_GOALS_STATE_ENTRY_TYPE = "goals-state";
-const STATE_FILE = join(
-	process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? ".", ".pi", "agent"),
-	"pi-goal-state.json",
-);
+const STATE_FILE = join(getAgentDir(), "pi-goal-state.json");
 
 export type SafetyPauseCause = "continuation_limit" | "no_progress";
 

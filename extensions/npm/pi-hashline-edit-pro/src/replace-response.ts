@@ -35,7 +35,7 @@ type NEditEntry = {
 export interface NoopInput {
 	path: string;
 	noopEdit: NEditEntry | undefined;
-	snapshotId: string;
+	snapshotId?: string;
 	editMeta: RMeta;
 	warnings: string[] | undefined;
 }
@@ -47,7 +47,7 @@ export interface SuccessInput {
   result: string;
   resultHashes: string[];
   warnings: string[] | undefined;
-  snapshotId: string;
+  snapshotId?: string;
   editMeta: RMeta;
 }
 
@@ -126,7 +126,7 @@ export function buildChanged(input: SuccessInput): TResult {
   const { path, result, warnings, snapshotId, originalNormalized, editMeta, resultHashes } = input;
 
   const resultLines = visLines(result);
-  const diffResult = genDiff(originalNormalized, result, 2, resultHashes);
+  const diffResult = genDiff(originalNormalized, result, 1, resultHashes);
   const addedLines = editMeta.addedLines;
   const removedLines = editMeta.removedLines;
   const warningsBlock = warnBlock(warnings);

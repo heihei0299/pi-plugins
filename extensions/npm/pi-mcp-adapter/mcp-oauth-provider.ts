@@ -10,12 +10,12 @@ import {
   type AddClientAuthentication,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
-} from "@modelcontextprotocol/sdk/client/auth.js"
+} from "@modelcontextprotocol/client"
 import type {
   OAuthClientInformationMixed,
   OAuthClientMetadata,
   OAuthTokens,
-} from "@modelcontextprotocol/sdk/shared/auth.js"
+} from "@modelcontextprotocol/client"
 import {
   getAuthForUrl,
   updateTokens,
@@ -86,6 +86,7 @@ export interface McpOAuthConfig {
   redirectUri?: string
   clientName?: string
   clientUri?: string
+  skipIssuerMetadataValidation?: boolean
 }
 
 const reservedAuthorizationParams = new Set([
@@ -288,7 +289,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         updateClientInfo(this.serverName, clientInfo, this.serverUrl, this.storageOptions)
       }
       // Return all registration metadata and the local issuer extension.
-      // This keeps the SDK v1 view and the stored issuer binding consistent.
+      // This keeps the SDK OAuth view and the stored issuer binding consistent.
       return {
         client_id: clientInfo.clientId,
         client_secret: clientInfo.clientSecret,
@@ -318,7 +319,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
     if (this.config.clientId && info.client_id === this.config.clientId) {
       updateClientInfo(
         this.serverName,
-        { clientId: info.client_id, issuer, configPreRegistered: true },
+        {
+          clientId: info.client_id,
+          ...(issuer !== undefined ? { issuer } : {}),
+          configPreRegistered: true,
+        },
         this.serverUrl,
         this.storageOptions,
       )
@@ -329,11 +334,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
       ?? (this.redirectUrl ? [this.redirectUrl] : undefined)
     const clientInfo: StoredClientInfo = {
       clientId: info.client_id,
-      clientSecret: info.client_secret,
-      clientIdIssuedAt: info.client_id_issued_at,
-      clientSecretExpiresAt: info.client_secret_expires_at,
-      redirectUris,
-      issuer,
+      ...(info.client_secret !== undefined ? { clientSecret: info.client_secret } : {}),
+      ...(info.client_id_issued_at !== undefined ? { clientIdIssuedAt: info.client_id_issued_at } : {}),
+      ...(info.client_secret_expires_at !== undefined ? { clientSecretExpiresAt: info.client_secret_expires_at } : {}),
+      ...(redirectUris !== undefined ? { redirectUris } : {}),
+      ...(issuer !== undefined ? { issuer } : {}),
     }
     this.flowClientInfo = clientInfo
     updateClientInfo(this.serverName, clientInfo, this.serverUrl, this.storageOptions)
@@ -370,15 +375,16 @@ export class McpOAuthProvider implements OAuthClientProvider {
    * Save OAuth tokens.
    */
   async saveTokens(tokens: OAuthTokens): Promise<void> {
+    const issuer = this.discoveredIssuer ?? (tokens as IssuerBoundTokens).issuer
     const storedTokens: StoredTokens = {
       accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token,
+      ...(tokens.refresh_token !== undefined ? { refreshToken: tokens.refresh_token } : {}),
       // Preserve expiry even when expires_in is 0 (e.g. the SDK re-saving an
       // already-expired token) so expired tokens stay expired instead of
       // being persisted as never-expiring.
-      expiresAt: tokens.expires_in !== undefined ? Date.now() / 1000 + tokens.expires_in : undefined,
-      scope: tokens.scope,
-      issuer: this.discoveredIssuer ?? (tokens as IssuerBoundTokens).issuer,
+      ...(tokens.expires_in !== undefined ? { expiresAt: Date.now() / 1000 + tokens.expires_in } : {}),
+      ...(tokens.scope !== undefined ? { scope: tokens.scope } : {}),
+      ...(issuer !== undefined ? { issuer } : {}),
     }
     this.throwIfInactive()
     updateTokens(this.serverName, storedTokens, this.serverUrl, this.storageOptions)

@@ -1,4 +1,4 @@
-import { getToolUiResourceUri } from "@modelcontextprotocol/ext-apps/app-bridge";
+import { getToolUiResourceUri } from "./ui-app-bridge-helpers.ts";
 import type { McpExtensionState } from "./state.ts";
 import type { ToolMetadata, McpTool, McpResource, ServerEntry, ToolPrefix } from "./types.ts";
 import { formatToolName, isToolAllowed, resolveToolPrefix } from "./types.ts";
@@ -44,14 +44,15 @@ export function buildToolMetadata(
     } catch {
       failedTools.push(tool.name);
     }
+    const uiStreamMode = extractToolUiStreamMode(tool._meta);
     metadata.push({
       name,
       originalName: tool.name,
       description: tool.description ?? "",
-      inputSchema: tool.inputSchema,
-      uiResourceUri,
-      uiVisibility,
-      uiStreamMode: extractToolUiStreamMode(tool._meta),
+      ...(tool.inputSchema !== undefined ? { inputSchema: tool.inputSchema } : {}),
+      ...(uiResourceUri !== undefined ? { uiResourceUri } : {}),
+      ...(uiVisibility !== undefined ? { uiVisibility } : {}),
+      ...(uiStreamMode !== undefined ? { uiStreamMode } : {}),
     });
   }
 

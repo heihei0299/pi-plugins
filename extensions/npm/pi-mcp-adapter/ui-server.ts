@@ -2,12 +2,12 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { buildAllowAttribute } from "@modelcontextprotocol/ext-apps/app-bridge";
+import { buildAllowAttribute } from "./ui-app-bridge-helpers.ts";
 import {
-  ContentBlockSchema,
   type CallToolRequest,
   type CallToolResult,
-} from "@modelcontextprotocol/sdk/types.js";
+} from "@modelcontextprotocol/client";
+import { ContentBlockSchema } from "@modelcontextprotocol/core";
 import type { ConsentManager } from "./consent-manager.ts";
 import { ServerError, wrapError } from "./errors.ts";
 import { formatAuthRequiredMessage } from "./utils.ts";
@@ -95,6 +95,7 @@ export interface UiServerHandle {
 
 export async function startUiServer(options: UiServerOptions): Promise<UiServerHandle> {
   const sessionToken = options.sessionToken ?? randomUUID();
+  const uiResourceToken = randomUUID();
   const log = logger.child({ 
     component: "UiServer",
     server: options.serverName,
@@ -164,7 +165,8 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
       streamSummary.phases.push(envelope.phase);
     }
     streamSummary.finalStatus = envelope.status;
-    streamSummary.lastMessage = envelope.message;
+    if (envelope.message !== undefined) streamSummary.lastMessage = envelope.message;
+    else delete streamSummary.lastMessage;
   };
 
   const serializeEvent = (eventId: number, name: string, payload: unknown): string => {
@@ -174,6 +176,7 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
   const getLatestCheckpointIndex = () => {
     for (let index = eventLog.length - 1; index >= 0; index -= 1) {
       const entry = eventLog[index];
+      if (!entry) continue;
       const envelope = getVisualizationStreamEnvelope((entry.payload as { structuredContent?: unknown } | null)?.structuredContent);
       if (envelope?.frameType === "checkpoint" || envelope?.frameType === "final") {
         return index;
@@ -271,13 +274,11 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
       }
 
       if (method === "GET" && url.pathname === "/") {
-        if (!url.searchParams.has("session") && isLoopbackAddress(req.socket.remoteAddress)) {
-          const dest = `/?session=${encodeURIComponent(sessionToken)}`;
+        if (!url.searchParams.has("session")) {
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
           res.end(
-            `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(`MCP UI - ${options.serverName} / ${options.toolName}`)}</title>` +
-              `<noscript><meta http-equiv="refresh" content="0;url=${dest}"></noscript></head>` +
-              `<body><script>location.replace(${JSON.stringify(dest)});</script></body></html>`,
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>MCP UI</title></head>" +
+              "<body><p>Open the authenticated MCP UI URL shown by Pi.</p></body></html>",
           );
           return;
         }
@@ -286,6 +287,7 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
 
         const html = buildHostHtmlTemplate({
           sessionToken,
+          uiResourceToken,
           serverName: options.serverName,
           toolName: options.toolName,
           toolArgs: options.toolArgs,
@@ -330,7 +332,7 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
       }
 
       if (method === "GET" && url.pathname === "/ui-app") {
-        if (!validateTokenQuery(url, sessionToken, res)) return;
+        if (!validateTokenQuery(url, uiResourceToken, res, "resource")) return;
         touchHeartbeat();
         // Enforce host metadata independently of where app HTML places its document head.
         const cspContent = buildCspMetaContent(options.resource.meta.csp);
@@ -411,8 +413,8 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
           name: callParams.name,
           originalName: callParams.name,
           description: toolDefinition?.description ?? "",
-          inputSchema: toolDefinition?.inputSchema,
-          uiVisibility,
+          ...(toolDefinition?.inputSchema !== undefined ? { inputSchema: toolDefinition.inputSchema } : {}),
+          ...(uiVisibility !== undefined ? { uiVisibility } : {}),
         };
         const approval = options.state
           ? await ensureToolCallApproved(
@@ -421,6 +423,7 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
               toolMeta,
               callArgs.arguments,
               options.state.owner?.signal,
+              "iframe",
             )
           : options.config && isToolCallApprovalRequired(options.config, options.serverName, toolMeta)
             ? { ok: false as const, reason: "approval_required_headless" as const }
@@ -449,11 +452,15 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
           options.manager.incrementInFlight(options.serverName);
           const result = options.config
             ? await withSessionRecovery(
-                { manager: options.manager, config: options.config, onNeedsAuth: options.onNeedsAuth },
+                {
+                  manager: options.manager,
+                  config: options.config,
+                  ...(options.onNeedsAuth ? { onNeedsAuth: options.onNeedsAuth } : {}),
+                },
                 options.serverName,
-                (conn) => conn.client.callTool(callArgs, undefined, options.manager.getRequestOptions?.(options.serverName)),
+                (conn) => conn.client.callTool(callArgs, options.manager.getRequestOptions?.(options.serverName)),
               )
-            : await connection.client.callTool(callArgs, undefined, options.manager.getRequestOptions?.(options.serverName));
+            : await connection.client.callTool(callArgs, options.manager.getRequestOptions?.(options.serverName));
           sendJson(res, 200, { ok: true, result });
         } finally {
           options.manager.decrementInFlight(options.serverName);
@@ -481,9 +488,9 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
         } else if (msgParams.type === "intent" || msgParams.intent) {
           const intentName = msgParams.intent ?? "";
           if (intentName) {
-            sessionMessages.intents.push({ 
-              intent: intentName, 
-              params: msgParams.params 
+            sessionMessages.intents.push({
+              intent: intentName,
+              ...(msgParams.params !== undefined ? { params: msgParams.params } : {}),
             });
             log.debug("UI intent received", { intent: intentName });
           }
@@ -639,7 +646,11 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
         return;
       }
       log.error("Failed to start server", error);
-      reject(new ServerError(error.message, { port: candidates[candidateIndex], cause: error }));
+      const port = candidates[candidateIndex];
+      reject(new ServerError(error.message, {
+        ...(port !== undefined ? { port } : {}),
+        cause: error,
+      }));
     };
 
     const onListening = () => {
@@ -760,21 +771,13 @@ function isAllowedHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 }
 
-function isLoopbackAddress(address: string | undefined): boolean {
-  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function validateTokenQuery(url: URL, expected: string, res: ServerResponse): boolean {
-  const token = url.searchParams.get("session");
+function validateTokenQuery(
+  url: URL,
+  expected: string,
+  res: ServerResponse,
+  parameter = "session",
+): boolean {
+  const token = url.searchParams.get(parameter);
   if (token !== expected) {
     sendJson(res, 403, { ok: false, error: "Invalid session" });
     return false;

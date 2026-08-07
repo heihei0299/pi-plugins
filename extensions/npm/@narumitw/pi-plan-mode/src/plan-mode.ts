@@ -4,7 +4,6 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { showActiveImplementationMenu } from "./active-implementation-menu.js";
 import { completePlanArguments } from "./command.js";
 import {
 	normalizePlanModeCompletion,
@@ -29,7 +28,6 @@ import {
 import { invalidPlanMessage, latestAssistantText, parseProposedPlan } from "./message-transform.js";
 import { createPlanActionController } from "./plan-action-controller.js";
 import { createPlanExportController } from "./plan-export-controller.js";
-import { showPlanLaunchMenu } from "./plan-launch-menu.js";
 import {
 	clearPlanModeUi,
 	planModeStatusText as formatPlanModeStatusText,
@@ -56,7 +54,6 @@ import {
 	type PlanModeSettings,
 	readPlanModeSettings,
 } from "./settings.js";
-import { showPlanModeSettings } from "./settings-menu.js";
 import { type PlanCompletionSource, type PlanModeState, restorePlanModeState } from "./state.js";
 import {
 	canSelectToolInPlanMode,
@@ -81,11 +78,25 @@ interface ReadyPresentationIntent {
 	plan: string;
 	source: PlanCompletionSource;
 }
+type InteractiveUi = typeof import("./interactive-ui.js");
+
 interface PlanModeDependencies {
 	readSettings?(): ReturnType<typeof readPlanModeSettings>;
 	settingsPath?: string;
+	loadInteractiveUi?(): Promise<InteractiveUi>;
 }
 export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDependencies = {}) {
+	let interactiveUiPromise: Promise<InteractiveUi> | undefined;
+	const loadInteractiveUi = () => {
+		if (dependencies.loadInteractiveUi) return dependencies.loadInteractiveUi();
+		if (!interactiveUiPromise) {
+			interactiveUiPromise = import("./interactive-ui.js").catch((error) => {
+				interactiveUiPromise = undefined;
+				throw error;
+			});
+		}
+		return interactiveUiPromise;
+	};
 	let state: PlanModeState = { enabled: false, awaitingAction: false };
 	let settings: PlanModeSettings = { thinkingLevel: "inherit" };
 	let previousTools: string[] | undefined;
@@ -104,6 +115,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 		finishReady: (ctx) => exitPlanMode(ctx),
 	});
 	const planActions = createPlanActionController({
+		loadInteractiveUi,
 		getState: () => state,
 		captureLifecycle: captureMenuLifecycle,
 		statusText: planStatusText,
@@ -721,8 +733,11 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 
 	async function showLaunchMenu(ctx: ExtensionContext, initialScreen: "main" | "tools" = "main") {
 		const lifecycle = captureMenuLifecycle();
+		if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
+		const ui = await loadInteractiveUi();
+		if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
 		const tools = selectableTools();
-		await showPlanLaunchMenu(ctx, {
+		await ui.showPlanLaunchMenu(ctx, {
 			statusText: "Status: Off — normal tools are active.",
 			initialScreen,
 			getSelectedNames: () => snapshotPlanModeSelectedNames(tools, toolSelectionSnapshot()),
@@ -766,7 +781,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 			return;
 		}
 		const lifecycle = captureMenuLifecycle();
-		await showActiveImplementationMenu(ctx, {
+		if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
+		const ui = await loadInteractiveUi();
+		if (!lifecycle.isCurrent() || lifecycle.signal.aborted) return;
+		await ui.showActiveImplementationMenu(ctx, {
 			statusText: planStatusText(),
 			getExportDestination: () => planExports.getDestination(ctx),
 			signal: lifecycle.signal,
@@ -790,7 +808,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 		signal: AbortSignal,
 		isCurrent: () => boolean,
 	) {
-		const result = await showPlanModeSettings(ctx, {
+		if (!isCurrent() || signal.aborted) return false;
+		const ui = await loadInteractiveUi();
+		if (!isCurrent() || signal.aborted) return false;
+		const result = await ui.showPlanModeSettings(ctx, {
 			tools: selectableTools(),
 			signal,
 			isCurrent,

@@ -2,7 +2,7 @@ import { readFile } from "fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { loadHashStore, upsertSnapshot, upsertUndo, getUndoEntry, deleteUndo } from "./hash-store";
+import { loadHashStore, upsertSnapshot, upsertUndo, getUndoEntry, deleteUndo, type UndoRecord } from "./hash-store";
 import { contentChecksum } from "./hashline/hasher";
 import { resolveTarget, writeAtomic } from "./fs-write";
 import { toCwd } from "./paths";
@@ -19,9 +19,14 @@ export interface UndoEntry {
   resultContent: string;
 }
 
-export async function saveUndo(path: string, entry: UndoEntry): Promise<boolean> {
+export async function saveUndo(
+  path: string,
+  entry: UndoEntry,
+): Promise<{ persisted: boolean; restore: () => Promise<void> }> {
+  let previous: UndoRecord | undefined;
   try {
     const store = await loadHashStore();
+    previous = getUndoEntry(store, path);
     upsertUndo(store, path, {
       content: entry.content,
       bom: entry.bom,
@@ -29,11 +34,22 @@ export async function saveUndo(path: string, entry: UndoEntry): Promise<boolean>
       hashes: entry.hashes,
       resultContent: entry.resultContent,
     });
-    return true;
   } catch (error) {
     console.error("Failed to persist undo entry:", error);
-    return false;
+    return { persisted: false, restore: async () => undefined };
   }
+  return {
+    persisted: true,
+    restore: async () => {
+      try {
+        const store = await loadHashStore();
+        if (previous) upsertUndo(store, path, previous);
+        else deleteUndo(store, path);
+      } catch (error) {
+        console.error("Failed to restore previous undo entry:", error);
+      }
+    },
+  };
 }
 
 export async function getUndo(path: string): Promise<UndoEntry | undefined> {
@@ -101,16 +117,15 @@ export function regReplaceUndo(pi: ExtensionAPI): void {
       }
 
       return withFileMutationQueue(mutationTargetPath, async () => {
-        let currentNormalized: string | undefined;
+        let currentRaw: string | undefined;
         try {
-          const currentRaw = await readFile(mutationTargetPath, "utf-8");
-          const { text: currentStripped } = stripBOM(currentRaw);
-          currentNormalized = toLF(currentStripped);
+          currentRaw = await readFile(mutationTargetPath, "utf-8");
         } catch (error) {
           if (errCode(error) !== "ENOENT") throw error;
         }
 
-        if (currentNormalized === undefined) {
+        if (currentRaw === undefined) {
+          await clearUndo(mutationTargetPath);
           return {
             content: [
               {
@@ -122,7 +137,8 @@ export function regReplaceUndo(pi: ExtensionAPI): void {
             details: {},
           };
         }
-        if (currentNormalized !== undo.resultContent) {
+        if (currentRaw !== undo.bom + restoreEndings(undo.resultContent, undo.originalEnding)) {
+          await clearUndo(mutationTargetPath);
           return {
             content: [
               {
@@ -135,10 +151,13 @@ export function regReplaceUndo(pi: ExtensionAPI): void {
           };
         }
 
+        const { text: currentStripped } = stripBOM(currentRaw);
+        const currentNormalized = toLF(currentStripped);
         const diffResult = genDiff(undo.content, currentNormalized, 0);
         const linesAddedByReplace = cntDiff(diffResult.diff, "+");
         const linesRemovedByReplace = cntDiff(diffResult.diff, "-");
         const restoredRange = changedRange(currentNormalized, undo.content);
+        const undoDiff = genDiff(currentNormalized, undo.content, 1, undo.hashes).diff;
 
         await writeAtomic(
           mutationTargetPath,
@@ -174,6 +193,7 @@ export function regReplaceUndo(pi: ExtensionAPI): void {
             },
           ],
           details: {
+            diff: undoDiff,
             metrics: buildMetrics({
               classification: "applied",
               editsAttempted: 1,

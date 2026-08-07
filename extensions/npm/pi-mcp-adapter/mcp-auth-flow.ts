@@ -7,9 +7,10 @@
 import {
   auth as runSdkAuth,
   extractWWWAuthenticateParams,
+  LATEST_PROTOCOL_VERSION,
   UnauthorizedError,
-} from "@modelcontextprotocol/sdk/client/auth.js"
-import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js"
+  type AuthOptions,
+} from "@modelcontextprotocol/client"
 import open from "open"
 import { McpOAuthProvider, type McpOAuthConfig } from "./mcp-oauth-provider.ts"
 import {
@@ -50,15 +51,17 @@ export interface AuthenticateOptions {
   authStorageOptions?: AuthStorageOptions
   signal?: AbortSignal
   runtime?: McpOAuthRuntime
+  skipIssuerMetadataValidation?: boolean
 }
 
-type AuthDiscovery = {
-  resourceMetadataUrl?: URL
-  scope?: string
-}
+type AuthDiscovery = Pick<AuthOptions, "resourceMetadataUrl" | "scope" | "skipIssuerMetadataValidation">
 
-function applyConfiguredScope(discovery: AuthDiscovery, config: McpOAuthConfig): AuthDiscovery {
-  return config.scope !== undefined ? { ...discovery, scope: config.scope } : discovery
+function applyOAuthConfig(discovery: AuthDiscovery, config: McpOAuthConfig): AuthDiscovery {
+  return {
+    ...discovery,
+    ...(config.scope !== undefined ? { scope: config.scope } : {}),
+    ...(config.skipIssuerMetadataValidation === true ? { skipIssuerMetadataValidation: true } : {}),
+  }
 }
 
 type PendingAuth = {
@@ -208,6 +211,12 @@ export function extractOAuthConfig(definition: ServerEntry): McpOAuthConfig {
     }
     config.clientUri = clientUri
   }
+  if (definition.oauth?.skipIssuerMetadataValidation !== undefined) {
+    if (typeof definition.oauth.skipIssuerMetadataValidation !== "boolean") {
+      throw new Error("OAuth skipIssuerMetadataValidation must be a boolean")
+    }
+    config.skipIssuerMetadataValidation = definition.oauth.skipIssuerMetadataValidation
+  }
   return config
 }
 
@@ -239,7 +248,7 @@ async function probeAuthDiscovery(serverUrl: string, definition?: ServerEntry, s
           clientInfo: { name: "pi-mcp-adapter", version: "2.11.0" },
         },
       }),
-      signal: discoverySignal,
+      ...(discoverySignal ? { signal: discoverySignal } : {}),
     })
     const { resourceMetadataUrl, scope } = extractWWWAuthenticateParams(response)
     await response.body?.cancel().catch(() => {})
@@ -320,7 +329,7 @@ export async function startAuth(
       },
     }, authStorageOptions, runtime.signal)
     try {
-      const discovery = applyConfiguredScope(await probeAuthDiscovery(serverUrl, definition, signal), config)
+      const discovery = applyOAuthConfig(await probeAuthDiscovery(serverUrl, definition, signal), config)
       throwIfAborted(signal)
       const result = await abortable(runSdkAuth(authProvider, { serverUrl, ...discovery }), signal)
       throwIfAborted(signal)
@@ -386,7 +395,7 @@ export async function startAuth(
 
     throwIfAborted(signal)
 
-    const discovery = applyConfiguredScope(await probeAuthDiscovery(serverUrl, definition, signal), config)
+    const discovery = applyOAuthConfig(await probeAuthDiscovery(serverUrl, definition, signal), config)
     throwIfAborted(signal)
     const result = await abortable(runSdkAuth(authProvider, { serverUrl, ...discovery }), signal)
     throwIfAborted(signal)
@@ -606,6 +615,7 @@ export async function completeAuth(
     const result = await abortable(runSdkAuth(pendingAuth.authProvider, {
       serverUrl: pendingAuth.serverUrl,
       authorizationCode: code,
+      ...(iss !== undefined ? { iss } : {}),
       ...pendingAuth.discovery,
     }), signal)
     throwIfAborted(signal)
@@ -658,7 +668,11 @@ export async function authenticate(
 
   const operation = (async (): Promise<AuthStatus> => {
     // Start auth flow
-    const { authorizationUrl } = await startAuth(serverName, serverUrl, definition, { ...options, signal, runtime })
+    const { authorizationUrl } = await startAuth(serverName, serverUrl, definition, {
+      ...options,
+      ...(signal ? { signal } : {}),
+      runtime,
+    })
 
     // If no auth URL needed, already authenticated
     if (!authorizationUrl) {
@@ -701,7 +715,11 @@ export async function authenticate(
       throwIfAborted(signal)
 
       // Complete the auth
-      return await completeAuth(serverName, callbackResult, { ...options, signal, runtime })
+      return await completeAuth(serverName, callbackResult, {
+        ...options,
+        ...(signal ? { signal } : {}),
+        runtime,
+      })
     } catch (error) {
       if (oauthState) cancelPendingCallback(oauthState)
       try {
@@ -773,7 +791,11 @@ export async function getValidToken(
 
         const discovery = await probeAuthDiscovery(serverUrl, undefined, signal)
         throwIfAborted(signal)
-        const result = await abortable(runSdkAuth(authProvider, { serverUrl, ...discovery }), signal)
+        const result = await abortable(runSdkAuth(authProvider, {
+          serverUrl,
+          ...discovery,
+          ...(options.skipIssuerMetadataValidation === true ? { skipIssuerMetadataValidation: true } : {}),
+        }), signal)
         throwIfAborted(signal)
         if (result !== "AUTHORIZED") {
           return null

@@ -10,7 +10,7 @@ Related docs:
 - [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md)
 - Bounded `agent_browser` outcome metadata on `details` (`resultCategory`, `successCategory`, `failureCategory`, optional `nextActions`, optional `pageChangeSummary` with per-step summaries on `batch`): contract in [`TOOL_CONTRACT.md`](TOOL_CONTRACT.md#details); maintainer checklists under “Tool result categories” and “Page-change summaries” in [`../AGENTS.md`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/AGENTS.md)
 - Post-success `get text` selector visibility (`RQ-0074`): optional `details.selectorTextVisibility` / `selectorTextVisibilityAll`, visible warnings, and `inspect-visible-text-candidates*` next actions after read-only visibility probes—[`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md), [`TOOL_CONTRACT.md`](TOOL_CONTRACT.md#details), and [`../AGENTS.md`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/AGENTS.md) maintainer checklist
-- Managed-session outcomes (`RQ-0077`): after extension-managed implicit or fresh `--session` injection reaches process execution, `details.managedSessionOutcome` records the transition (`created` / `replaced` / `unchanged` / `closed` on success; `preserved` / `abandoned` when a plan fails before a new session becomes current). Failing `sessionMode: "fresh"` calls also append model-visible `Managed session outcome: …`—[`TOOL_CONTRACT.md`](TOOL_CONTRACT.md#details), [`COMMAND_REFERENCE.md`](COMMAND_REFERENCE.md), [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md), and [`../AGENTS.md`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/AGENTS.md) maintainer checklist
+- Managed-session outcomes (`RQ-0077`): after extension-managed implicit or fresh `--session` injection reaches process execution, `details.managedSessionOutcome` records the transition (`created` / `replaced` / `unchanged` / `closed` on success; `preserved` / `abandoned` when a plan fails before a new session becomes current). Failing `sessionMode: "fresh"` calls and successful replacements whose old-session close fails also append model-visible `Managed session outcome: …`—[`TOOL_CONTRACT.md`](TOOL_CONTRACT.md#details), [`COMMAND_REFERENCE.md`](COMMAND_REFERENCE.md), [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md), and [`../AGENTS.md`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/AGENTS.md) maintainer checklist
 - Stateful context commands (`cookies`, `storage`, `auth`, `dialog`, `frame`, `state`) and aggregate `batch` results: model-facing `details.data` is summarized or redacted per [`TOOL_CONTRACT.md`](TOOL_CONTRACT.md#details); aggregate `batch` replaces top-level `details.data` with a compact per-step matrix (`success`, argv-redacted `command`, redacted `result` or scrubbed `error`) while full per-step payloads, artifacts, and categories remain on `batchSteps[]`—operational notes in [`COMMAND_REFERENCE.md`](COMMAND_REFERENCE.md#use-stateful-browser-context-commands-safely), assembly in `extensions/agent-browser/lib/results/presentation/batch.ts`
 
 ## Purpose
@@ -38,7 +38,7 @@ For PR-ready local confidence before release-only lifecycle and platform cost, r
 npm run verify -- pre-pr
 ```
 
-`pre-pr` composes the default gate with `npm run verify -- package`: generated docs, clean `dist/` build, TypeScript, the full unit/fake suite, live command-reference sampling, and package-content verification. It intentionally does not run lifecycle, packaged Pi smoke, Crabbox platform smoke, startup-profile, real-upstream, dogfood, or benchmark modes.
+`pre-pr` composes the default gate with `npm run verify -- package`: generated docs, clean `dist/` build, TypeScript, the full unit/fake suite, live command-reference sampling, and package-content verification. It intentionally does not run lifecycle, packaged Pi smoke, Crabbox platform smoke, startup-profile, real-upstream or dogfood modes.
 
 `npm run verify -- release` runs:
 
@@ -49,7 +49,7 @@ npm run verify -- pre-pr
 
 `npm publish` runs npm’s `prepublishOnly` script from `package.json`, which executes the same `npm run verify -- release` gate and then `npm pack --dry-run`. That concatenated gate is everything in the default `npm run verify` step (generated playbook drift, clean `dist/` build, TypeScript, the unit/fake suite, generated command-reference blocks, and live upstream command-reference sampling against the targeted `agent-browser` on `PATH`), the configured-source lifecycle harness, the packaged Pi smoke in `package-pi`, and the release-blocking Crabbox platform matrix. Using `npm publish --ignore-scripts` skips that contract intentionally.
 
-`prepublishOnly` intentionally does **not** run the standalone host-only `npm run verify -- startup-profile`, `npm run verify -- real-upstream`, `npm run verify -- dogfood`, or `npm run verify -- benchmark` modes; those remain separate `npm run verify` modes in [`scripts/project.mjs`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/scripts/project.mjs). The platform matrix includes its own fast target-local build/package gate and browser dogfood suite, and is automated through the `release` slice.
+`prepublishOnly` intentionally does **not** run the standalone host-only `npm run verify -- startup-profile`, `npm run verify -- real-upstream`, `npm run verify -- dogfood` modes; those remain separate `npm run verify` modes in [`scripts/project.mjs`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/scripts/project.mjs). The platform matrix includes its own fast target-local build/package gate and browser dogfood suite, and is automated through the `release` slice.
 
 Run the opt-in startup profiler whenever package layout, the compiled entrypoint, top-level imports, schema registration, or prompt/config startup logic changes:
 
@@ -81,7 +81,7 @@ Every release also requires interactive `tmux`-driven Pi dogfood with the native
 
 When reviewing saved session JSONL after a failed smoke or a `qa` preset that reclassified an upstream-successful batch, expect `agent_browser` tool rows to carry `isError: true` whenever `details.resultCategory` is `failure`. For normal prose output, model-visible text should end with a `Pi tool isError: true` category line; for caller-requested `--json` output, the hook preserves parseable JSON and only patches `isError`. The extension applies that patch on the `tool_result` path so Pi’s transcript matches the wrapper contract ([`TOOL_CONTRACT.md`](TOOL_CONTRACT.md#details)). Preserve a normal Pi session directory for those checks; avoiding `--no-session` keeps this evidence intact ([`AGENTS.md`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/AGENTS.md) preferred validation workflow).
 
-The configured-source lifecycle regression harness is required before release because it launches an interactive `pi` process under `tmux` with `--approve` and validates `/reload`, full relaunch with the same exact Pi 0.79 `--session-id`, managed-session continuity, persisted artifacts, compiled-entrypoint pickup after process restart, and Pi failure-patch behavior. Branch-backed `session_tree` rehydration and cleanup ownership are validated by focused extension harness tests:
+The configured-source lifecycle regression harness is required before release because it launches an interactive Pi 0.84.0+ process under `tmux` with `--approve` and validates `/reload`, full relaunch with the same exact `--session-id`, managed-session continuity, persisted artifacts, compiled-entrypoint pickup after process restart, and Pi failure-patch behavior. Branch-backed `session_tree` rehydration and cleanup ownership are validated by focused extension harness tests:
 
 ```bash
 npm run verify -- lifecycle
@@ -155,17 +155,6 @@ Return a concise PASS/FAIL report with evidence and any tool or workflow issues 
 
 Evaluator expectations after the queued Sauce Demo fixes: the agent should independently choose efficient, safe browser operations; native add-to-cart clicks should mutate cart state without the agent authoring `eval`/DOM-click fallbacks (the wrapper may fail with `details.clickDispatch` when upstream reports click success but no trusted DOM event reached the target); same-snapshot form fills may be batched safely when the agent chooses that route; the selected sort order should be verified; checkout must stop before Finish and must not place the order; the agent must not attempt Finish or another likely final submit action because prompt stop-boundaries are agent responsibility rather than wrapper-enforced business-intent policy; screenshot and recording must use the requested paths or be explicitly reported unavailable, and close should be blocked with `details.promptGuard.reason: "requested-artifacts-missing-before-close"` until required screenshot paths are verified; `network requests` may show public-demo telemetry 401s; `console` may report offline-cache logs; `errors` should show no page errors; and the browser session plus temp artifacts should be cleaned up after evidence is recorded. A run that reaches `checkout-complete.html` or silently substitutes artifact paths is a workflow failure even if other store flow steps work.
 
-## Deterministic agent efficiency benchmark
-
-[`scripts/agent-browser-efficiency-benchmark.mjs`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/scripts/agent-browser-efficiency-benchmark.mjs) is an accounting-only benchmark: it does not shell out to `agent-browser`, launch a browser, or read or write Pi sessions. It models representative `agent_browser` call shapes (including optional `stdin` for `batch` and top-level `job`, `qa`, or experimental `sourceLookup` / `networkSourceLookup` objects that compile to batch) and aggregates success rate, tool-call counts, UTF-8 size of model-visible strings, stale-ref failure and recovery counts, artifact success, distinct failure-category coverage, and summed elapsed-time estimates. When extending scenarios, keep them aligned with the closed `RQ-0068` “no reusable recipe layer” rationale in [`ARCHITECTURE.md`](ARCHITECTURE.md#no-reusable-recipe-layer-yet) (benchmark ids cited there are the canonical inventory for that evidence bar).
-
-- **During development:** `npm run benchmark:agent-browser` prints a Markdown report; `npm run benchmark:agent-browser -- --json` saves machine-readable metrics; `npm run benchmark:agent-browser -- --compare path/to/prior.json` fails with exit code `1` on regressions (see the script’s `--help` for exit codes). Optional `--sample-jsonl path/to/session.jsonl` adds a `jsonlSample` section with real UTF-8 byte totals and per-workflow/overall p95 sizes for model-visible `agent_browser` tool-result text without changing deterministic scenario metrics; comparison ignores `jsonlSample` blocks.
-- **Default gate:** `npm run verify` checks generated playbook drift, clean-builds `dist/`, runs `tsc --noEmit`, runs the full unit/fake suite under `test/**/*.test.ts` with Node test concurrency pinned to `1` (including [`test/agent-browser.efficiency-benchmark.test.ts`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/test/agent-browser.efficiency-benchmark.test.ts) for scenario coverage and comparison behavior), verifies generated command-reference baseline blocks, and samples live upstream command-reference tokens. It does not spawn the standalone benchmark script’s JSON/Markdown run; that is what the opt-in slice below adds.
-- **Pre-PR gate:** `npm run verify -- pre-pr` runs the default gate plus `npm run verify -- package` for larger handoffs that need package-content confidence without lifecycle, platform, real-upstream, dogfood, or benchmark cost.
-- **Opt-in slice:** `npm run verify -- benchmark` runs the benchmark script once with `--json` and then that same test module alone. It is intentionally **not** part of `npm run verify -- pre-pr` or `npm run verify -- release`, so routine handoff and publish gates stay decoupled from benchmark churn while still allowing a focused check after editing scenarios or `CURRENT_BENCHMARK_VERSION`.
-
-Maintainer constraints for evolving scenarios and version bumps are summarized under “Agent browser efficiency benchmark” in [`../AGENTS.md`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/AGENTS.md).
-
 ## What package verification checks
 
 `npm run verify -- package` confirms that:
@@ -176,7 +165,7 @@ Maintainer constraints for evolving scenarios and version bumps are summarized u
 - `npm pack --json --dry-run` runs the package `prepare` build once and packs the compiled `dist/extensions/agent-browser/index.js` entrypoint
 - GitHub/source installs use the same `prepare` build; when Pi installs with `npm install --omit=dev`, `scripts/prepare.mjs` installs source-build dev dependencies with lifecycle scripts disabled before building so Pi can load the ignored compiled entrypoint from a fresh clone
 - the package-level doctor command and capability baseline are present
-- compiled extension runtime files are present, including the split result-rendering modules required by the published facade
+- compiled extension runtime files are present, including the split result-rendering modules required by the compiled extension entrypoint
 - source-only, agent-only, and superseded docs are absent from the tarball
 
 `npm run verify -- package-pi` runs the same package-content checks and additionally confirms that:
@@ -192,7 +181,6 @@ The packaged execution smoke intentionally uses a temporary fake `agent-browser`
 Current forbidden packed files include:
 
 - `AGENTS.md`
-- internal planning docs under `docs/plans/`
 - `.pi/extensions/agent-browser.ts`
 - TypeScript extension source and other test/repo-only maintenance files
 

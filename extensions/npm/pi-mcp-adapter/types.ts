@@ -1,6 +1,11 @@
 // types.ts - Core type definitions
-import type { Transport as McpTransport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { ContentBlock as McpContentBlock } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  ContentBlock as McpContentBlock,
+  ListPromptsResult,
+  ListResourcesResult,
+  ListToolsResult,
+  Transport as McpTransport,
+} from "@modelcontextprotocol/client";
 import type { TextContent, ImageContent } from "@earendil-works/pi-ai";
 import type { UiStreamMode } from "./ui-stream-types.ts";
 import type { UiToolVisibility } from "./ui-tool-visibility.ts";
@@ -48,36 +53,41 @@ export type ImportKind =
   | "windsurf" 
   | "vscode";
 
-// Tool definition from MCP server
+type SdkTool = ListToolsResult["tools"][number];
+type SdkResource = ListResourcesResult["resources"][number];
+type SdkPrompt = ListPromptsResult["prompts"][number];
+type SdkPromptArgument = NonNullable<SdkPrompt["arguments"]>[number];
+
+// MCP wire definitions derive their field types from the installed SDK while
+// retaining the adapter's deliberately smaller public surface.
 export interface McpTool {
-  name: string;
-  title?: string;
-  description?: string;
-  inputSchema?: unknown; // JSON Schema
-  _meta?: Record<string, unknown>;
+  name: SdkTool["name"];
+  title?: SdkTool["title"];
+  description?: SdkTool["description"];
+  inputSchema?: SdkTool["inputSchema"]; // JSON Schema
+  _meta?: SdkTool["_meta"];
 }
 
-// Resource definition from MCP server
 export interface McpResource {
-  uri: string;
-  name: string;
-  description?: string;
-  mimeType?: string;
-  _meta?: Record<string, unknown>;
+  uri: SdkResource["uri"];
+  name: SdkResource["name"];
+  description?: SdkResource["description"];
+  mimeType?: SdkResource["mimeType"];
+  _meta?: SdkResource["_meta"];
 }
 
 export interface McpPromptArgument {
-  name: string;
-  description?: string;
-  required?: boolean;
+  name: SdkPromptArgument["name"];
+  description?: SdkPromptArgument["description"];
+  required?: SdkPromptArgument["required"];
 }
 
 export interface McpPrompt {
-  name: string;
-  title?: string;
-  description?: string;
-  arguments?: McpPromptArgument[];
-  _meta?: Record<string, unknown>;
+  name: SdkPrompt["name"];
+  title?: SdkPrompt["title"];
+  description?: SdkPrompt["description"];
+  arguments?: SdkPrompt["arguments"];
+  _meta?: SdkPrompt["_meta"];
 }
 
 export interface UiResourceMeta {
@@ -340,6 +350,8 @@ export interface OAuthConfig {
   clientName?: string;
   /** Client homepage URI for dynamic registration */
   clientUri?: string;
+  /** Security-weakening escape hatch for known-misconfigured authorization servers. */
+  skipIssuerMetadataValidation?: boolean;
 }
 
 // Server configuration
@@ -387,6 +399,20 @@ export interface ServerEntry {
   debug?: boolean;  // Show server stderr (default: false)
   /** Enable metadata-only JSONL protocol tracing for this server. */
   trace?: boolean;
+  /** Force a specific HTTP MCP transport. Used by Agent Plugins, whose `type` declares the transport and forbids client fallback. */
+  httpTransport?: "streamable-http" | "sse";
+  /** Client-managed persistent data directory for Agent Plugin stdio servers. */
+  pluginDataDir?: string;
+  /** Treat env values as already resolved literals. Used for Agent Plugin env rules. */
+  literalEnv?: boolean;
+  /**
+   * MCP protocol era negotiation for this server. Defaults to `"legacy"`
+   * (byte-equivalent to pre-2026 behavior — no `versionNegotiation` is sent).
+   * `"auto"` offers the SDK's default 2026-07-28+ modern versions with
+   * legacy fallback; `"2026-07-28"` pins the connection to that revision
+   * with no fallback. `auto` and `2026-07-28` must be set explicitly.
+   */
+  protocolVersion?: "legacy" | "auto" | "2026-07-28";
   // Keep configuration visible without allowing connections or execution.
   disabled?: boolean;
 }
@@ -422,6 +448,23 @@ export interface McpTraceSettings {
   maxEvents?: number;
 }
 
+export const MCP_TOOL_APPROVAL_REQUEST_EVENT = "pi-mcp-adapter:tool-approval-request" as const;
+
+export type McpToolApprovalOrigin = "proxy" | "direct" | "script" | "resource" | "iframe";
+export type McpToolApprovalDecision = "allow_once" | "allow_for_session" | "deny" | "abstain";
+export type McpToolApprovalHandler = () => McpToolApprovalDecision | Promise<McpToolApprovalDecision>;
+
+export interface McpToolApprovalRequest {
+  requestId: string;
+  serverName: string;
+  originalToolName: string;
+  prefixedToolName: string;
+  args: Record<string, unknown>;
+  origin: McpToolApprovalOrigin;
+  signal?: AbortSignal;
+  claim(handler: McpToolApprovalHandler): boolean;
+}
+
 export interface McpSettings {
   toolPrefix?: ToolPrefix;
   /** Show the plug prefix in MCP status and connection text (default: true). Set to false to disable it. */
@@ -430,6 +473,8 @@ export interface McpSettings {
   mcpFooterStatus?: McpFooterStatus;
   /** Discover detected host-specific MCP configs only when explicitly enabled. */
   hostConfigDiscovery?: HostConfigDiscovery;
+  /** Agent Plugin package directories to load MCP servers from. */
+  agentPluginPaths?: string[];
   idleTimeout?: number; // minutes, default 10, 0 to disable
   requestTimeoutMs?: number; // milliseconds, overrides the SDK request timeout when > 0
   directTools?: boolean;
@@ -620,6 +665,48 @@ export function resolveToolPrefix(
   globalPrefix?: ToolPrefix,
 ): ToolPrefix {
   return definition?.toolPrefix ?? globalPrefix ?? "server";
+}
+
+
+/**
+ * Resolve a configured MCP server name from a prefixed tool name.
+ *
+ * When the proxy tool is addressed with a fully-qualified name such as
+ * `searxng_searxng_web_search`, downstream policy systems (for example a
+ * permission gate) need to recover the owning server so they can evaluate
+ * server-scoped rules against the bare server name. This performs the inverse
+ * of {@link getServerPrefix}: it finds the longest configured server prefix
+ * that the tool name starts with and returns that server's name.
+ *
+ * @param toolName - the tool name as passed to the proxy `mcp({ tool })` call.
+ * @param serverNames - the configured MCP server names (keys of `mcpServers`).
+ * @param prefix - the active tool-prefix mode.
+ * @returns the resolved server name, or `undefined` when no prefix matches or
+ *   the prefix mode is `"none"`.
+ */
+export function resolveServerFromToolName(
+  toolName: string,
+  serverNames: Iterable<string>,
+  prefix: ToolPrefix,
+): string | undefined {
+  if (prefix === "none") return undefined;
+  const candidates: { name: string; prefix: string }[] = [];
+  for (const name of serverNames) {
+    const p = getServerPrefix(name, prefix);
+    if (p && toolName.startsWith(p + "_")) candidates.push({ name, prefix: p });
+  }
+  if (candidates.length === 0) return undefined;
+  candidates.sort((a, b) => b.prefix.length - a.prefix.length);
+  const best = candidates[0];
+  // Fail safe: two distinct server names can normalize to the same prefix
+  // (e.g. my-server and my_server both -> my_server under "server" mode).
+  // When that happens the owning server is ambiguous; return undefined so a
+  // downstream permission gate falls back to its existing wildcard path rather
+  // than enforcing a rule against the wrong server.
+  if (candidates.some((c) => c.prefix === best!.prefix && c.name !== best!.name)) {
+    return undefined;
+  }
+  return best?.name;
 }
 
 export function sanitizePromptName(name: string): string {

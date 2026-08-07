@@ -4,7 +4,7 @@ import type {
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import { defineMenu, type MenuContext, type RunMenuResult, runMenu } from "@narumitw/pi-tui-kit";
+import type { MenuContext, RunMenuResult } from "@narumitw/pi-tui-kit";
 import {
 	type BtwSettings,
 	btwSettingsPath,
@@ -51,6 +51,8 @@ export async function showBtwCommandMenu(
 	options: ShowBtwCommandMenuOptions,
 ): Promise<BtwCommandMenuResult> {
 	if (ctx.mode !== "tui") return "closed";
+	const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
+	if (ctx.signal?.aborted) return "closed";
 	const settingsPath = options.settingsPath ?? btwSettingsPath();
 	const readSettings = options.readSettings ?? readBtwSettings;
 	const updateSettings = options.updateSettings ?? updateBtwSettings;

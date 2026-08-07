@@ -1,11 +1,11 @@
 import { createConnection, type Socket } from "node:net";
-import { ReadBuffer, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { ReadBuffer, serializeMessage } from "@modelcontextprotocol/client";
+import type { Transport } from "@modelcontextprotocol/client";
+import type { JSONRPCMessage } from "@modelcontextprotocol/client";
 
 /** MCP JSONL transport for an explicitly configured Unix-domain socket. */
 export class UnixSocketClientTransport implements Transport {
-  private socket?: Socket;
+  private socket: Socket | undefined;
   private readonly readBuffer = new ReadBuffer();
 
   onclose?: () => void;

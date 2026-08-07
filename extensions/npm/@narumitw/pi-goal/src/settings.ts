@@ -27,7 +27,7 @@ export const DEFAULT_GOAL_SETTINGS: GoalSettings = {
 	toolVisibility: "always",
 	experimental: { goals: false },
 	rpc: { enabled: false },
-	continuationLimits: { automaticTurns: null, noProgressTurns: 3 },
+	continuationLimits: { automaticTurns: 25, noProgressTurns: 3 },
 };
 
 export type GoalSettingsLoadResult =

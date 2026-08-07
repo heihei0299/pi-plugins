@@ -1,5 +1,4 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
 import {
 	type CompletionDelivery,
 	type ConsultationCwdPolicy,
@@ -124,6 +123,9 @@ async function showSubagentManager(
 		return;
 	}
 	const generation = owner.generation;
+	const isCurrent = () => generation === owner.generation && !owner.controller.signal.aborted;
+	const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
+	if (!isCurrent()) return;
 	let availableAgents = discoverAgents(ctx.cwd, "user", readSubagentSettings() ?? {}).agents;
 	let toolDraft: ToolDraft | undefined;
 	type Screen =
@@ -482,7 +484,7 @@ async function showSubagentManager(
 	await runMenu(ctx, menu, {
 		getState: () => undefined,
 		signal: owner.controller.signal,
-		isCurrent: () => generation === owner.generation && !owner.controller.signal.aborted,
+		isCurrent,
 	});
 }
 
@@ -502,6 +504,9 @@ async function showSubagentSettings(
 		return;
 	}
 	const generation = owner.generation;
+	const isCurrent = () => generation === owner.generation && !owner.controller.signal.aborted;
+	const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
+	if (!isCurrent()) return;
 	type SettingsAction =
 		| "set-completion"
 		| "set-consult-resources"
@@ -521,7 +526,7 @@ async function showSubagentSettings(
 	await runMenu(ctx, menu, {
 		getState: () => undefined,
 		signal: owner.controller.signal,
-		isCurrent: () => generation === owner.generation && !owner.controller.signal.aborted,
+		isCurrent,
 	});
 }
 

@@ -29,6 +29,9 @@ import {
 	type GoalSettings,
 	type GoalSettingsLoadIssue,
 } from "./settings.js";
+import { GoalToolPolicy, type GoalToolVisibilitySnapshot } from "./tool-policy.js";
+
+export { GOAL_BLOCKED_TOOL, GOAL_COMPLETE_TOOL, GOAL_TOOL_NAMES } from "./tool-policy.js";
 
 export interface ContinuationTicket {
 	goalId: string;
@@ -59,6 +62,39 @@ export interface CompletedGoalRun {
 	toolAttempted: boolean;
 }
 
+type StoppedGoalStatus = "paused" | "blocked" | "usage_limited" | "budget_limited";
+
+export type GoalStopRequest =
+	| { kind: "explicit_pause"; expectedGoalId: string }
+	| { kind: "budget_limit"; expectedGoalId: string; reason: string }
+	| {
+			kind: "safety_pause";
+			expectedGoalId: string;
+			cause: SafetyPauseCause;
+			abortTurn: boolean;
+			reason: string;
+	  }
+	| { kind: "retry_exhausted"; expectedGoalId: string; reason: string }
+	| {
+			kind: "tools_unavailable";
+			expectedGoalId: string;
+			abortTurn: boolean;
+			recordUsage: boolean;
+	  }
+	| { kind: "blocker_report"; expectedGoalId: string; reason: string }
+	| {
+			kind: "agent_interruption";
+			expectedGoalId: string;
+			status: "paused" | "blocked" | "usage_limited";
+			reason: string;
+	  }
+	| {
+			kind: "activation_rollback";
+			expectedGoalId: string;
+			restoreGoal: ActiveGoal;
+			abortTurn: boolean;
+	  };
+
 export interface StatusContext {
 	cwd: string;
 	mode?: "tui" | "rpc" | "json" | "print";
@@ -73,17 +109,8 @@ export interface StatusContext {
 	sessionManager?: unknown;
 }
 
-export interface GoalToolVisibilitySnapshot {
-	activeTools: string[];
-	goalToolsUnlocked: boolean;
-	goalToolsHiddenByPolicy: string[];
-}
-
 export const STATUS_KEY = "goal";
 export const GOAL_STATE_ENTRY_TYPE = "goal-state";
-export const GOAL_COMPLETE_TOOL = "goal_complete";
-export const GOAL_BLOCKED_TOOL = "goal_blocked";
-export const GOAL_TOOL_NAMES = [GOAL_COMPLETE_TOOL, GOAL_BLOCKED_TOOL] as const;
 
 /** Canonical Goal state passed to the in-process managed-run publisher. */
 export type GoalStateSnapshotStatus = GoalStatus | "cleared";
@@ -160,10 +187,11 @@ const CONTRADICTORY_COMPLETION_PATTERNS = [
 // One instance belongs to one extension factory. It owns all mutable session state
 // and the cross-cutting invariants used by command and lifecycle orchestration.
 // Keep this state machine cohesive despite its size: prompt ownership, continuation,
-// budget, safety, and tool-policy transitions share ordering-sensitive invariants.
+// budget, safety, and queue transitions share ordering-sensitive invariants. Tool visibility is
+// delegated to GoalToolPolicy.
 // Cohesion justification: Goal transitions, continuation ownership, queue state, and budget/retry
-// recovery share one generation-guarded runtime; separating them would duplicate stale-turn and
-// persistence invariants across modules.
+// recovery share one generation-guarded runtime; separating them further would duplicate stale-turn
+// and persistence invariants across modules.
 export class GoalRuntime {
 	settings: GoalSettings = DEFAULT_GOAL_SETTINGS;
 	settingsLoadIssue?: GoalSettingsLoadIssue;
@@ -186,10 +214,7 @@ export class GoalRuntime {
 	agentRunToolAttempted = false;
 	guardAbortGoalId?: string;
 	staleGoalToolCallsBlocked = false;
-	/** Once true, goal tools stay in the active set for this runtime (prompt-cache stable). */
-	goalToolsUnlocked = false;
-	/** Exact lazy goal tools this runtime removed and may restore on a mode change. */
-	goalToolsHiddenByPolicy = new Set<string>();
+	readonly toolPolicy: GoalToolPolicy;
 	pendingGoalPromptMarkers = new Map<string, PendingGoalPrompt>();
 	claimedGoalPromptMarkers = new Set<string>();
 	cancelledContinuationMarkers = new Set<string>();
@@ -202,6 +227,7 @@ export class GoalRuntime {
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
+		this.toolPolicy = new GoalToolPolicy(pi);
 	}
 
 	setGoalStateSink(sink: ((snapshot: GoalStateSnapshot) => void) | undefined) {
@@ -318,7 +344,7 @@ export class GoalRuntime {
 	dispatchContinuationIfSettled(ctx: StatusContext) {
 		const intent = this.continuationIntent;
 		if (!intent) return false;
-		if (this.activeGoal?.status === "active" && !this.goalToolsAvailable()) {
+		if (this.activeGoal?.status === "active" && !this.toolPolicy.toolsAvailable()) {
 			this.pauseGoalForUnavailableTools(ctx);
 			return false;
 		}
@@ -360,7 +386,103 @@ export class GoalRuntime {
 
 	updateStatus(ctx: StatusContext, goal: ActiveGoal) {
 		this.clearCompletionStatusTimer();
-		ctx.ui.setStatus(STATUS_KEY, formatStatus(goal));
+		ctx.ui.setStatus(
+			STATUS_KEY,
+			formatStatus(goal, this.settings.continuationLimits.automaticTurns),
+		);
+	}
+
+	stopActiveGoal(ctx: StatusContext, request: GoalStopRequest) {
+		const currentGoal = this.activeGoal;
+		if (!currentGoal || currentGoal.id !== request.expectedGoalId) return undefined;
+
+		let goal = currentGoal;
+		let status: StoppedGoalStatus;
+		let terminalReason: string | undefined;
+		switch (request.kind) {
+			case "explicit_pause":
+				this.recordGoalUsage(goal, ctx);
+				this.cancelContinuationWork();
+				this.clearGoalRecoveryForGoal(goal.id);
+				this.clearBudgetWrapUp();
+				this.blockStaleGoalToolCalls();
+				abortCurrentTurn(ctx);
+				status = "paused";
+				break;
+			case "budget_limit":
+				this.cancelContinuationWork();
+				this.clearGoalRecoveryForGoal(goal.id);
+				this.clearBudgetWrapUp();
+				status = "budget_limited";
+				terminalReason = request.reason;
+				break;
+			case "safety_pause":
+				this.cancelContinuationWork();
+				this.clearGoalRecoveryForGoal(goal.id);
+				this.clearBudgetWrapUp();
+				this.blockStaleGoalToolCalls();
+				if (request.abortTurn) {
+					this.guardAbortGoalId = goal.id;
+					abortCurrentTurn(ctx);
+				}
+				goal = { ...goal, safetyPauseCause: request.cause };
+				status = "paused";
+				terminalReason = request.reason;
+				break;
+			case "retry_exhausted":
+				this.clearGoalRecoveryForGoal(goal.id);
+				this.cancelContinuationWork();
+				this.clearBudgetWrapUp();
+				this.blockStaleGoalToolCalls();
+				status = "blocked";
+				terminalReason = request.reason;
+				break;
+			case "tools_unavailable":
+				if (request.recordUsage) this.recordGoalUsage(goal, ctx);
+				this.cancelContinuationWork();
+				this.clearGoalRecoveryForGoal(goal.id);
+				this.clearBudgetWrapUp();
+				if (request.abortTurn) {
+					this.blockStaleGoalToolCalls();
+					abortCurrentTurn(ctx);
+				} else {
+					this.clearStaleGoalToolCallBlock();
+				}
+				status = "paused";
+				break;
+			case "blocker_report":
+				this.recordGoalUsage(goal, ctx);
+				this.cancelContinuationWork();
+				this.clearBudgetWrapUp();
+				this.clearGoalRecoveryForGoal(goal.id);
+				this.blockStaleGoalToolCalls();
+				status = "blocked";
+				terminalReason = request.reason;
+				break;
+			case "agent_interruption":
+				this.cancelContinuationWork();
+				this.clearBudgetWrapUp();
+				this.blockStaleGoalToolCalls();
+				abortCurrentTurn(ctx);
+				status = request.status;
+				terminalReason = request.reason;
+				break;
+			case "activation_rollback":
+				goal = request.restoreGoal;
+				if (request.abortTurn) abortCurrentTurn(ctx);
+				this.blockStaleGoalToolCalls();
+				status = "paused";
+				break;
+		}
+
+		this.activeGoal = transitionGoal(goal, status);
+		if (terminalReason !== undefined) this.setTerminalReason(this.activeGoal.id, terminalReason);
+		const stoppedGoal = this.activeGoal;
+		this.persistGoal(stoppedGoal);
+		if (this.activeGoal?.id === stoppedGoal.id && this.activeGoal.status === stoppedGoal.status) {
+			this.updateStatus(ctx, stoppedGoal);
+		}
+		return stoppedGoal;
 	}
 
 	blockStaleGoalToolCalls() {
@@ -450,18 +572,14 @@ export class GoalRuntime {
 			return false;
 		}
 
-		this.cancelContinuationWork();
-		this.clearGoalRecoveryForGoal(goal.id);
-		this.clearBudgetWrapUp();
-		this.activeGoal = transitionGoal(goal, "budget_limited");
-		this.setTerminalReason(
-			this.activeGoal.id,
-			`token budget reached (${formatBudget(this.activeGoal)})`,
-		);
-		this.persistGoal(this.activeGoal);
-		this.updateStatus(ctx, this.activeGoal);
-		ctx.ui.notify(`Goal token budget reached: ${formatBudget(this.activeGoal)}`, "warning");
-		if (sendWrapUp) this.queueBudgetWrapUp(ctx, this.activeGoal);
+		const stoppedGoal = this.stopActiveGoal(ctx, {
+			kind: "budget_limit",
+			expectedGoalId: goal.id,
+			reason: `token budget reached (${formatBudget(goal)})`,
+		});
+		if (!stoppedGoal) return false;
+		ctx.ui.notify(`Goal token budget reached: ${formatBudget(stoppedGoal)}`, "warning");
+		if (sendWrapUp) this.queueBudgetWrapUp(ctx, stoppedGoal);
 		return true;
 	}
 
@@ -519,27 +637,23 @@ export class GoalRuntime {
 	pauseGoalForSafety(ctx: StatusContext, cause: SafetyPauseCause, abortTurn: boolean) {
 		const goal = this.activeGoal;
 		if (goal?.status !== "active") return false;
-		this.cancelContinuationWork();
-		this.clearGoalRecoveryForGoal(goal.id);
-		this.clearBudgetWrapUp();
-		this.blockStaleGoalToolCalls();
-		if (abortTurn) {
-			this.guardAbortGoalId = goal.id;
-			abortCurrentTurn(ctx);
-		}
-		this.activeGoal = transitionGoal({ ...goal, safetyPauseCause: cause }, "paused");
+		const automaticLimit = this.settings.continuationLimits.automaticTurns;
 		const count =
 			cause === "continuation_limit"
-				? `${this.activeGoal.automaticModelTurns} automatic model responses`
-				: `no progress across ${this.activeGoal.toolFreeRepeatCount} automatic runs`;
-		this.setTerminalReason(
-			this.activeGoal.id,
-			`${cause} (${count}; ${formatTokenCount(this.activeGoal.tokensUsed)} tokens)`,
-		);
-		this.persistGoal(this.activeGoal);
-		this.updateStatus(ctx, this.activeGoal);
+				? `${goal.automaticModelTurns} of ${automaticLimit ?? "Unlimited"} automatic model responses`
+				: `no progress across ${goal.toolFreeRepeatCount} automatic runs`;
+		const stoppedGoal = this.stopActiveGoal(ctx, {
+			kind: "safety_pause",
+			expectedGoalId: goal.id,
+			cause,
+			abortTurn,
+			reason: `${cause} (${count}; ${formatTokenCount(goal.tokensUsed)} tokens)`,
+		});
+		if (!stoppedGoal) return false;
 		ctx.ui.notify(
-			`Goal paused: ${count}; ${formatTokenCount(this.activeGoal.tokensUsed)} cumulative tokens. Run /goal resume to continue.`,
+			cause === "continuation_limit"
+				? `Automatic-work limit reached: ${stoppedGoal.automaticModelTurns} of ${automaticLimit} responses. Goal progress is saved with ${formatTokenCount(stoppedGoal.tokensUsed)} cumulative tokens. Open /goal to review and continue.`
+				: `Goal paused: ${count}; ${formatTokenCount(stoppedGoal.tokensUsed)} cumulative tokens. Open /goal to review and continue.`,
 			"warning",
 		);
 		return true;
@@ -561,14 +675,13 @@ export class GoalRuntime {
 		this.goalRecovery = undefined;
 		const goal = this.activeGoal;
 		if (goal?.id !== recovery.goalId || goal.status !== "active") return false;
-		this.cancelContinuationWork();
-		this.clearBudgetWrapUp();
-		this.blockStaleGoalToolCalls();
-		this.activeGoal = transitionGoal(goal, "blocked");
 		const details = recovery.errorMessage ? `: ${truncateNotification(recovery.errorMessage)}` : "";
-		this.setTerminalReason(this.activeGoal.id, `agent error after retries${details}`);
-		this.persistGoal(this.activeGoal);
-		this.updateStatus(ctx, this.activeGoal);
+		const stoppedGoal = this.stopActiveGoal(ctx, {
+			kind: "retry_exhausted",
+			expectedGoalId: goal.id,
+			reason: `agent error after retries${details}`,
+		});
+		if (!stoppedGoal) return false;
 		ctx.ui.notify(
 			`Goal blocked after agent error retries were exhausted${details}. Resolve the blocker or run /goal resume to retry.`,
 			"warning",
@@ -786,99 +899,8 @@ export class GoalRuntime {
 		this.queueFreezeAwaitingSettle = false;
 		this.clearPersistedGoal(ctx.cwd, clearedGoal, reason);
 		ctx.ui.setStatus(STATUS_KEY, undefined);
-		// Do not clear goalToolsUnlocked: after first activation, keep tools visible
-		// for the rest of this extension runtime to avoid repeated goal-tool schema
-		// churn within the same runtime.
-	}
-
-	isGoalToolName(name: string) {
-		return (GOAL_TOOL_NAMES as readonly string[]).includes(name);
-	}
-
-	goalToolsAvailable() {
-		const active = new Set(this.pi.getActiveTools());
-		return GOAL_TOOL_NAMES.every((name) => active.has(name));
-	}
-
-	hideGoalToolsIfLocked() {
-		if (this.goalToolsUnlocked) return;
-		const active = this.pi.getActiveTools();
-		const hidden = active.filter((name) => this.isGoalToolName(name));
-		if (hidden.length === 0) return;
-		this.pi.setActiveTools(active.filter((name) => !this.isGoalToolName(name)));
-		for (const name of hidden) this.goalToolsHiddenByPolicy.add(name);
-	}
-
-	restoreGoalToolsHiddenByPolicy() {
-		const activeBeforeRestore = this.pi.getActiveTools();
-		const activeSet = new Set(activeBeforeRestore);
-		const missingOwnedTools = [...this.goalToolsHiddenByPolicy].filter(
-			(name) => !activeSet.has(name),
-		);
-		if (missingOwnedTools.length === 0) {
-			this.goalToolsHiddenByPolicy.clear();
-			return;
-		}
-		try {
-			this.pi.setActiveTools([...activeBeforeRestore, ...missingOwnedTools]);
-			const restored = new Set(this.pi.getActiveTools());
-			if (missingOwnedTools.some((name) => !restored.has(name))) {
-				throw new Error("the active tool policy rejected a previously hidden goal tool");
-			}
-			this.goalToolsHiddenByPolicy.clear();
-		} catch (error) {
-			this.pi.setActiveTools(activeBeforeRestore);
-			throw error;
-		}
-	}
-
-	assertGoalToolsAvailable() {
-		if (this.goalToolsAvailable()) return;
-		throw new Error(
-			"goal_complete and goal_blocked are unavailable; include them in the active tool allowlist or leave the restrictive tool mode first.",
-		);
-	}
-
-	ensureGoalToolsVisible() {
-		const active = this.pi.getActiveTools();
-		const activeSet = new Set(active);
-		const missing = GOAL_TOOL_NAMES.filter((name) => !activeSet.has(name));
-		if (missing.length > 0) this.pi.setActiveTools([...active, ...missing]);
-		this.assertGoalToolsAvailable();
-	}
-
-	prepareGoalToolsForActivation(ctx: StatusContext) {
-		if (this.settings.toolVisibility === "after-first-goal") {
-			if (!this.goalToolsAvailable() && ctx.isIdle?.() !== true) {
-				throw new Error("wait until Pi is idle before revealing the goal tools");
-			}
-			this.revealGoalTools();
-			return;
-		}
-		this.assertGoalToolsAvailable();
-	}
-
-	/** Mark lazy tools permanently desired for this runtime and make them active now. */
-	revealGoalTools() {
-		const activeBeforeReveal = this.pi.getActiveTools();
-		const wasUnlocked = this.goalToolsUnlocked;
-		try {
-			this.ensureGoalToolsVisible();
-			this.goalToolsUnlocked = true;
-			this.goalToolsHiddenByPolicy.clear();
-		} catch (error) {
-			this.pi.setActiveTools(activeBeforeReveal);
-			this.goalToolsUnlocked = wasUnlocked;
-			throw error;
-		}
-	}
-
-	snapshotGoalToolVisibility(): GoalToolVisibilitySnapshot {
-		return {
-			activeTools: this.pi.getActiveTools(),
-			goalToolsUnlocked: this.goalToolsUnlocked,
-			goalToolsHiddenByPolicy: [...this.goalToolsHiddenByPolicy],
-		};
+		// Do not relock toolPolicy: after first activation, keep tools visible for the
+		// rest of this extension runtime to avoid repeated tool-schema churn.
 	}
 
 	snapshotSettingsApplicationState(): GoalSettingsRuntimeSnapshot {
@@ -899,7 +921,7 @@ export class GoalRuntime {
 			staleGoalToolCallsBlocked: this.staleGoalToolCallsBlocked,
 			cancelledContinuationMarkers: [...this.cancelledContinuationMarkers],
 			terminalDetails: this.terminalDetails ? structuredClone(this.terminalDetails) : undefined,
-			toolVisibility: this.snapshotGoalToolVisibility(),
+			toolVisibility: this.toolPolicy.snapshot(),
 		};
 	}
 
@@ -922,34 +944,19 @@ export class GoalRuntime {
 		this.terminalDetails = snapshot.terminalDetails
 			? structuredClone(snapshot.terminalDetails)
 			: undefined;
-		this.restoreGoalToolVisibility(snapshot.toolVisibility);
-	}
-
-	restoreGoalToolVisibility(snapshot: GoalToolVisibilitySnapshot) {
-		this.pi.setActiveTools(snapshot.activeTools);
-		this.goalToolsUnlocked = snapshot.goalToolsUnlocked;
-		this.goalToolsHiddenByPolicy.clear();
-		for (const name of snapshot.goalToolsHiddenByPolicy) {
-			this.goalToolsHiddenByPolicy.add(name);
-		}
+		this.toolPolicy.restore(snapshot.toolVisibility);
 	}
 
 	pauseGoalForUnavailableTools(ctx: StatusContext, abortTurn = true, recordUsage = true) {
 		const goal = this.activeGoal;
 		if (goal?.status !== "active") return false;
-		if (recordUsage) this.recordGoalUsage(goal, ctx);
-		this.cancelContinuationWork();
-		this.clearGoalRecoveryForGoal(goal.id);
-		this.clearBudgetWrapUp();
-		if (abortTurn) {
-			this.blockStaleGoalToolCalls();
-			abortCurrentTurn(ctx);
-		} else {
-			this.clearStaleGoalToolCallBlock();
-		}
-		this.activeGoal = transitionGoal(goal, "paused");
-		this.persistGoal(this.activeGoal);
-		this.updateStatus(ctx, this.activeGoal);
+		const stoppedGoal = this.stopActiveGoal(ctx, {
+			kind: "tools_unavailable",
+			expectedGoalId: goal.id,
+			abortTurn,
+			recordUsage,
+		});
+		if (!stoppedGoal) return false;
 		ctx.ui.notify(
 			"Goal tools are unavailable, so the active goal was paused. Restore the tools and run /goal resume.",
 			"warning",
@@ -1071,16 +1078,32 @@ export function incrementGoal(goal: ActiveGoal): ActiveGoal {
 	return { ...goal, iteration: goal.iteration + 1, updatedAt: Date.now() };
 }
 
-export function formatStatus(goal: ActiveGoal | undefined) {
+export function formatStatus(
+	goal: ActiveGoal | undefined,
+	automaticTurnLimit: number | null = DEFAULT_GOAL_SETTINGS.continuationLimits.automaticTurns,
+) {
 	if (!goal) return undefined;
 	if (goal.status === "complete") return "complete";
-	if (goal.status === "queued") return "queued";
-	if (goal.status === "paused") return "paused";
-	if (goal.status === "blocked") return "blocked";
-	if (goal.status === "usage_limited") return "usage";
-	if (goal.status === "budget_limited") return `budget ${formatBudget(goal)}`;
-	if (goal.tokenBudget !== undefined) return `active ${formatBudget(goal)}`;
-	return `active ${formatDuration(goal.timeUsedSeconds)}`;
+	const automatic =
+		automaticTurnLimit === null
+			? "automatic Unlimited"
+			: `automatic ${goal.automaticModelTurns}/${automaticTurnLimit}`;
+	if (goal.status === "queued") return `queued · ${automatic}`;
+	if (goal.status === "paused" && goal.safetyPauseCause === "continuation_limit") {
+		if (automaticTurnLimit === null) {
+			return `paused · previous automatic limit at ${goal.automaticModelTurns}`;
+		}
+		if (goal.automaticModelTurns < automaticTurnLimit) {
+			return `paused · automatic ${goal.automaticModelTurns}/${automaticTurnLimit}`;
+		}
+		return `paused · automatic limit ${goal.automaticModelTurns}/${automaticTurnLimit}`;
+	}
+	if (goal.status === "paused") return `paused · ${automatic}`;
+	if (goal.status === "blocked") return `blocked · ${automatic}`;
+	if (goal.status === "usage_limited") return `usage · ${automatic}`;
+	if (goal.status === "budget_limited") return `budget ${formatBudget(goal)} · ${automatic}`;
+	if (goal.tokenBudget !== undefined) return `active ${formatBudget(goal)} · ${automatic}`;
+	return `active ${formatDuration(goal.timeUsedSeconds)} · ${automatic}`;
 }
 
 export function formatBudget(goal: ActiveGoal) {
@@ -1093,18 +1116,23 @@ export function goalSummary(
 	experimentalGoals = false,
 	queueFrozen = false,
 	pendingAction?: PendingQueueAction,
+	automaticTurnLimit: number | null = DEFAULT_GOAL_SETTINGS.continuationLimits.automaticTurns,
 ) {
 	const summary = [
 		`Goal: ${goal.text}`,
 		`Status: ${queueFrozen ? "queue off" : goal.status}`,
 		`Iteration: ${goal.iteration}`,
-		`Automatic model responses: ${goal.automaticModelTurns}`,
+		automaticTurnLimit === null
+			? `Automatic work: ${goal.automaticModelTurns} responses · Unlimited`
+			: `Automatic work: ${goal.automaticModelTurns} of ${automaticTurnLimit} responses`,
 		`Active elapsed: ${formatDuration(goal.timeUsedSeconds)}`,
 		`Tokens: ${goal.tokenBudget === undefined ? formatTokenCount(goal.tokensUsed) : formatBudget(goal)}`,
 	];
 	if (goal.safetyPauseCause) {
 		summary.push(
-			`Safety pause: ${goal.safetyPauseCause === "continuation_limit" ? "automatic response limit" : "no progress"}`,
+			goal.safetyPauseCause === "continuation_limit"
+				? `Safety pause: automatic-work limit reached (${goal.automaticModelTurns} of ${automaticTurnLimit ?? "Unlimited"} responses). Progress is saved; open /goal to review and continue.`
+				: "Safety pause: no progress. Progress is saved; open /goal to review and continue.",
 		);
 	}
 	if (experimentalGoals || queuedGoals.length > 0 || queueFrozen || pendingAction) {
