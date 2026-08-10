@@ -12,12 +12,13 @@ import {
   type LineEnding,
 } from "./replace-diff";
 import { readNormFile } from "./file-reader";
-import { normReq, normalizeFilePath, tryParseContentLines } from "./replace-normalize";
-import { isRec, has, rejectUnknownFields, abortIf } from "./utils";
+import { normReq } from "./replace-normalize";
+import { isRec, rejectUnknownFields, abortIf, normalizeFilePath } from "./utils";
 import { resolveTarget, writeAtomic } from "./fs-write";
 import { applyEdit,
   lineHashes,
   resEdit,
+  parseHashRef,
   MAX_HASH_LINES,
   type HEdit,
   type NEdit,
@@ -43,14 +44,14 @@ import {
 } from "./replace-render";
 import { loadP, loadGuide } from "./prompts";
 import { saveUndo } from "./replace-undo";
-import { loadHashStore, type HashStore } from "./hash-store";
+import { loadHashStore, findSnapshotPaths, type HashStore } from "./hash-store";
 
-const contentLinesSchema = Type.Array(Type.String(), {
+const newContentSchema = Type.String({
   description:
-    "Replacement content, one string per line; entries must not contain line breaks. Use [] to delete the range."
+    "Replacement content as a single string with \\n line separators; every \\n separates lines, so a trailing \\n adds a final empty line. Mirror the replaced range's lines exactly, blank lines included. A replacement that is only blank lines is written as one \\n per blank line. Use \"\" to delete the range."
 });
 
-const hashRangeInclSchema = Type.Array(
+const hashBoundsSchema = Type.Array(
   Type.String({ description: "A 3-char HASH from read output" }),
   {
     description: "Pair of 3-char hashes from read output marking the first and last line of the range to replace (inclusive).",
@@ -61,16 +62,16 @@ const hashRangeInclSchema = Type.Array(
 
 export const editToolSchema = Type.Object(
   {
-    path: Type.String({ description: "Path to edit" }),
-    hash_range_inclusive: hashRangeInclSchema,
-    content_lines: contentLinesSchema,
+    path: Type.Optional(Type.String({ description: "Path to edit. Required — always provide it explicitly; it is only auto-resolved from the anchors as a fallback when omitted by mistake." })),
+    hash_bounds: hashBoundsSchema,
+    new_content: newContentSchema,
   },
   { additionalProperties: false },
 );
 export type ReqParams = {
   path: string;
-  hash_range_inclusive: [string, string];
-  content_lines: string[];
+  hash_bounds: [string, string];
+  new_content: string;
 };
 
 export type ReplaceDetails = {
@@ -100,20 +101,7 @@ interface PipelineResult {
 
 const PREVIEW_DEBOUNCE_MS = 150;
 
-const ROOT_KS = new Set(["path", "content_lines", "hash_range_inclusive"]);
-
-const LEGACY_KS = ["oldText", "newText", "old_text", "new_text", "old_range", "start", "end", "lines", "changes"];
-
-export function assertNoLegacyKeys(request: unknown): void {
-  if (!isRec(request)) return;
-  for (const legacyKey of LEGACY_KS) {
-    if (has(request, legacyKey)) {
-      throw new Error(
-        `[E_LEGACY_SHAPE] "${legacyKey}" is not supported. Use {hash_range_inclusive: ["<START>", "<END>"], content_lines: [...]}.`
-      );
-    }
-  }
-}
+const ROOT_KS = new Set(["path", "new_content", "hash_bounds"]);
 
 export function assertReq(
   request: unknown,
@@ -122,19 +110,53 @@ export function assertReq(
     throw new Error("[E_BAD_SHAPE] Edit request must be an object.");
   }
 
-  assertNoLegacyKeys(request);
-
   rejectUnknownFields(request, ROOT_KS, "Edit request");
 
   if (typeof request.path !== "string" || request.path.length === 0) {
     throw new Error('[E_BAD_SHAPE] Edit request requires a non-empty "path" string.');
   }
 
-  if (!Array.isArray(request.hash_range_inclusive) || !Array.isArray(request.content_lines)) {
+  if (!Array.isArray(request.hash_bounds) || typeof request.new_content !== "string") {
     throw new Error(
-      '[E_BAD_SHAPE] Edit request requires both "hash_range_inclusive" and "content_lines" at the top level.',
+      '[E_BAD_SHAPE] Edit request requires both "hash_bounds" and "new_content" at the top level.',
     );
   }
+}
+
+async function resolveMissingPath(
+  request: Record<string, unknown>,
+): Promise<{ path: string; warning: string } | undefined> {
+  if (typeof request.path === "string") return undefined;
+  const bounds = request.hash_bounds;
+  if (!Array.isArray(bounds) || bounds.length !== 2) return undefined;
+  const hashes: string[] = [];
+  for (const ref of bounds) {
+    if (typeof ref !== "string") return undefined;
+    try {
+      hashes.push(parseHashRef(ref).hash);
+    } catch {
+      return undefined;
+    }
+  }
+  let store: HashStore;
+  try {
+    store = await loadHashStore();
+  } catch {
+    return undefined;
+  }
+  const matches = findSnapshotPaths(store, hashes);
+  if (matches.length === 1) {
+    return {
+      path: matches[0]!,
+      warning: `[E_BAD_SHAPE] Autocorrected: missing "path" resolved to ${matches[0]} — the only file whose stored hashes contain both anchors.`,
+    };
+  }
+  if (matches.length > 1) {
+    throw new Error(
+      `[E_BAD_SHAPE] Edit request requires a non-empty "path" string; the anchors match multiple known files: ${matches.join(", ")}. Include the intended path.`,
+    );
+  }
+  return undefined;
 }
 
 export interface ExecPipelineOptions {
@@ -149,8 +171,8 @@ function collectRemovedHashes(
   originalHashes: string[],
 ): Set<string> {
   const removedHashes = new Set<string>();
-  const startHash = edit.hash_range_inclusive[0].hash;
-  const endHash = edit.hash_range_inclusive[1].hash;
+  const startHash = edit.hash_bounds[0].hash;
+  const endHash = edit.hash_bounds[1].hash;
   const startLine = originalHashes.indexOf(startHash);
   const endLine = originalHashes.indexOf(endHash);
   if (startLine >= 0 && endLine >= 0) {
@@ -171,8 +193,8 @@ function countLineChanges(
 ): { totalAddedLines: number; totalRemovedLines: number } {
   if (isNoop) return { totalAddedLines: 0, totalRemovedLines: 0 };
   let totalRemovedLines = 0;
-  const startLine = originalHashes.indexOf(edit.hash_range_inclusive[0].hash);
-  const endLine = originalHashes.indexOf(edit.hash_range_inclusive[1].hash);
+  const startLine = originalHashes.indexOf(edit.hash_bounds[0].hash);
+  const endLine = originalHashes.indexOf(edit.hash_bounds[1].hash);
   if (startLine >= 0 && endLine >= 0) {
     totalRemovedLines = Math.abs(endLine - startLine) + 1;
   }
@@ -190,16 +212,20 @@ export async function execPipeline(
 
   const path = params.path;
 
-  const hashStore = options?.store ?? await loadHashStore();
-
-  const { normalized: originalNormalized, bom, originalEnding, fileHashes: originalHashes, hadUtf8DecodeErrors, absolutePath } = await readNormFile(
-    path, cwd, { signal: options?.signal, accessMode: options?.accessMode, maxLines: MAX_HASH_LINES, store: hashStore },
+  const editWarnings: string[] = [];
+  const edit = resEdit(
+    {
+      hash_bounds: params.hash_bounds,
+      new_content: params.new_content,
+    },
+    editWarnings,
   );
 
-  const edit = resEdit({
-    hash_range_inclusive: params.hash_range_inclusive,
-    content_lines: params.content_lines,
-  });
+  const hashStore = options?.store ?? await loadHashStore();
+  const { normalized: originalNormalized, bom, originalEnding, fileHashes: originalHashes, hadUtf8DecodeErrors, absolutePath } = await readNormFile(
+    path, cwd, { signal: options?.signal, accessMode: options?.accessMode, maxLines: MAX_HASH_LINES, store: hashStore, noPersist: options?.noPersist },
+  );
+
   const anchorResult = applyEdit(
     originalNormalized,
     edit,
@@ -222,8 +248,7 @@ export async function execPipeline(
         hashes: originalHashes,
         removedHashes,
       }, hashStore, noPersist !== true);
-  const warnings = [...(anchorResult.warnings ?? [])];
-
+  const warnings = [...editWarnings, ...(anchorResult.warnings ?? [])];
   const { totalAddedLines, totalRemovedLines } = countLineChanges(
     edit, originalHashes, isNoop, anchorResult.autoFixes?.length ?? 0,
   );
@@ -253,19 +278,18 @@ export async function compPreview(
   try {
     const normalized = normReq(request);
     assertReq(normalized);
-    const { path, originalNormalized, result, resultHashes } = await execPipeline(
+    const { path, originalNormalized, result, resultHashes, originalHashes } = await execPipeline(
       normalized,
       cwd,
       { accessMode: constants.R_OK, noPersist: true },
     );
-
     if (originalNormalized === result) {
       return {
         error: `No changes made to ${path}. The edit produced identical content.`,
       };
     }
 
-    return { diff: genDiff(originalNormalized, result, 4, resultHashes).diff };
+    return { diff: genDiff(originalNormalized, result, 4, resultHashes, originalHashes).diff };
   } catch (error: unknown) {
     return { error: error instanceof Error ? error.message : String(error) };
   }
@@ -307,13 +331,9 @@ export function buildToolDef(): ToolDef {
     promptSnippet: E_SNIPPET,
     promptGuidelines: E_GUIDE,
     prepareArguments: (args: unknown) => {
-      assertNoLegacyKeys(args);
       if (!isRec(args)) return args as any;
       const record = { ...args };
       normalizeFilePath(record);
-      if (has(record, "content_lines") && typeof record.content_lines === "string") {
-        tryParseContentLines(record, "content_lines");
-      }
       return record;
     },
     renderShell: "default",
@@ -422,6 +442,10 @@ export function buildToolDef(): ToolDef {
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const canonical = normReq(params);
+      const resolution = isRec(canonical) ? await resolveMissingPath(canonical) : undefined;
+      if (resolution && isRec(canonical)) {
+        canonical.path = resolution.path;
+      }
       assertReq(canonical);
 
       const normalizedParams = canonical;
@@ -450,6 +474,10 @@ export function buildToolDef(): ToolDef {
           ctx.cwd,
           { accessMode: constants.R_OK | constants.W_OK, signal },
         );
+
+        if (resolution) {
+          warnings.unshift(resolution.warning);
+        }
 
         const editsAttempted = 1;
         if (originalNormalized === result) {

@@ -3,6 +3,10 @@ import type { ActionMenuItem } from "@narumitw/pi-tui-kit";
 import { formatTokenCount as formatCompactTokenCount, formatDuration } from "./accounting.js";
 import { parseTokenBudget } from "./command.js";
 import type { GoalCommandController } from "./commands.js";
+import { notifyTerminal, safeGoalMenuText } from "./errors.js";
+
+export { safeGoalMenuText } from "./errors.js";
+
 import type { ActiveGoal, PendingQueueAction } from "./persistence.js";
 import { goalQueueIdentity } from "./queue.js";
 import { type GoalRuntime, goalSummary } from "./runtime.js";
@@ -389,7 +393,8 @@ export async function showGoalManager(
 			"start-with-custom-budget": async ({ value, signal }) => {
 				const budget = parseTokenBudget(value ?? "");
 				if (budget === undefined) {
-					ctx.ui.notify(
+					notifyTerminal(
+						ctx.ui,
 						"Enter a positive token amount, for example 25k, 300k, or 1.5m.",
 						"warning",
 					);
@@ -411,7 +416,8 @@ export async function showGoalManager(
 				const goal = displayedBudgetGoal;
 				const budget = parseTokenBudget(value ?? "");
 				if (budget === undefined) {
-					ctx.ui.notify(
+					notifyTerminal(
+						ctx.ui,
 						"Enter a positive token amount, for example 300k, 1.5m, or 300000.",
 						"warning",
 					);
@@ -431,7 +437,8 @@ export async function showGoalManager(
 					return { kind: "close" };
 				}
 				if (budget <= goal.tokensUsed) {
-					ctx.ui.notify(
+					notifyTerminal(
+						ctx.ui,
 						`Enter a new cumulative total greater than current usage (${formatCompactTokenCount(goal.tokensUsed)}).`,
 						"warning",
 					);
@@ -515,7 +522,8 @@ export async function showGoalManager(
 					goalQueueIdentity(runtime.activeGoal, runtime.queuedGoals, runtime.pendingQueueAction) !==
 					previewedQueue
 				) {
-					ctx.ui.notify(
+					notifyTerminal(
+						ctx.ui,
 						"The goal queue changed while the dialog was open. Reopen /goal and try again.",
 						"warning",
 					);
@@ -616,18 +624,6 @@ function refreshGoalMenuState(runtime: GoalMenuRuntimeView, ctx: ExtensionComman
 	runtime.recordGoalUsage?.(goal, ctx);
 	runtime.persistGoal?.(goal);
 	runtime.updateStatus?.(ctx, goal);
-}
-
-export function safeGoalMenuText(value: string, maxCharacters = 120) {
-	const sanitized = [...value]
-		.map((character) => (isTerminalControl(character) ? " " : character))
-		.join("")
-		.replace(/\s+/gu, " ")
-		.trim();
-	const characters = [...sanitized];
-	return characters.length <= maxCharacters
-		? sanitized
-		: `${characters.slice(0, maxCharacters).join("")}…`;
 }
 
 async function startFromMenu(commands: GoalCommandController, ctx: ExtensionCommandContext) {
@@ -787,7 +783,8 @@ function requireCurrentStartBudgetQueue(
 	if (currentGoalQueueIdentity(runtime) === expectedIdentity) {
 		return true;
 	}
-	ctx.ui.notify(
+	notifyTerminal(
+		ctx.ui,
 		"The goal queue changed while the token budget flow was open. Reopen /goal and try again.",
 		"warning",
 	);
@@ -811,7 +808,8 @@ function requireCurrentBudgetPreview(
 	) {
 		return true;
 	}
-	ctx.ui.notify(
+	notifyTerminal(
+		ctx.ui,
 		"The goal changed or its usage changed while the budget dialog was open. Reopen /goal and try again.",
 		"warning",
 	);
@@ -824,7 +822,8 @@ function requireCurrentQueueHead(
 	ctx: ExtensionCommandContext,
 ) {
 	if (runtime.activeGoal?.id === expectedGoal.id) return true;
-	ctx.ui.notify(
+	notifyTerminal(
+		ctx.ui,
 		"The goal queue changed while the dialog was open. Reopen /goal and try again.",
 		"warning",
 	);
@@ -848,7 +847,8 @@ function requireCurrentQueueSelection(
 	) {
 		return true;
 	}
-	ctx.ui.notify(
+	notifyTerminal(
+		ctx.ui,
 		"The goal queue changed while the dialog was open. Reopen /goal and try again.",
 		"warning",
 	);
@@ -861,7 +861,8 @@ function requireCurrentMenuGoal(
 	ctx: ExtensionCommandContext,
 ) {
 	if (runtime.activeGoal?.id === expected.id) return true;
-	ctx.ui.notify(
+	notifyTerminal(
+		ctx.ui,
 		"The active goal changed while the dialog was open. Reopen /goal and try again.",
 		"warning",
 	);
@@ -891,11 +892,6 @@ function automaticPauseSummary(used: number, limit: number | null) {
 		return `Goal paused after ${used} responses at its previous safety limit. Current automatic-work limit: ${limit}.`;
 	}
 	return `Goal reached its ${used}-of-${limit} safety limit.`;
-}
-
-function isTerminalControl(character: string) {
-	const codePoint = character.codePointAt(0) ?? 0;
-	return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
 }
 
 function goalHelp() {

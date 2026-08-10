@@ -30,8 +30,8 @@
 
 | 包名 | 版本 | 链接 |
 |------|------|------|
-| @cortexkit/pi-magic-context | 0.33.1 | [npm](https://www.npmjs.com/package/@cortexkit/pi-magic-context) |
-| @ff-labs/pi-fff | 0.10.1 | [npm](https://www.npmjs.com/package/@ff-labs/pi-fff) |
+| @cortexkit/pi-magic-context | 0.35.0 | [npm](https://www.npmjs.com/package/@cortexkit/pi-magic-context) |
+| @ff-labs/pi-fff | 0.10.3 | [npm](https://www.npmjs.com/package/@ff-labs/pi-fff) |
 | @gotgenes/pi-permission-system | 24.0.0 | [npm](https://www.npmjs.com/package/@gotgenes/pi-permission-system) |
 | @juanibiapina/pi-extension-settings | 0.9.1 | [npm](https://www.npmjs.com/package/@juanibiapina/pi-extension-settings) |
 | @juanibiapina/pi-powerbar | 0.14.0 | [npm](https://www.npmjs.com/package/@juanibiapina/pi-powerbar) |
@@ -39,8 +39,8 @@
 | @juicesharp/rpiv-todo | 2.4.0 | [npm](https://www.npmjs.com/package/@juicesharp/rpiv-todo) |
 | @narumitw/pi-btw | 0.49.6 | [npm](https://www.npmjs.com/package/@narumitw/pi-btw) |
 | @narumitw/pi-caffeinate | 0.49.3 | [npm](https://www.npmjs.com/package/@narumitw/pi-caffeinate) |
-| @narumitw/pi-goal | 0.49.5 | [npm](https://www.npmjs.com/package/@narumitw/pi-goal) |
-| @narumitw/pi-lsp | 0.49.3 | [npm](https://www.npmjs.com/package/@narumitw/pi-lsp) |
+| @narumitw/pi-goal | 0.49.7 | [npm](https://www.npmjs.com/package/@narumitw/pi-goal) |
+| @narumitw/pi-lsp | 0.49.4 | [npm](https://www.npmjs.com/package/@narumitw/pi-lsp) |
 | @narumitw/pi-plan-mode | 0.49.3 | [npm](https://www.npmjs.com/package/@narumitw/pi-plan-mode) |
 | @narumitw/pi-subagents | 0.49.3 | [npm](https://www.npmjs.com/package/@narumitw/pi-subagents) |
 | @tmustier/pi-raw-paste | 0.1.3 | [npm](https://www.npmjs.com/package/@tmustier/pi-raw-paste) |
@@ -48,12 +48,12 @@
 | pi-add-dir | 1.3.1 | [npm](https://www.npmjs.com/package/pi-add-dir) |
 | pi-agent-browser-native | 0.3.0 | [npm](https://www.npmjs.com/package/pi-agent-browser-native) |
 | pi-autoresearch | 1.6.2 | [npm](https://www.npmjs.com/package/pi-autoresearch) |
-| pi-cache-optimizer | 2.8.0 | [npm](https://www.npmjs.com/package/pi-cache-optimizer) |
-| pi-hashline-edit-pro | 1.1.2 | [npm](https://www.npmjs.com/package/pi-hashline-edit-pro) |
-| pi-mcp-adapter | 2.21.0 | [npm](https://www.npmjs.com/package/pi-mcp-adapter) |
+| pi-cache-optimizer | 2.8.2 | [npm](https://www.npmjs.com/package/pi-cache-optimizer) |
+| pi-hashline-edit-pro | 2.3.1 | [npm](https://www.npmjs.com/package/pi-hashline-edit-pro) |
+| pi-mcp-adapter | 2.21.2 | [npm](https://www.npmjs.com/package/pi-mcp-adapter) |
 | pi-rtk-optimizer | 0.9.0 | [npm](https://www.npmjs.com/package/pi-rtk-optimizer) |
 | pi-slopchop | 0.10.1 | [npm](https://www.npmjs.com/package/pi-slopchop) |
-| pi-web-access | 0.18.0 | [npm](https://www.npmjs.com/package/pi-web-access) |
+| pi-web-access | 0.19.0 | [npm](https://www.npmjs.com/package/pi-web-access) |
 | pi-workspace-history | 0.2.2 | [npm](https://www.npmjs.com/package/pi-workspace-history) |
 
 ### Git 包

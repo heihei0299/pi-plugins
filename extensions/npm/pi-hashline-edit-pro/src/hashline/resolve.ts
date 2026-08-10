@@ -1,7 +1,7 @@
-import { abortIf, rejectUnknownFields, lastNonEmpty, firstNonEmpty, clipLine } from "../utils";
-import { HL_BARE_PREFIX_RE, HL_PREFIX_PLUS_RE, HL_PREFIX_MINUS_RE } from "./hash";
+import { abortIf, rejectUnknownFields, firstNonEmptyIndex, lastNonEmptyIndex, clipLine } from "../utils";
+import { HASH_CLASS, HL_BARE_PREFIX_RE, HL_PREFIX_PLUS_RE, HL_PREFIX_MINUS_RE, canon } from "./hash";
 import { parseHashRef, parseText, type Anchor } from "./parse";
-import { CONTENT_LINES_NOT_STRING_MSG } from "../constants";
+import { NEW_CONTENT_NOT_STRING_MSG } from "../constants";
 
 export type RAnchor = {
 	line: number;
@@ -9,10 +9,10 @@ export type RAnchor = {
 	hashMatched: boolean;
 };
 
-export type HEdit = { content_lines: string[]; hash_range_inclusive: [Anchor, Anchor] };
+export type HEdit = { content_lines: string[]; hash_bounds: [Anchor, Anchor] };
 export type RHEdit = {
   content_lines: string[];
-  hash_range_inclusive: [RAnchor, RAnchor];
+  hash_bounds: [RAnchor, RAnchor];
 };
 
 interface HMismatch {
@@ -22,16 +22,15 @@ interface HMismatch {
 	context?: RAnchor;
 }
 
-export interface BDupWarn {
-	kind: "trailing" | "leading";
-	survivingLineContent: string;
-	survivingLineIndex: number;
-	replacementLineContent: string;
+export interface BDup {
+	kind: "trailing" | "leading" | "first-new-after" | "last-new-before";
+	replacementLineIndex: number;
 }
 
 export interface AutoFix {
-  kind: "trailing" | "leading";
-  removedLine: string;
+	kind: "trailing" | "leading" | "first-new-after" | "last-new-before";
+	removedLine: string;
+	removedLineIndex: number;
 }
 
 export interface NEdit {
@@ -40,8 +39,8 @@ export interface NEdit {
 }
 
 export type HTEdit = {
-  content_lines: string[];
-  hash_range_inclusive: [string, string];
+  new_content: string;
+  hash_bounds: [string, string];
 };
 
 function resAnchorFromMap(
@@ -89,7 +88,7 @@ export function fmtMismatch(
   const refList = notFound.map((m) => `"${m.ref.hash}"`).join(", ");
   if (notFound.length > 0) {
     out.push(
-      `[E_STALE_ANCHOR] ${notFound.length} stale anchor${notFound.length > 1 ? "s" : ""}${filePath ? ` in ${filePath}` : ""}: ${refList}. The file content has changed since those anchors were read. Call read() to get fresh anchors, then copy the 3-char HASH of the start and end of the range you are replacing into hash_range_inclusive of your next replace call.`
+      `[E_STALE_ANCHOR] ${notFound.length} stale anchor${notFound.length > 1 ? "s" : ""}${filePath ? ` in ${filePath}` : ""}: ${refList}. The file content has changed since those anchors were read. Call read() to get fresh anchors, then copy the 3-char HASH of the start and end of the range you are replacing into hash_bounds of your next replace call.`
     );
     for (const m of notFound) {
       const ctx = m.context;
@@ -107,7 +106,7 @@ export function fmtMismatch(
   if (ambiguous.length > 0) {
     if (out.length > 0) out.push("");
     out.push(
-      `[E_AMBIGUOUS_ANCHOR] ${ambiguous.length} ambiguous anchor${ambiguous.length > 1 ? "s" : ""}${filePath ? ` in ${filePath}` : ""}. Call read() to get fresh anchors, then copy the 3-char HASH of the start and end of the range you are replacing into hash_range_inclusive of your next replace call.`
+      `[E_AMBIGUOUS_ANCHOR] ${ambiguous.length} ambiguous anchor${ambiguous.length > 1 ? "s" : ""}${filePath ? ` in ${filePath}` : ""}. Call read() to get fresh anchors, then copy the 3-char HASH of the start and end of the range you are replacing into hash_bounds of your next replace call.`
     );
     for (const m of ambiguous) {
       const sample = (m.candidates ?? []).slice(0, 5);
@@ -130,13 +129,7 @@ export function fmtMismatch(
   return out.join("\n");
 }
 
-const ITEM_KS = new Set(["content_lines", "hash_range_inclusive"]);
-
-function isStrArr(value: unknown): value is string[] {
-	return (
-		Array.isArray(value) && value.every((item) => typeof item === "string")
-	);
-}
+const ITEM_KS = new Set(["new_content", "hash_bounds"]);
 
 function isStrPair(value: unknown): value is [string, string] {
 	return (
@@ -147,47 +140,52 @@ function isStrPair(value: unknown): value is [string, string] {
 }
 
 function assertItem(edit: Record<string, unknown>): void {
-  rejectUnknownFields(edit, ITEM_KS, "Edit", "The edit takes only { content_lines, hash_range_inclusive }.");
+  rejectUnknownFields(edit, ITEM_KS, "Edit", "The edit takes only { new_content, hash_bounds }.");
 
-  if ("hash_range_inclusive" in edit && !isStrPair(edit.hash_range_inclusive)) {
+  if ("hash_bounds" in edit && !isStrPair(edit.hash_bounds)) {
     throw new Error(
-      `[E_BAD_SHAPE] Field "hash_range_inclusive" must be a pair of anchor strings [start, end].`,
+      `[E_BAD_SHAPE] Field "hash_bounds" must be a pair of anchor strings [start, end].`,
     );
   }
-  if (!("content_lines" in edit)) {
-    throw new Error(`[E_BAD_SHAPE] The edit requires a "content_lines" field. Provide the replacement lines (use [] to delete).`);
+  if (!("new_content" in edit)) {
+    throw new Error(`[E_BAD_SHAPE] The edit requires a "new_content" field. Provide the replacement text (use "" to delete).`);
   }
-  if ("content_lines" in edit && !isStrArr(edit.content_lines)) {
-    const val = edit.content_lines;
-    if (typeof val === "string") {
-      try {
-        const parsed = JSON.parse(val);
-        if (Array.isArray(parsed)) {
-          edit.content_lines = parsed;
-        } else {
-          throw new Error(CONTENT_LINES_NOT_STRING_MSG);
-        }
-      } catch {
-        throw new Error(CONTENT_LINES_NOT_STRING_MSG);
-      }
-    } else {
-      throw new Error(`[E_BAD_SHAPE] Field "content_lines" must be a string array.`);
-    }
+  if (typeof edit.new_content !== "string") {
+    throw new Error(NEW_CONTENT_NOT_STRING_MSG);
   }
-  if (!isStrPair(edit.hash_range_inclusive)) {
+  if (!isStrPair(edit.hash_bounds)) {
     throw new Error(
-      `[E_BAD_SHAPE] The edit requires a "hash_range_inclusive" pair of anchor strings [start, end].`,
+      `[E_BAD_SHAPE] The edit requires a "hash_bounds" pair of anchor strings [start, end].`,
     );
   }
 }
 
-export function resEdit(edit: HTEdit): HEdit {
+const ANCHOR_ROW_RE = new RegExp(`^([+-]?)(${HASH_CLASS})│`);
+
+export function resEdit(edit: HTEdit, warnings?: string[]): HEdit {
   assertItem(edit as Record<string, unknown>);
 
-  const replaceLines = parseText(edit.content_lines);
+  const replaceLines = parseText(edit.new_content);
+  const bounds = edit.hash_bounds.map((ref) => {
+    const trimmed = ref.trim();
+    const match = trimmed.match(ANCHOR_ROW_RE);
+    if (match) {
+      let message: string;
+      if (match[1] === "+") {
+        message = `[E_BAD_REF] Autocorrected: stripped diff-preview marker copied from the diff preview in hash_bounds entry "${trimmed}".`;
+      } else if (match[1] === "-") {
+        message = `[E_BAD_REF] Autocorrected: stripped leading "-" marker in hash_bounds entry "${trimmed}".`;
+      } else {
+        message = `[E_BAD_REF] Autocorrected: stripped "HASH│" prefix copied from read output in hash_bounds entry "${trimmed}".`;
+      }
+      warnings?.push(message);
+      return match[2]!;
+    }
+    return ref;
+  }) as [string, string];
   return {
     content_lines: replaceLines,
-    hash_range_inclusive: [parseHashRef(edit.hash_range_inclusive[0]), parseHashRef(edit.hash_range_inclusive[1])],
+    hash_bounds: [parseHashRef(bounds[0]), parseHashRef(bounds[1])],
   };
 }
 
@@ -217,15 +215,19 @@ export function stripBarePrefixes(
 	});
 	if (stripped.length === 0) return edit;
 	const locations = stripped
-		.map((s) => `content_lines[${s.lineIndex}]`)
+		.map((s) => `new_content line ${s.lineIndex + 1}`)
 		.join(", ");
 	const matchedCount = stripped.filter((s) => s.matched).length;
 	const evidence =
 		matchedCount === 0
 			? "none of the stripped hashes match current file lines"
 			: `${matchedCount} of ${stripped.length} stripped hash(es) match current file lines`;
+	const guidance =
+		matchedCount === 0
+			? " Verify that these lines were pasted from read output; literal content starting with 'HASH│' would be altered by this strip."
+			: "";
 	warnings.push(
-		`[E_BARE_HASH_PREFIX] Autocorrected: stripped "HASH│" prefix copied from read output in ${locations} (${evidence}).`
+		`[E_BARE_HASH_PREFIX] Autocorrected: stripped "HASH│" prefix copied from read output in ${locations} (${evidence}).${guidance}`
 	);
 	return { ...edit, content_lines: contentLines };
 }
@@ -249,7 +251,7 @@ export function stripDiffPrefixes(
 		return line;
 	});
 	if (stripped.length === 0) return edit;
-	const locations = stripped.map((i) => `content_lines[${i}]`).join(", ");
+	const locations = stripped.map((i) => `new_content line ${i + 1}`).join(", ");
 	warnings.push(
 		`[E_INVALID_PATCH] Autocorrected: stripped diff-preview marker copied from the diff preview in ${locations}.`
 	);
@@ -265,7 +267,7 @@ export function swapReversedRanges(
 	for (let i = 0; i < fileHashes.length; i++) {
 		lineByHash.set(fileHashes[i]!, i + 1);
 	}
-	const [startRef, endRef] = edit.hash_range_inclusive;
+	const [startRef, endRef] = edit.hash_bounds;
 	const startLine = lineByHash.get(startRef.hash);
 	const endLine = lineByHash.get(endRef.hash);
 	if (
@@ -276,29 +278,138 @@ export function swapReversedRanges(
 		return edit;
 	}
 	warnings.push(
-		`[E_BAD_OP] Autocorrected: hash_range_inclusive was reversed (start ${startRef.hash} is after end ${endRef.hash}); swapped the pair.`
+		`[E_BAD_OP] Autocorrected: hash_bounds was reversed (start ${startRef.hash} is after end ${endRef.hash}); swapped the pair.`
 	);
-	return { ...edit, hash_range_inclusive: [endRef, startRef] as [Anchor, Anchor] };
+	return { ...edit, hash_bounds: [endRef, startRef] as [Anchor, Anchor] };
 }
 
-function checkBoundaryDup(
-	adjacentLine: string | undefined,
-	replacementEdge: string | undefined,
-	kind: "trailing" | "leading",
-	survivingLineIndex: number,
-): BDupWarn | null {
-	if (
-		adjacentLine === undefined ||
-		replacementEdge === undefined ||
-		replacementEdge.length === 0 ||
-		replacementEdge !== adjacentLine
-	) return null;
-  return {
-    kind,
-    survivingLineContent: adjacentLine,
-    survivingLineIndex,
-    replacementLineContent: replacementEdge,
-  };
+function trailingDups(
+	contentLines: string[],
+	fileLines: string[],
+	endLine: number,
+): BDup[] {
+	const start = lastNonEmptyIndex(contentLines);
+	if (start < 0) return [];
+	const dups: BDup[] = [];
+	const maxK = Math.min(start + 1, fileLines.length - endLine);
+	for (let k = 0; k < maxK; k++) {
+		if (contentLines[start - k] !== fileLines[endLine + k]) break;
+		dups.push({ kind: "trailing", replacementLineIndex: start - k });
+	}
+	return dups;
+}
+
+function leadingDups(
+	contentLines: string[],
+	fileLines: string[],
+	startLine: number,
+): BDup[] {
+	const start = firstNonEmptyIndex(contentLines);
+	if (start < 0) return [];
+	const dups: BDup[] = [];
+	const maxK = Math.min(contentLines.length - start, startLine - 1);
+	for (let k = 0; k < maxK; k++) {
+		if (contentLines[start + k] !== fileLines[startLine - 2 - k]) break;
+		dups.push({ kind: "leading", replacementLineIndex: start + k });
+	}
+	return dups;
+}
+
+function sectionIsUnique(
+	canonLines: string[],
+	start: number,
+	length: number,
+): boolean {
+	let count = 0;
+	for (let i = 0; i + length <= canonLines.length; i++) {
+		let k = 0;
+		while (k < length && canonLines[i + k] === canonLines[start + k]) k++;
+		if (k < length) continue;
+		count++;
+		if (count > 1) return false;
+	}
+	return true;
+}
+
+function firstNewAfterDups(
+	contentLines: string[],
+	rangeLines: string[],
+	canonLines: string[],
+	endLine: number,
+): BDup[] {
+	const firstNew = findNewEdge(contentLines, rangeLines, false);
+	if (!firstNew) return [];
+	const maxK = Math.min(contentLines.length - firstNew.index, canonLines.length - endLine);
+	let runLen = 0;
+	while (
+		runLen < maxK &&
+		canon(contentLines[firstNew.index + runLen]!) === canonLines[endLine + runLen]!
+	) {
+		runLen++;
+	}
+	if (runLen === 0 || !sectionIsUnique(canonLines, endLine, runLen)) return [];
+	const dups: BDup[] = [];
+	for (let k = 0; k < runLen; k++) {
+		dups.push({ kind: "first-new-after", replacementLineIndex: firstNew.index + k });
+	}
+	return dups;
+}
+
+function lastNewBeforeDups(
+	contentLines: string[],
+	rangeLines: string[],
+	canonLines: string[],
+	startLine: number,
+): BDup[] {
+	const lastNew = findNewEdge(contentLines, rangeLines, true);
+	if (!lastNew) return [];
+	const maxK = Math.min(lastNew.index + 1, startLine - 1);
+	let runLen = 0;
+	while (
+		runLen < maxK &&
+		canon(contentLines[lastNew.index - runLen]!) === canonLines[startLine - 2 - runLen]!
+	) {
+		runLen++;
+	}
+	if (runLen === 0) return [];
+	const sectionStart = startLine - 1 - runLen;
+	if (!sectionIsUnique(canonLines, sectionStart, runLen)) return [];
+	const dups: BDup[] = [];
+	for (let k = 0; k < runLen; k++) {
+		dups.push({ kind: "last-new-before", replacementLineIndex: lastNew.index - k });
+	}
+	return dups;
+}
+
+function canonCounts(lines: string[]): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const line of lines) {
+		const key = canon(line);
+		counts.set(key, (counts.get(key) ?? 0) + 1);
+	}
+	return counts;
+}
+
+export function findNewEdge(
+	contentLines: string[],
+	rangeLines: string[],
+	fromEnd: boolean,
+): { index: number; line: string } | undefined {
+	const multiset = canonCounts(rangeLines);
+	const step = fromEnd ? -1 : 1;
+	const start = fromEnd ? contentLines.length - 1 : 0;
+	for (let i = start; i >= 0 && i < contentLines.length; i += step) {
+		const line = contentLines[i]!;
+		if (line.length === 0) continue;
+		const key = canon(line);
+		const count = multiset.get(key) ?? 0;
+		if (count > 0) {
+			multiset.set(key, count - 1);
+		} else {
+			return { index: i, line };
+		}
+	}
+	return undefined;
 }
 
 export function valEdit(
@@ -307,10 +418,10 @@ export function valEdit(
 	fileHashes: string[],
 	warnings: string[],
 	signal: AbortSignal | undefined,
-): { resolved: RHEdit | undefined; mismatches: HMismatch[]; boundaryWarnings: BDupWarn[] } {
+): { resolved: RHEdit | undefined; mismatches: HMismatch[]; boundaryDups: BDup[] } {
 	assertAligned(fileLines, fileHashes, "valEdit");
 	const mismatches: HMismatch[] = [];
-	const boundaryWarnings: BDupWarn[] = [];
+	const boundaryDups: BDup[] = [];
 
 	const hashIndex = new Map<string, number[]>();
 	for (let i = 0; i < fileHashes.length; i++) {
@@ -330,40 +441,40 @@ export function valEdit(
 	};
 
 	abortIf(signal);
-	const startResolved = tryResolve(edit.hash_range_inclusive[0]);
-	const endResolved = tryResolve(edit.hash_range_inclusive[1]);
+	const startResolved = tryResolve(edit.hash_bounds[0]);
+	const endResolved = tryResolve(edit.hash_bounds[1]);
 	if (!startResolved || !endResolved) {
 		if (!startResolved && endResolved) {
-			const startMismatch = mismatches.findLast((m) => m.ref === edit.hash_range_inclusive[0]);
+			const startMismatch = mismatches.findLast((m) => m.ref === edit.hash_bounds[0]);
 			if (startMismatch && startMismatch.kind === "not_found") startMismatch.context = endResolved;
 		} else if (startResolved && !endResolved) {
-			const endMismatch = mismatches.findLast((m) => m.ref === edit.hash_range_inclusive[1]);
+			const endMismatch = mismatches.findLast((m) => m.ref === edit.hash_bounds[1]);
 			if (endMismatch && endMismatch.kind === "not_found") endMismatch.context = startResolved;
 		}
-		return { resolved: undefined, mismatches, boundaryWarnings };
+		return { resolved: undefined, mismatches, boundaryDups };
 	}
 	if (startResolved.line > endResolved.line) {
 		throw new Error(
-			`[E_BAD_OP] Range start line ${startResolved.line} must be <= end line ${endResolved.line} (anchors ${edit.hash_range_inclusive[0].hash} and ${edit.hash_range_inclusive[1].hash}).`,
+			`[E_BAD_OP] Range start line ${startResolved.line} must be <= end line ${endResolved.line} (anchors ${edit.hash_bounds[0].hash} and ${edit.hash_bounds[1].hash}).`,
 		);
 	}
 	const endLine = endResolved.line;
-	const nextLine = fileLines[endLine];
-	const replacementLastLine = lastNonEmpty(edit.content_lines);
-	const trailing = checkBoundaryDup(nextLine, replacementLastLine, "trailing", endLine);
-	if (trailing) boundaryWarnings.push(trailing);
-	const prevLine = fileLines[startResolved.line - 2];
-	const replacementFirstLine = firstNonEmpty(edit.content_lines);
-	const leading = checkBoundaryDup(prevLine, replacementFirstLine, "leading", startResolved.line - 2);
-	if (leading) boundaryWarnings.push(leading);
+	const rangeLines = fileLines.slice(startResolved.line - 1, endLine);
+	const canonLines = fileLines.map((line) => canon(line));
+	boundaryDups.push(
+		...trailingDups(edit.content_lines, fileLines, endLine),
+		...leadingDups(edit.content_lines, fileLines, startResolved.line),
+		...firstNewAfterDups(edit.content_lines, rangeLines, canonLines, endLine),
+		...lastNewBeforeDups(edit.content_lines, rangeLines, canonLines, startResolved.line),
+	);
 
 	return {
 		resolved: {
 			content_lines: edit.content_lines,
-			hash_range_inclusive: [startResolved, endResolved],
+			hash_bounds: [startResolved, endResolved],
 		},
 		mismatches,
-		boundaryWarnings,
+		boundaryDups,
 	};
 }
 

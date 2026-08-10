@@ -22,7 +22,16 @@ import { resolveConfiguredOAuthDir } from './config.ts';
 const require = createRequire(import.meta.url);
 const AUTH_SECRET_SERVICE = 'pi-mcp-adapter.oauth';
 const TEST_AUTH_STORE_ENV = 'PI_MCP_ADAPTER_TEST_AUTH_STORE';
-const AUTH_SECRET_CHUNK_SIZE = 1800;
+/**
+ * Windows Credential Manager caps one value at CRED_MAX_CREDENTIAL_BLOB_SIZE
+ * (2560 bytes) and stores it as UTF-16, so the real ceiling is
+ * AUTH_SECRET_VALUE_LIMIT characters. Chunks must stay below that, and so must
+ * the threshold that decides whether to chunk at all, or oversized records still
+ * fail to persist on Windows.
+ */
+const AUTH_SECRET_CHUNK_SIZE = 1000;
+/** Largest single value the strictest supported credential store accepts. */
+const AUTH_SECRET_VALUE_LIMIT = 1280;
 const KEYRING_RECOVERY_DISABLED_ENV = 'PI_MCP_ADAPTER_DISABLE_KEYRING_RECOVERY';
 const KEYRING_RECOVERY_KEYCTL_ENV = 'PI_MCP_ADAPTER_KEYRING_RECOVERY_KEYCTL';
 const KEYRING_RECOVERY_NODE_ENV = 'PI_MCP_ADAPTER_KEYRING_RECOVERY_NODE';
@@ -163,6 +172,22 @@ const keyringAuthSecretStore: AuthSecretStore = {
   },
 };
 
+/** Mimics the Windows Credential Manager per-value ceiling for tests. */
+const sizeLimitedAuthSecretStore: AuthSecretStore = {
+  read(account) {
+    return memoryAuthEntries.get(account);
+  },
+  write(account, payload) {
+    if (payload.length > AUTH_SECRET_VALUE_LIMIT) {
+      throw new Error(`Value of 'password encoded as UTF-16' is longer than the platform limit of ${AUTH_SECRET_VALUE_LIMIT * 2} chars`);
+    }
+    memoryAuthEntries.set(account, payload);
+  },
+  remove(account) {
+    memoryAuthEntries.delete(account);
+  },
+};
+
 const unavailableAuthSecretStore: AuthSecretStore = {
   read() {
     throw new Error('simulated secure credential store unavailable');
@@ -205,6 +230,7 @@ export function removeTestAuthSecretStoreEntry(account: string): void {
 
 function getAuthSecretStore(): AuthSecretStore {
   if (process.env[TEST_AUTH_STORE_ENV] === 'memory') return memoryAuthSecretStore;
+  if (process.env[TEST_AUTH_STORE_ENV] === 'sizelimited') return sizeLimitedAuthSecretStore;
   if (process.env[TEST_AUTH_STORE_ENV] === 'unavailable') return unavailableAuthSecretStore;
   if (process.env[TEST_AUTH_STORE_ENV] === 'keyrevoked') return keyRevokedAuthSecretStore;
   return keyringAuthSecretStore;
@@ -401,7 +427,99 @@ function parseJsonPayload(serverName: string, payload: string, source: string): 
 }
 
 function parseAuthEntryPayload(serverName: string, payload: string, source: string): AuthEntry {
-  return parseJsonPayload(serverName, payload, source) as AuthEntry;
+  const parsed = parseJsonPayload(serverName, payload, source);
+  const entry = toAuthEntry(parsed);
+  if (!entry) {
+    throw new Error(`Failed to parse OAuth credentials for ${serverName} from ${source}: invalid credential shape`);
+  }
+  return entry;
+}
+
+function toAuthEntry(value: unknown): AuthEntry | undefined {
+  const entry = toRecord(value);
+  if (!entry) return undefined;
+
+  const codeVerifier = optionalString(entry.codeVerifier);
+  const oauthState = optionalString(entry.oauthState);
+  const serverUrl = optionalString(entry.serverUrl);
+  if (codeVerifier === null || oauthState === null || serverUrl === null) return undefined;
+
+  const tokens = entry.tokens === undefined ? undefined : toStoredTokens(entry.tokens);
+  const clientInfo = entry.clientInfo === undefined ? undefined : toStoredClientInfo(entry.clientInfo);
+  if ((entry.tokens !== undefined && !tokens) || (entry.clientInfo !== undefined && !clientInfo)) return undefined;
+
+  const authEntry: AuthEntry = {};
+  if (tokens) authEntry.tokens = tokens;
+  if (clientInfo) authEntry.clientInfo = clientInfo;
+  if (codeVerifier !== undefined) authEntry.codeVerifier = codeVerifier;
+  if (oauthState !== undefined) authEntry.oauthState = oauthState;
+  if (serverUrl !== undefined) authEntry.serverUrl = serverUrl;
+  return authEntry;
+}
+
+function toStoredTokens(value: unknown): StoredTokens | undefined {
+  const tokens = toRecord(value);
+  if (!tokens || typeof tokens.accessToken !== 'string') return undefined;
+
+  const refreshToken = optionalString(tokens.refreshToken);
+  const scope = optionalString(tokens.scope);
+  const issuer = optionalString(tokens.issuer);
+  const expiresAt = optionalNumber(tokens.expiresAt);
+  if (refreshToken === null || scope === null || issuer === null || expiresAt === null) return undefined;
+
+  const storedTokens: StoredTokens = { accessToken: tokens.accessToken };
+  if (refreshToken !== undefined) storedTokens.refreshToken = refreshToken;
+  if (expiresAt !== undefined) storedTokens.expiresAt = expiresAt;
+  if (scope !== undefined) storedTokens.scope = scope;
+  if (issuer !== undefined) storedTokens.issuer = issuer;
+  return storedTokens;
+}
+
+function toStoredClientInfo(value: unknown): StoredClientInfo | undefined {
+  const clientInfo = toRecord(value);
+  if (!clientInfo || typeof clientInfo.clientId !== 'string') return undefined;
+
+  const clientSecret = optionalString(clientInfo.clientSecret);
+  const issuer = optionalString(clientInfo.issuer);
+  const clientIdIssuedAt = optionalNumber(clientInfo.clientIdIssuedAt);
+  const clientSecretExpiresAt = optionalNumber(clientInfo.clientSecretExpiresAt);
+  const configPreRegistered = optionalBoolean(clientInfo.configPreRegistered);
+  if (clientSecret === null || issuer === null || clientIdIssuedAt === null || clientSecretExpiresAt === null || configPreRegistered === null) return undefined;
+
+  const storedClient: StoredClientInfo = { clientId: clientInfo.clientId };
+  const redirectUris = stringArray(clientInfo.redirectUris);
+  if (clientSecret !== undefined) storedClient.clientSecret = clientSecret;
+  if (clientIdIssuedAt !== undefined) storedClient.clientIdIssuedAt = clientIdIssuedAt;
+  if (clientSecretExpiresAt !== undefined) storedClient.clientSecretExpiresAt = clientSecretExpiresAt;
+  if (redirectUris !== undefined) storedClient.redirectUris = redirectUris;
+  if (issuer !== undefined) storedClient.issuer = issuer;
+  if (configPreRegistered !== undefined) storedClient.configPreRegistered = configPreRegistered;
+  return storedClient;
+}
+
+function toRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function optionalString(value: unknown): string | null | undefined {
+  if (value === undefined) return undefined;
+  return typeof value === 'string' ? value : null;
+}
+
+function optionalNumber(value: unknown): number | null | undefined {
+  if (value === undefined) return undefined;
+  return typeof value === 'number' ? value : null;
+}
+
+function optionalBoolean(value: unknown): boolean | null | undefined {
+  if (value === undefined) return undefined;
+  return typeof value === 'boolean' ? value : null;
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.every(uri => typeof uri === 'string') ? value : undefined;
 }
 
 function isAuthEntryChunkManifest(value: unknown): value is AuthEntryChunkManifest {

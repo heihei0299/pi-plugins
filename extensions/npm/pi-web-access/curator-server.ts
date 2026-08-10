@@ -8,12 +8,17 @@ const WATCHDOG_INTERVAL_MS = 1000;
 const MAX_BODY_SIZE = 64 * 1024;
 
 type ServerState = "SEARCHING" | "RESULT_SELECTION" | "COMPLETED";
+type CuratorResultEventData = IndexedCuratorSearchEntry & { slotIndex?: number };
+type CuratorSearchErrorEventData = { queryIndex: number; query: string; error: string; provider?: string; slotIndex?: number };
+type CuratorStoredEvent =
+	| { event: "result"; data: CuratorResultEventData }
+	| { event: "search-error"; data: CuratorSearchErrorEventData };
 
 export interface CuratorServerOptions {
 	queries: string[];
 	sessionToken: string;
 	timeout: number;
-	availableProviders: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; serpdive: boolean; kagi: boolean; ollama: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean };
+	availableProviders: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; jina: boolean; serpdive: boolean; kagi: boolean; ollama: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean };
 	defaultProvider: string;
 	searchProvider: string;
 	summaryModels: Array<{ value: string; label: string }>;
@@ -205,7 +210,8 @@ export function startCuratorServer(
 	let watchdog: NodeJS.Timeout | null = null;
 	let state: ServerState = "SEARCHING";
 	let sseResponse: ServerResponse | null = null;
-	const sseBuffer: string[] = [];
+	const streamedEventsByResultIndex = new Map<number, CuratorStoredEvent>();
+	let searchStreamDone = queries.length === 0;
 	let nextQueryIndex = queries.length;
 	let summarizeAbortController: AbortController | null = null;
 	let summarizeRequestSeq = 0;
@@ -274,6 +280,7 @@ export function startCuratorServer(
 		if (provider === "searchinfinity") return availableProviders.searchinfinity;
 		if (provider === "querit") return availableProviders.querit;
 		if (provider === "tavily") return availableProviders.tavily;
+		if (provider === "jina") return availableProviders.jina;
 		if (provider === "serpdive") return availableProviders.serpdive;
 		if (provider === "kagi") return availableProviders.kagi;
 		if (provider === "ollama") return availableProviders.ollama;
@@ -288,13 +295,35 @@ export function startCuratorServer(
 		return false;
 	}
 
-	function sendSSE(event: string, data: unknown): void {
+	function writeSSE(res: ServerResponse, event: string, data: unknown): boolean {
 		const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-		const res = sseResponse;
-		if (res && !res.writableEnded && res.socket && !res.socket.destroyed) {
-			try { res.write(payload); return; } catch {}
+		try {
+			res.write(payload);
+			return true;
+		} catch {
+			return false;
 		}
-		sseBuffer.push(payload);
+	}
+
+	function sendSSE(event: string, data: unknown): void {
+		const res = sseResponse;
+		if (res && !res.writableEnded && res.socket && !res.socket.destroyed && writeSSE(res, event, data)) return;
+		if (sseResponse === res) sseResponse = null;
+	}
+
+	function retainStreamedEvent(event: CuratorStoredEvent): void {
+		streamedEventsByResultIndex.set(event.data.queryIndex, event);
+	}
+
+	function getStreamedEvents(): CuratorStoredEvent[] {
+		return [...streamedEventsByResultIndex.values()];
+	}
+
+	function replaySSE(res: ServerResponse): void {
+		for (const item of getStreamedEvents()) {
+			if (!writeSSE(res, item.event, item.data)) return;
+		}
+		if (searchStreamDone) writeSSE(res, "done", {});
 	}
 
 	const pageHtml = generateCuratorPage(
@@ -352,18 +381,7 @@ export function startCuratorServer(
 				res.flushHeaders();
 				if (res.socket) res.socket.setNoDelay(true);
 				sseResponse = res;
-				if (sseBuffer.length > 0) {
-					const pending = sseBuffer.splice(0, sseBuffer.length);
-					for (let i = 0; i < pending.length; i++) {
-						const msg = pending[i];
-						try {
-							res.write(msg);
-						} catch {
-							sseBuffer.unshift(...pending.slice(i));
-							break;
-						}
-					}
-				}
+				replaySSE(res);
 				if (sseKeepalive) clearInterval(sseKeepalive);
 				sseKeepalive = setInterval(() => {
 					if (sseResponse) {
@@ -373,6 +391,17 @@ export function startCuratorServer(
 				req.on("close", () => {
 					if (sseResponse === res) sseResponse = null;
 				});
+				return;
+			}
+
+			if (method === "GET" && url.pathname === "/state") {
+				const token = url.searchParams.get("session");
+				if (token !== sessionToken) {
+					sendJson(res, 403, { ok: false, error: "Invalid session" });
+					return;
+				}
+				touchHeartbeat();
+				sendJson(res, 200, { ok: true, events: getStreamedEvents(), done: searchStreamDone });
 				return;
 			}
 
@@ -684,15 +713,20 @@ export function startCuratorServer(
 				pushResult: (queryIndex, data) => {
 					if (completed) return;
 					nextQueryIndex = Math.max(nextQueryIndex, queryIndex + 1);
-					sendSSE("result", { queryIndex, query: data.query ?? queries[queryIndex] ?? "", ...data });
+					const eventData: CuratorResultEventData = { ...data, queryIndex, query: data.query ?? queries[queryIndex] ?? "" };
+					retainStreamedEvent({ event: "result", data: eventData });
+					sendSSE("result", eventData);
 				},
 				pushError: (queryIndex, error, provider, meta) => {
 					if (completed) return;
 					nextQueryIndex = Math.max(nextQueryIndex, queryIndex + 1);
-					sendSSE("search-error", { queryIndex, query: meta?.query ?? queries[queryIndex] ?? "", error, provider, slotIndex: meta?.slotIndex });
+					const eventData: CuratorSearchErrorEventData = { queryIndex, query: meta?.query ?? queries[queryIndex] ?? "", error, provider, slotIndex: meta?.slotIndex };
+					retainStreamedEvent({ event: "search-error", data: eventData });
+					sendSSE("search-error", eventData);
 				},
 				searchesDone: () => {
 					if (completed) return;
+					searchStreamDone = true;
 					sendSSE("done", {});
 					state = "RESULT_SELECTION";
 					stateChangedAt = Date.now();

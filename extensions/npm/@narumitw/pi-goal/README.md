@@ -52,7 +52,7 @@ pi -e npm:@narumitw/pi-goal
 Try this package locally from the repository root:
 
 ```bash
-pi -e ./extensions/pi-goal
+pi -e ./packages/pi-goal
 ```
 
 ## ⚙️ Configuration
@@ -310,11 +310,11 @@ This breaking contract replaces and removes `pi-goal:rpc:start`, `pi-goal:rpc:pa
 ## 🗂️ Package layout
 
 ```txt
-extensions/pi-goal/
+packages/pi-goal/
 ├── src/
 │   ├── index.ts      # Pi package entrypoint
 │   ├── goal.ts       # Order-explicit extension composition root
-│   ├── command-registration.ts # Pi slash-command adapter
+│   ├── command-registration.ts # Lightweight slash-command adapter with lazy manager/settings UI
 │   ├── commands.ts   # Per-factory user-command and queue mutation controller
 │   ├── tools.ts      # Goal completion and blocker tool adapters
 │   ├── lifecycle.ts  # Pi session, agent, tool, and compaction event adapter

@@ -1,4 +1,5 @@
-import { complete, type Api, type AssistantMessage, type Message, type Model, type TextContent } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai/compat";
+import type { Api, AssistantMessage, Message, Model, ProviderHeaders, TextContent } from "@earendil-works/pi-ai";
 import { truncateAtWord } from "./utils.ts";
 import { throwIfAborted } from "./abort.ts";
 import type { ExtensionUIContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
@@ -11,11 +12,14 @@ import {
   type SamplingMessageContentBlock,
 } from "@modelcontextprotocol/client";
 
+export type SamplingUIContext = Pick<ExtensionUIContext, "confirm">;
+export type SamplingModelRegistry = Pick<ModelRegistry, "getAvailable" | "getApiKeyAndHeaders">;
+
 export interface SamplingHandlerOptions {
   serverName: string;
   autoApprove: boolean;
-  ui?: ExtensionUIContext;
-  modelRegistry: ModelRegistry;
+  ui?: SamplingUIContext;
+  modelRegistry: SamplingModelRegistry;
   getCurrentModel: () => Model<Api> | undefined;
   getSignal: () => AbortSignal | undefined;
 }
@@ -126,7 +130,7 @@ async function resolveSamplingModel(
 ): Promise<{
   model: Model<Api>;
   apiKey?: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
 }> {
   const candidates: Model<Api>[] = [];
   const availableModels = options.modelRegistry.getAvailable();

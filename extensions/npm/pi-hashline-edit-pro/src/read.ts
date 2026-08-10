@@ -3,6 +3,7 @@ import {
 	createReadTool,
 	formatSize,
 	truncateHead,
+	DEFAULT_MAX_LINES,
 	type TruncationResult,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -11,7 +12,7 @@ import { loadFileKindAndText } from "./file-kind";
 import { readNormFile } from "./file-reader";
 import { lineHashes, fmtRegion, HASH_SEP, MAX_HASH_LINES } from "./hashline";
 import { toCwd } from "./paths";
-import { abortIf } from "./utils";
+import { abortIf, isRec, normalizeFilePath } from "./utils";
 import { fileSnap } from "./file-reader";
 import { visLines } from "./utils";
 import { loadP, loadGuide } from "./prompts";
@@ -57,6 +58,7 @@ export async function fmtReadPreview(
 	precomputedHashes?: string[],
 	path?: string,
 	maxLineBytes = MAX_READ_LINE_BYTES,
+	maxTruncLines = DEFAULT_MAX_LINES,
 ): Promise<{ text: string; truncation?: TruncationResult; nextOffset?: number }> {
 	const allLines = visLines(text);
 	const totalLines = allLines.length;
@@ -99,7 +101,7 @@ export async function fmtReadPreview(
 				? `[Line ${row.lineNumber} is ${formatSize(row.bytes)}, exceeds ${formatSize(maxBytes)}; content not shown. Use bash: sed -n '${row.lineNumber}p' <path> | head -c ${maxBytes}]`
 				: fmtRegion([selectedHashes[index]!], [selected[index]!]),
 		);
-		const skippedTruncation = truncateHead(rows.join("\n"), { maxBytes });
+		const skippedTruncation = truncateHead(rows.join("\n"), { maxBytes, maxLines: maxTruncLines });
 		const shownRowCount = skippedTruncation.content === "" ? 0 : skippedTruncation.content.split("\n").length;
 		const lastShownLine = shownRowCount > 0 ? startLine + shownRowCount - 1 : startLine - 1;
 		const lineLabel = oversized.length === 1 ? `Line ${oversized[0]!.lineNumber}` : `Lines ${oversized.map((row) => row.lineNumber).join(", ")}`;
@@ -121,7 +123,7 @@ export async function fmtReadPreview(
 		};
 	}
 
-	const truncation = truncateHead(formatted, { maxBytes });
+	const truncation = truncateHead(formatted, { maxBytes, maxLines: maxTruncLines });
 
 	let preview = truncation.content;
 	let nextOffset: number | undefined;
@@ -152,6 +154,12 @@ export function regRead(pi: ExtensionAPI): void {
 		description: R_DESC,
 		promptSnippet: R_SNIPPET,
 		promptGuidelines: readGuide(),
+		prepareArguments: (args: unknown) => {
+			if (!isRec(args)) return args as any;
+			const record = { ...args };
+			normalizeFilePath(record);
+			return record;
+		},
 		parameters: Type.Object({
 			path: Type.String({
 				description: "Path to the file to read (relative or absolute)",
@@ -202,8 +210,12 @@ export function regRead(pi: ExtensionAPI): void {
 				fileHashes,
 				absolutePath,
 			);
-			const snapshot = await fileSnap(absolutePath);
-
+			let snapshotId: string | undefined;
+			try {
+				snapshotId = (await fileSnap(absolutePath)).snapshotId;
+			} catch (error) {
+				console.error("Failed to compute snapshot for read:", error);
+			}
 			const previewText =
 				hadUtf8DecodeErrors
 					? `${preview.text}\n\n[Non-UTF-8 bytes shown as U+FFFD; editing rewrites the file as UTF-8.]`
@@ -213,7 +225,7 @@ export function regRead(pi: ExtensionAPI): void {
 				content: [{ type: "text", text: previewText }],
 				details: {
 					truncation: preview.truncation,
-					snapshotId: snapshot.snapshotId,
+					snapshotId,
 					...(preview.nextOffset !== undefined
 						? { nextOffset: preview.nextOffset }
 						: {}),

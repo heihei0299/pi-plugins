@@ -8,7 +8,7 @@ function safeInlineJSON(data: unknown): string {
 }
 
 function buildProviderButtons(
-	available: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; serpdive: boolean; kagi: boolean; ollama: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean },
+	available: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; jina: boolean; serpdive: boolean; kagi: boolean; ollama: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean },
 	selected: string,
 	hasInitialQueries: boolean,
 ): string {
@@ -23,6 +23,7 @@ function buildProviderButtons(
 		{ value: "searchinfinity", label: "Searchinfinity", available: available.searchinfinity },
 		{ value: "querit", label: "Querit", available: available.querit },
 		{ value: "tavily", label: "Tavily", available: available.tavily },
+		{ value: "jina", label: "Jina", available: available.jina },
 		{ value: "serpdive", label: "SERPdive", available: available.serpdive },
 		{ value: "kagi", label: "Kagi", available: available.kagi },
 		{ value: "ollama", label: "Ollama", available: available.ollama },
@@ -51,7 +52,7 @@ export function generateCuratorPage(
 	queries: string[],
 	sessionToken: string,
 	timeout: number,
-	availableProviders: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; serpdive: boolean; kagi: boolean; ollama: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean },
+	availableProviders: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; jina: boolean; serpdive: boolean; kagi: boolean; ollama: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean },
 	defaultProvider: string,
 	searchProvider: string,
 	summaryModels: Array<{ value: string; label: string }>,
@@ -713,6 +714,11 @@ main {
   color: #a6e3a1;
   background: rgba(166, 227, 161, 0.14);
   border-color: rgba(166, 227, 161, 0.3);
+}
+.provider-tag.provider-jina {
+  color: #f9e2af;
+  background: rgba(249, 226, 175, 0.14);
+  border-color: rgba(249, 226, 175, 0.3);
 }
 .provider-tag.provider-serpdive {
   color: #94e2d5;
@@ -1447,7 +1453,7 @@ const SCRIPT = `(function() {
   var token = DATA.sessionToken;
   var timeoutSec = DATA.timeout;
   var queries = Array.isArray(DATA.queries) ? DATA.queries : [];
-  var providers = ["all", "openai", "exa", "brave", "parallel", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "serpdive", "kagi", "ollama", "searxng", "perplexity", "gemini", "anysearch", "xai", "brightdata", "serpbase"];
+  var providers = ["all", "openai", "exa", "brave", "parallel", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "jina", "serpdive", "kagi", "ollama", "searxng", "perplexity", "gemini", "anysearch", "xai", "brightdata", "serpbase"];
   var availProviders = DATA.availableProviders && typeof DATA.availableProviders === "object" ? DATA.availableProviders : {};
   var workflow = "summary-review";
   var initialDefaultProvider = typeof DATA.defaultProvider === "string" ? DATA.defaultProvider : "exa";
@@ -1475,6 +1481,9 @@ const SCRIPT = `(function() {
   var lastInteraction = Date.now();
   var completedCount = 0;
   var es = null;
+  var lastLiveEventAt = Date.now();
+  var stateSyncInFlight = false;
+  var liveUpdateWarning = false;
 
   var allQueries = queries.map(function(query, slotId) { return { slotId: slotId, query: query }; });
   var nextSlotId = queries.length;
@@ -1656,6 +1665,7 @@ const SCRIPT = `(function() {
     if (provider === "searchinfinity") return "Searchinfinity";
     if (provider === "querit") return "Querit";
     if (provider === "tavily") return "Tavily";
+    if (provider === "jina") return "Jina";
     if (provider === "serpdive") return "SERPdive";
     if (provider === "kagi") return "Kagi";
     if (provider === "ollama") return "Ollama";
@@ -1942,15 +1952,28 @@ const SCRIPT = `(function() {
   }
 
   function clearError() {
+    liveUpdateWarning = false;
     if (!errorBanner) return;
     errorBanner.hidden = true;
     errorBanner.textContent = "";
   }
 
   function setError(text) {
+    liveUpdateWarning = false;
     if (!errorBanner) return;
     errorBanner.textContent = text;
     errorBanner.hidden = false;
+  }
+
+  function setLiveUpdateWarning(text) {
+    liveUpdateWarning = true;
+    if (!errorBanner) return;
+    errorBanner.textContent = text;
+    errorBanner.hidden = false;
+  }
+
+  function clearLiveUpdateWarning() {
+    if (liveUpdateWarning) clearError();
   }
 
   function updateSummaryGeneratingIndicator() {
@@ -2749,9 +2772,10 @@ const SCRIPT = `(function() {
     }
   }
 
-  es.addEventListener("result", function(e) {
-    var data = parseSseEventData("result", e);
+  function applyResultEvent(data) {
     if (!data) return;
+    lastLiveEventAt = Date.now();
+    clearLiveUpdateWarning();
 
     var queryText = data.query || queries[data.queryIndex] || "";
     var slotId = typeof data.slotIndex === "number" ? data.slotIndex : queryIndexToSlot.get(data.queryIndex);
@@ -2761,13 +2785,16 @@ const SCRIPT = `(function() {
       card = createSearchingCard(queryText, data.provider);
       card.dataset.qi = data.queryIndex;
       insertResultCard(card, slotId, null);
+    } else if (card.dataset.completed === "true") {
+      return;
     }
     applyResponseToCard(card, data, queryText, data.provider, slotId);
-  });
+  }
 
-  es.addEventListener("search-error", function(e) {
-    var data = parseSseEventData("search-error", e);
+  function applySearchErrorEvent(data) {
     if (!data) return;
+    lastLiveEventAt = Date.now();
+    clearLiveUpdateWarning();
 
     var queryText = data.query || queries[data.queryIndex] || "";
     var slotId = typeof data.slotIndex === "number" ? data.slotIndex : queryIndexToSlot.get(data.queryIndex);
@@ -2777,6 +2804,8 @@ const SCRIPT = `(function() {
       card = createSearchingCard(queryText, data.provider);
       card.dataset.qi = data.queryIndex;
       insertResultCard(card, slotId, null);
+    } else if (card.dataset.completed === "true") {
+      return;
     }
     applyResponseToCard(card, {
       queryIndex: data.queryIndex,
@@ -2785,9 +2814,12 @@ const SCRIPT = `(function() {
       error: data.error || "Search failed",
       provider: data.provider,
     }, queryText, data.provider, slotId);
-  });
+  }
 
-  es.addEventListener("done", function() {
+  function applyDoneEvent() {
+    var wasSearchesDone = searchesDone;
+    lastLiveEventAt = Date.now();
+    clearLiveUpdateWarning();
     searchesDone = true;
     initialStreamDone = true;
     if (completedCount > 0) {
@@ -2797,12 +2829,77 @@ const SCRIPT = `(function() {
     recomputeProviderStates();
     updateStageUI();
     maybeAutoGenerateSummary();
-    resetTimer();
+    if (!wasSearchesDone) resetTimer();
+  }
+
+  function applyStoredLiveEvent(item) {
+    if (!item || typeof item !== "object") return;
+    if (item.event === "result") applyResultEvent(item.data);
+    if (item.event === "search-error") applySearchErrorEvent(item.data);
+  }
+
+  function syncStateFromServer(showWarning) {
+    if (stateSyncInFlight || submitted || timerExpired || searchesDone) return;
+    stateSyncInFlight = true;
+    fetch("/state?session=" + encodeURIComponent(token), { cache: "no-store" })
+      .then(function(res) {
+        return res.text().then(function(raw) {
+          var data = raw ? JSON.parse(raw) : null;
+          if (!res.ok || !data || data.ok === false) {
+            throw new Error(extractServerError(data) || ("HTTP " + res.status));
+          }
+          return data;
+        });
+      })
+      .then(function(data) {
+        if (Array.isArray(data.events)) {
+          data.events.forEach(applyStoredLiveEvent);
+        }
+        if (data.done) applyDoneEvent();
+        if (showWarning && !searchesDone) {
+          setLiveUpdateWarning("Live search updates disconnected. Reconnecting and polling for results.");
+        }
+      })
+      .catch(function(err) {
+        if (!showWarning || submitted || timerExpired) return;
+        var message = err instanceof Error ? err.message : String(err);
+        setLiveUpdateWarning("Live search updates disconnected. Retrying: " + (message || "unknown error"));
+      })
+      .finally(function() {
+        stateSyncInFlight = false;
+      });
+  }
+
+  es.addEventListener("open", function() {
+    lastLiveEventAt = Date.now();
+    clearLiveUpdateWarning();
+    syncStateFromServer(false);
+  });
+
+  es.addEventListener("result", function(e) {
+    var data = parseSseEventData("result", e);
+    applyResultEvent(data);
+  });
+
+  es.addEventListener("search-error", function(e) {
+    var data = parseSseEventData("search-error", e);
+    applySearchErrorEvent(data);
+  });
+
+  es.addEventListener("done", function() {
+    applyDoneEvent();
   });
 
   es.onerror = function() {
-    // EventSource reconnects automatically.
+    if (submitted || timerExpired || searchesDone) return;
+    syncStateFromServer(true);
   };
+
+  setInterval(function() {
+    if (submitted || timerExpired || searchesDone || initialStreamDone) return;
+    if (Date.now() - lastLiveEventAt <= 5000) return;
+    syncStateFromServer(false);
+  }, 5000);
 
   function setupCardInteraction(card) {
     var header = card.querySelector(".result-card-header");

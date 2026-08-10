@@ -70,7 +70,7 @@ pi -e npm:@narumitw/pi-lsp
 Try this package locally from the repository root:
 
 ```bash
-pi -e ./extensions/pi-lsp
+pi -e ./packages/pi-lsp
 ```
 
 ## ⚙️ Configuration
@@ -274,7 +274,7 @@ Shows configured LSP commands and whether each command is available on `PATH`.
 ## 🗂️ Package layout
 
 ```txt
-extensions/pi-lsp/
+packages/pi-lsp/
 ├── src/
 │   ├── index.ts
 │   ├── adapters.ts

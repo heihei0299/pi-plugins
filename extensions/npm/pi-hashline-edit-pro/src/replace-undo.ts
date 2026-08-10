@@ -7,10 +7,10 @@ import { contentChecksum } from "./hashline/hasher";
 import { resolveTarget, writeAtomic } from "./fs-write";
 import { toCwd } from "./paths";
 import { toLF, stripBOM, genDiff, restoreEndings, type LineEnding } from "./replace-diff";
-import { cntDiff, splitLines, errCode } from "./utils";
+import { cntDiff, splitLines, errCode, isRec, normalizeFilePath } from "./utils";
 import { loadP, loadGuide } from "./prompts";
 import { buildMetrics } from "./replace-response";
-import { changedRange } from "./hashline";
+import { changedRange, lineHashes } from "./hashline";
 export interface UndoEntry {
   content: string;
   bom: string;
@@ -91,6 +91,12 @@ export function regReplaceUndo(pi: ExtensionAPI): void {
     description: loadP("../prompts/undo-last-replace.md"),
     promptSnippet: loadP("../prompts/undo-last-replace-snippet.md"),
     promptGuidelines: loadGuide("../prompts/undo-last-replace-guidelines.md"),
+    prepareArguments: (args: unknown) => {
+      if (!isRec(args)) return args as any;
+      const record = { ...args };
+      normalizeFilePath(record);
+      return record;
+    },
     parameters: Type.Object({
       path: Type.String({
         description: "Path to the file to undo",
@@ -153,11 +159,12 @@ export function regReplaceUndo(pi: ExtensionAPI): void {
 
         const { text: currentStripped } = stripBOM(currentRaw);
         const currentNormalized = toLF(currentStripped);
-        const diffResult = genDiff(undo.content, currentNormalized, 0);
+        const currentHashes = await lineHashes(currentNormalized, mutationTargetPath);
+        const diffResult = genDiff(undo.content, currentNormalized, 0, undefined, undo.hashes);
         const linesAddedByReplace = cntDiff(diffResult.diff, "+");
         const linesRemovedByReplace = cntDiff(diffResult.diff, "-");
         const restoredRange = changedRange(currentNormalized, undo.content);
-        const undoDiff = genDiff(currentNormalized, undo.content, 1, undo.hashes).diff;
+        const undoDiff = genDiff(currentNormalized, undo.content, 1, undo.hashes, currentHashes).diff;
 
         await writeAtomic(
           mutationTargetPath,

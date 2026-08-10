@@ -4,6 +4,7 @@ export {
 	HASH_SEP,
 	HASH_CLASS,
 	HASH_SPACE,
+	HASH_PROBE_STRIDE,
 	MAX_HASH_LINES,
 	HL_PREFIX_PLUS_RE,
 	HL_PREFIX_MINUS_RE,
@@ -11,6 +12,7 @@ export {
 	lineHashes,
 	_lineHashesPure,
 	initHasher,
+	canon,
 } from "./hash";
 
 export {
@@ -25,7 +27,7 @@ export {
 	type RHEdit,
 	type HTEdit,
 	type NEdit,
-	type BDupWarn,
+	type BDup,
 	type AutoFix,
 	resEdit,
 	valEdit,
@@ -33,6 +35,7 @@ export {
 	stripDiffPrefixes,
 	swapReversedRanges,
 	fmtMismatch,
+	findNewEdge,
 } from "./resolve";
 
 export {
