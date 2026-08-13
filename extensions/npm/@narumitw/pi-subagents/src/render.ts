@@ -7,7 +7,8 @@ import {
 	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import type { AgentScope, SubagentThinkingLevel } from "./agents.js";
+import type { AgentScope, SubagentThinkingLevel } from "./agents/types.js";
+import { renderPanelCall, renderPanelResult } from "./panel-render.js";
 import { hasUsableAggregator, type SubagentParams } from "./params.js";
 import { expansionHint, formatToolActivity, safeBlock, safeLine } from "./render-common.js";
 import {
@@ -137,6 +138,12 @@ function sanitizeSingleResultForRender(result: SingleResult): SingleResult {
 }
 
 function renderResultStatus(result: SingleResult, isPartial: boolean): string {
+	if (result.outcome && !["completed", "partial"].includes(result.outcome.status)) {
+		return result.outcome.status
+			.split("-")
+			.map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+			.join(" ");
+	}
 	if (isResultError(result)) {
 		return result.stopReason === "aborted" || result.aborted ? "Cancelled" : "Failed";
 	}
@@ -153,6 +160,31 @@ function coloredResultStatus(theme: Theme, result: SingleResult, isPartial: bool
 	return coloredStatus(theme, renderResultStatus(result, isPartial));
 }
 
+function formatResultIntelligence(result: SingleResult): string {
+	const structured =
+		result.structuredResult?.version === "pi-subagents:result:v2"
+			? result.structuredResult
+			: undefined;
+	return [
+		result.contract ? `contract: ${result.contract.level} · ${result.contract.taskId}` : undefined,
+		result.outcome
+			? `outcome: ${result.outcome.status}${result.outcome.reasonCode ? ` · ${result.outcome.reasonCode}` : ""}`
+			: undefined,
+		structured
+			? `evidence: ${structured.claims.length} claims · ${structured.artifacts.length} artifacts · ${structured.verification.length} verification items · ${structured.limitations.length} limitations`
+			: undefined,
+		result.resultContractInvalid ? "contract warning: invalid structured result" : undefined,
+		result.executionPlan
+			? `plan: ${result.executionPlan.id.slice(0, 12)} · generation ${result.executionPlan.taskGeneration} · admission ${result.executionPlan.admission.recommendation}`
+			: undefined,
+		result.capabilityGrant
+			? `grant: ${result.capabilityGrant.state} · expires ${result.capabilityGrant.expiresAt}`
+			: undefined,
+	]
+		.filter((line): line is string => Boolean(line))
+		.join("\n");
+}
+
 function formatResultPolicy(result: SingleResult): string {
 	if (!result.policy) return "";
 	return [
@@ -164,11 +196,34 @@ function formatResultPolicy(result: SingleResult): string {
 
 export function renderSubagentCall(args: SubagentParams, theme: Theme) {
 	const scope: AgentScope = args.agentScope ?? "user";
+	const limits = [
+		typeof args.timeoutMs === "number" ? `timeout:${args.timeoutMs}ms` : undefined,
+		typeof args.totalTimeoutMs === "number" ? `total:${args.totalTimeoutMs}ms` : undefined,
+		typeof args.idleTimeoutMs === "number" ? `idle:${args.idleTimeoutMs}ms` : undefined,
+		typeof args.maxTurns === "number" ? `turns:${args.maxTurns}` : undefined,
+		typeof args.maxToolCalls === "number" ? `tools:${args.maxToolCalls}` : undefined,
+	].filter((value): value is string => Boolean(value));
+	const limitText = limits.length > 0 ? ` · ${limits.join(" · ")}` : "";
+	const panelCall = renderPanelCall(args, theme);
+	if (panelCall) return panelCall;
+	if (args.workflow && args.workflow.tasks.length > 0) {
+		let text =
+			theme.fg("toolTitle", theme.bold("subagent ")) +
+			theme.fg("accent", `workflow (${args.workflow.tasks.length} tasks)`) +
+			theme.fg("muted", ` [${scope}]${limitText}`);
+		for (const task of args.workflow.tasks.slice(0, 3)) {
+			text += `\n  ${theme.fg("muted", `${task.id}:`)} ${theme.fg("accent", previewAgent(task.agent))}${theme.fg("dim", ` ${previewTask(task.task)}`)}`;
+		}
+		if (args.workflow.tasks.length > 3) {
+			text += `\n  ${theme.fg("muted", `... +${args.workflow.tasks.length - 3} more`)}`;
+		}
+		return new Text(text, 0, 0);
+	}
 	if (args.chain && args.chain.length > 0) {
 		let text =
 			theme.fg("toolTitle", theme.bold("subagent ")) +
 			theme.fg("accent", `chain (${args.chain.length} steps)`) +
-			theme.fg("muted", ` [${scope}]`);
+			theme.fg("muted", ` [${scope}]${limitText}`);
 		for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
 			const step = args.chain[i] as { agent?: unknown; task?: unknown } | undefined;
 			// Clean up {previous} placeholder for display
@@ -189,7 +244,7 @@ export function renderSubagentCall(args: SubagentParams, theme: Theme) {
 		let text =
 			theme.fg("toolTitle", theme.bold("subagent ")) +
 			theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-			theme.fg("muted", ` [${scope}]`);
+			theme.fg("muted", ` [${scope}]${limitText}`);
 		for (const task of args.tasks.slice(0, 3)) {
 			const item = task as { agent?: unknown; task?: unknown } | undefined;
 			text += `\n  ${theme.fg("accent", previewAgent(item?.agent))}${theme.fg("dim", ` ${previewTask(item?.task)}`)}`;
@@ -210,7 +265,7 @@ export function renderSubagentCall(args: SubagentParams, theme: Theme) {
 	let text =
 		theme.fg("toolTitle", theme.bold("subagent ")) +
 		theme.fg("accent", agentName) +
-		theme.fg("muted", ` [${scope}]`);
+		theme.fg("muted", ` [${scope}]${limitText}`);
 	text += `\n  ${theme.fg("dim", preview)}`;
 	return new Text(text, 0, 0);
 }
@@ -221,6 +276,10 @@ export function renderSubagentResult(
 	theme: Theme,
 ) {
 	const rawDetails = result.details as SubagentDetails | undefined;
+	if (rawDetails?.mode === "panel") {
+		const panelResult = renderPanelResult(rawDetails, expanded, isPartial, theme);
+		if (panelResult) return panelResult;
+	}
 	if (!rawDetails || rawDetails.results.length === 0) {
 		const text = result.content[0];
 		return new Text(
@@ -277,6 +336,12 @@ export function renderSubagentResult(
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
 			container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
+			const intelligence = formatResultIntelligence(r);
+			if (intelligence) {
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("muted", "─── Delegation ───"), 0, 0));
+				container.addChild(new Text(theme.fg("dim", intelligence), 0, 0));
+			}
 			const policy = formatResultPolicy(r);
 			if (policy) {
 				container.addChild(new Spacer(1));
@@ -467,7 +532,8 @@ export function renderSubagentResult(
 		return new Text(text, 0, 0);
 	}
 
-	if (details.mode === "parallel") {
+	if (details.mode === "parallel" || details.mode === "workflow") {
+		const modeLabel = details.mode === "workflow" ? "workflow" : "parallel";
 		const resultIsRunning = (result: SingleResult) =>
 			result.exitCode === -1 && !isResultError(result);
 		const running = details.results.filter(resultIsRunning).length;
@@ -507,7 +573,7 @@ export function renderSubagentResult(
 			const container = new Container();
 			container.addChild(
 				new Text(
-					`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)} · ${coloredStatus(theme, overallStatus)}`,
+					`${icon} ${theme.fg("toolTitle", theme.bold(`${modeLabel} `))}${theme.fg("accent", status)} · ${coloredStatus(theme, overallStatus)}`,
 					0,
 					0,
 				),
@@ -623,7 +689,7 @@ export function renderSubagentResult(
 		}
 
 		// Collapsed view (or still running)
-		let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)} · ${coloredStatus(theme, overallStatus)}`;
+		let text = `${icon} ${theme.fg("toolTitle", theme.bold(`${modeLabel} `))}${theme.fg("accent", status)} · ${coloredStatus(theme, overallStatus)}`;
 		for (const r of details.results) {
 			const rFailed = isResultError(r);
 			const rRunning = resultIsRunning(r);

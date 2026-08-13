@@ -8,17 +8,16 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import { DEFAULT_AGENT_CATALOG_MAX_ITEMS } from "./agents/catalog.js";
+import { type AgentDiscoveryResult, discoverAgents } from "./agents/discovery.js";
 import {
 	type AgentConfig,
-	type AgentDiscoveryResult,
 	type AgentScope,
 	type ConsultResourcePolicy,
-	DEFAULT_AGENT_CATALOG_MAX_ITEMS,
-	discoverAgents,
 	isThinkingLevel,
 	type SubagentSettings,
 	THINKING_LEVELS,
-} from "./agents.js";
+} from "./agents/types.js";
 import { resolveConsultTools } from "./consult-policy.js";
 import { renderConsultCall, renderConsultResult } from "./consult-render.js";
 import { resolveConsultResourceLaunchPolicy } from "./consult-resources.js";
@@ -27,7 +26,10 @@ import {
 	type ResolvedSubagentTarget,
 	resolveSubagentTarget,
 } from "./cwd-policy.js";
-import { assertSubagentDepthAllowed, resolveDefaultSubagentTimeoutMs } from "./execution.js";
+import {
+	assertSubagentDepthAllowed,
+	resolveDefaultSubagentTimeoutMs,
+} from "./execution/runtime-policy.js";
 import {
 	DEFAULT_MAX_CONTEXT_BYTES,
 	DEFAULT_MAX_STDERR_BYTES,
@@ -45,8 +47,8 @@ import { boundedPrivateText, boundText, safeDisplayPath, safeTerminalLine } from
 import {
 	DEFAULT_CONSULT_RESOURCE_POLICY,
 	DEFAULT_CONSULTATION_CWD_POLICY,
-	resolveSubagentThinkingLevel,
-} from "./settings.js";
+} from "./settings/inspection.js";
+import { resolveSubagentThinkingLevel } from "./settings.js";
 
 const ConsultScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	default: "user",
@@ -61,7 +63,14 @@ export const SubagentConsultParams = Type.Object(
 		agentScope: Type.Optional(ConsultScopeSchema),
 		confirmProjectAgents: Type.Optional(Type.Boolean({ default: true })),
 		cwd: Type.Optional(Type.String({ minLength: 1 })),
-		timeoutMs: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_SUBAGENT_TIMEOUT_MS })),
+		timeoutMs: Type.Optional(
+			Type.Number({
+				minimum: 1,
+				maximum: MAX_SUBAGENT_TIMEOUT_MS,
+				description:
+					"Work deadline selected for the consultation difficulty. On expiry, Pi aborts the work and makes one separately bounded summary attempt.",
+			}),
+		),
 		thinkingLevel: Type.Optional(ConsultThinkingSchema),
 	},
 	{ additionalProperties: false },
@@ -191,6 +200,7 @@ export function registerSubagentConsult(
 		promptSnippet: "Consult one constrained read-only subagent and wait for its answer",
 		promptGuidelines: [
 			"Use subagent_consult for bounded reconnaissance, planning, or review whose result is required in the current turn.",
+			"Set subagent_consult timeoutMs to the shortest realistic work deadline for the task difficulty; split oversized consultations instead of extending the deadline merely to compensate for broad scope.",
 			"Implementation-shaped tasks remain read-only and can return only analysis or instructions.",
 		],
 		parameters: SubagentConsultParams,

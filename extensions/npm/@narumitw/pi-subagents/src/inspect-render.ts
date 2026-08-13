@@ -24,6 +24,7 @@ export function renderInspectCall(args: Partial<SubagentInspectParams>, theme: T
 	if (args.agentScope) metadata.push(`[${args.agentScope}]`);
 	if (args.agent) metadata.push(`agent:${safeLine(args.agent, "", 256)}`);
 	if (args.agentId) metadata.push(`id:${safeLine(args.agentId, "", 256)}`);
+	if (args.workflowId) metadata.push(`workflow:${safeLine(args.workflowId, "", 256)}`);
 	if (args.includeClosed) metadata.push("include closed");
 	return new Text(toolHeader(theme, "subagent_inspect", action, metadata), 0, 0);
 }
@@ -74,6 +75,23 @@ function renderAction(
 			if (!expanded) lines.push(expansionHint());
 			return lines.join("\n");
 		}
+		case "list_workflows":
+			return renderList(
+				"workflow",
+				recordList(details.workflows),
+				details,
+				expanded,
+				theme,
+				formatWorkflow,
+			);
+		case "get_workflow": {
+			const workflow = recordValue(details.workflow);
+			if (!workflow) return undefined;
+			return [
+				`${statusBadge(theme, "completed")} · workflow ${theme.fg("accent", safeLine(workflow.workflowId, "workflow", 256))}`,
+				formatWorkflow(workflow, theme, expanded),
+			].join("\n");
+		}
 		case "list_models":
 			return renderList(
 				"model",
@@ -84,6 +102,17 @@ function renderAction(
 				formatModel,
 				stringValue(details.source),
 			);
+		case "preview_context": {
+			const preview = recordValue(details.preview);
+			if (!preview) return undefined;
+			return [
+				`${statusBadge(theme, "completed")} · context ${theme.fg("accent", safeLine(preview.mode, "none", 128))}`,
+				theme.fg(
+					"dim",
+					`${numberValue(preview.turns)} turns · ${numberValue(preview.sourceCount)} sources · ${numberValue(preview.bytes)} bytes${preview.truncated === true ? " · truncated" : ""}`,
+				),
+			].join("\n");
+		}
 		case "status":
 			return renderStatus(details, expanded, theme);
 		case "diagnose":
@@ -146,13 +175,57 @@ function formatRun(run: Record<string, unknown>, theme: Theme, expanded: boolean
 	];
 	if (expanded) {
 		const thinking = stringValue(run.thinkingLevel);
+		const timeout = numberValue(run.currentTimeoutMs) || numberValue(run.timeoutMs);
+		const idleTimeout = numberValue(run.currentIdleTimeoutMs) || numberValue(run.idleTimeoutMs);
+		const maxTurns = numberValue(run.currentMaxTurns) || numberValue(run.maxTurns);
+		const maxToolCalls = numberValue(run.currentMaxToolCalls) || numberValue(run.maxToolCalls);
 		const task = safeBlock(run.currentTask, "", 2 * 1024).trim();
 		const error = safeBlock(run.error, "", 2 * 1024).trim();
 		lines.push(
-			`  ${theme.fg("dim", `${numberValue(run.historyCount)} history · ${thinking ? `thinking:${safeLine(thinking, "", 128)} · ` : ""}${numberValue(run.children)} children`)}`,
+			`  ${theme.fg("dim", `${numberValue(run.historyCount)} history · ${thinking ? `thinking:${safeLine(thinking, "", 128)} · ` : ""}${timeout ? `timeout:${timeout}ms · ` : ""}${idleTimeout ? `idle:${idleTimeout}ms · ` : ""}${maxTurns ? `turns:${maxTurns} · ` : ""}${maxToolCalls ? `tools:${maxToolCalls} · ` : ""}${numberValue(run.children)} children`)}`,
 		);
+		const context = recordValue(run.context);
+		const telemetry = recordValue(run.telemetry);
+		if (context) {
+			lines.push(
+				`  ${theme.fg("dim", `context: ${numberValue(context.turns)} turns · ${numberValue(context.sources)} sources · ${numberValue(context.bytes)} bytes${context.truncated === true ? " · truncated" : ""}`)}`,
+			);
+		}
+		if (telemetry) {
+			lines.push(
+				`  ${theme.fg("dim", `transport: ${safeLine(telemetry.transport, "unknown", 128)} · phase:${safeLine(telemetry.phase, "unknown", 128)}${stringValue(telemetry.protocol) ? ` · ${safeLine(telemetry.protocol, "", 128)}` : ""}`)}`,
+			);
+		}
 		if (task) lines.push(`  ${theme.fg("dim", `task: ${task}`)}`);
 		if (error) lines.push(`  ${theme.fg("error", `error: ${error}`)}`);
+	}
+	return lines.join("\n");
+}
+
+function formatWorkflow(
+	workflow: Record<string, unknown>,
+	theme: Theme,
+	expanded: boolean,
+): string {
+	const id = safeLine(workflow.workflowId, "workflow", 256);
+	const states = recordValue(workflow.states);
+	const stateText = states
+		? Object.entries(states)
+				.map(([state, count]) => `${safeLine(state, "unknown", 128)}:${numberValue(count)}`)
+				.join(" · ")
+		: "";
+	const lines = [
+		`${theme.fg("muted", "• ")}${theme.fg("accent", id)} ${theme.fg("muted", `${numberValue(workflow.itemCount)} items · generation:${numberValue(workflow.generation)}`)}`,
+	];
+	if (stateText) lines.push(`  ${theme.fg("dim", stateText)}`);
+	if (expanded) {
+		for (const item of recordList(workflow.items).slice(0, COLLAPSED_LIST_LIMIT)) {
+			lines.push(
+				`  ${theme.fg("muted", "- ")}${theme.fg("toolOutput", safeLine(item.id, "task", 256))} ${theme.fg("dim", safeLine(item.state, "unknown", 128))}`,
+			);
+		}
+		const omitted = numberValue(workflow.omittedItems);
+		if (omitted > 0) lines.push(theme.fg("muted", `  … ${omitted} tasks omitted`));
 	}
 	return lines.join("\n");
 }
@@ -181,11 +254,15 @@ function renderStatus(
 	const status = recordValue(details.status);
 	const stateful = recordValue(status?.stateful);
 	if (!status || !stateful) return undefined;
+	const currentLimits = recordValue(status.statefulLimits) ?? recordValue(stateful.limits);
 	const lines = [
 		`${statusBadge(theme, "completed")} · runtime status`,
 		`${theme.fg("muted", "workflow: ")}${theme.fg("accent", safeLine(status.workflow, "unknown", 128))} · ${numberValue(stateful.activeAgents)} active · ${numberValue(stateful.retainedAgents)} retained`,
 		`${theme.fg("muted", "stateful: ")}${stateful.initialized === true ? "initialized" : "not initialized"} · resources: ${safeLine(status.consultResources, "unknown", 128)}`,
 	];
+	if (currentLimits) {
+		lines.push(`${theme.fg("muted", "limits: ")}${formatDetachedLimits(currentLimits)}`);
+	}
 	if (expanded) {
 		const delivery = stringValue(stateful.completionDelivery);
 		const transport = stringValue(stateful.transport);
@@ -202,8 +279,31 @@ function renderStatus(
 				),
 			);
 		}
+		const configured = recordValue(status.configuredStatefulLimits);
+		const sources = recordValue(status.configuredStatefulLimitSources);
+		if (configured) {
+			lines.push(theme.fg("dim", `configured: ${formatDetachedLimits(configured, sources)}`));
+		}
 	} else lines.push(expansionHint());
 	return lines.join("\n");
+}
+
+function formatDetachedLimits(
+	limits: Record<string, unknown>,
+	sources?: Record<string, unknown>,
+): string {
+	return [
+		["agents", "maxAgents"],
+		["active", "maxActiveTurns"],
+		["children", "maxChildrenPerAgent"],
+		["depth", "maxDepth"],
+		["stored", "maxStoredAgents"],
+	]
+		.map(([label, field]) => {
+			const source = stringValue(sources?.[field]);
+			return `${label}:${numberValue(limits[field])}${source ? ` (${safeLine(source, "", 64)})` : ""}`;
+		})
+		.join(" · ");
 }
 
 function renderDiagnose(details: Record<string, unknown>, expanded: boolean, theme: Theme): string {

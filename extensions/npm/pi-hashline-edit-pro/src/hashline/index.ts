@@ -36,6 +36,9 @@ export {
 	swapReversedRanges,
 	fmtMismatch,
 	findNewEdge,
+	assertRangeServed,
+	RangeStaleError,
+	AnchorMismatchError,
 } from "./resolve";
 
 export {

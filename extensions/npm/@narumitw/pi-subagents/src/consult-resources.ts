@@ -1,11 +1,6 @@
-import {
-	DefaultResourceLoader,
-	getAgentDir,
-	SettingsManager,
-} from "@earendil-works/pi-coding-agent";
-import type { ConsultResourcePolicy } from "./agents.js";
+import type { ConsultResourcePolicy } from "./agents/types.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, truncateUtf8 } from "./limits.js";
-import { assertPiPromptSourcesAreReadableFiles } from "./prompt-source-safety.js";
+import { resolvePiPromptResources } from "./prompt-resources.js";
 import type { ChildLaunchPolicy } from "./runner.js";
 
 const MINIMAL_CONSULT_SYSTEM_PROMPT =
@@ -31,30 +26,12 @@ export async function resolveConsultResourceLaunchPolicy(
 		};
 	}
 
-	const agentDir = getAgentDir();
-	assertPiPromptSourcesAreReadableFiles(cwd, agentDir, projectTrusted, [
-		"SYSTEM.md",
-		"APPEND_SYSTEM.md",
-	]);
-	const loader = new DefaultResourceLoader({
-		cwd,
-		agentDir,
-		settingsManager: SettingsManager.inMemory({}, { projectTrusted }),
-		noExtensions: true,
-		noSkills: true,
-		noPromptTemplates: true,
-		noThemes: true,
-		noContextFiles: true,
-	});
-	await loader.reload();
-
-	const discoveredSystemPrompt = loader.getSystemPrompt();
+	const resources = await resolvePiPromptResources(cwd, projectTrusted);
+	const discoveredSystemPrompt = resources.systemPrompt;
 	const baseSystemPrompt = discoveredSystemPrompt
 		? truncateUtf8(discoveredSystemPrompt, DEFAULT_MAX_CONTEXT_BYTES).text
 		: undefined;
-	const appendSystemPromptPaths = loader
-		.getAppendSystemPromptSources()
-		.map((source) => source.path);
+	const appendSystemPromptPaths = resources.appendSystemPromptPaths;
 	const shared = {
 		disableExtensions: true,
 		disableContextFiles: !projectTrusted,

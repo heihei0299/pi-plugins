@@ -1,11 +1,16 @@
-import type { AgentConfig } from "./agents.js";
+import type { AgentConfig } from "./agents/types.js";
 import { redactPrivateText } from "./context.js";
-import { resolveDefaultSubagentTimeoutMs } from "./execution.js";
+import { appendDelegationContract } from "./delegation-contract.js";
+import { resolveDefaultSubagentTimeoutMs } from "./execution/runtime-policy.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, truncateUtf8 } from "./limits.js";
 import type { ManagedAgent } from "./registry.js";
+import { appendResultInstruction } from "./result-contract.js";
 
 export function buildStatefulTurnPrompt(
-	record: Pick<ManagedAgent, "context" | "history" | "mailbox" | "currentMailboxMessageIds">,
+	record: Pick<
+		ManagedAgent,
+		"context" | "history" | "mailbox" | "currentMailboxMessageIds" | "contract" | "resultFormat"
+	>,
 	task: string,
 	maxBytes = DEFAULT_MAX_CONTEXT_BYTES,
 ): { text: string; truncated: boolean } {
@@ -30,7 +35,11 @@ export function buildStatefulTurnPrompt(
 	]
 		.filter(Boolean)
 		.join("\n\n---\n\n");
-	return truncateUtf8(context, maxBytes);
+	const contracted = appendDelegationContract(context, record.contract, maxBytes);
+	return truncateUtf8(
+		appendResultInstruction(contracted.text, record.resultFormat, maxBytes),
+		maxBytes,
+	);
 }
 
 export function resolveStatefulTurnTimeout(

@@ -1,119 +1,58 @@
+/**
+ * AgentRegistry intentionally owns its full state machine in one module so queue, tree,
+ * mailbox, generation, grant, transport, persistence, and completion transitions are atomic.
+ */
 import { randomUUID } from "node:crypto";
-import type { SubagentThinkingLevel } from "./agents.js";
+import { projectAgentRecords } from "./agent-projection.js";
+import type { SubagentThinkingLevel } from "./agents/types.js";
+import {
+	type CapabilityGrant,
+	isCapabilityGrantActive,
+	revokeCapabilityGrant,
+} from "./capability-grant.js";
 import type { TargetPolicyAudit } from "./cwd-policy.js";
-import { DEFAULT_MAX_CONTEXT_BYTES, DEFAULT_MAX_OUTPUT_BYTES, truncateUtf8 } from "./limits.js";
+import type { DelegationContract } from "./delegation-contract.js";
+import {
+	copyExecutionPlan,
+	type ExecutionPlan,
+	rotateExecutionPlanGeneration,
+} from "./execution-plan.js";
+import {
+	DEFAULT_MAX_CONTEXT_BYTES,
+	DEFAULT_MAX_OUTPUT_BYTES,
+	MAX_SUBAGENT_TIMEOUT_MS,
+	MAX_TOOL_MESSAGE_BYTES,
+	truncateUtf8,
+} from "./limits.js";
+import { classifyStructuredOutcome } from "./outcome.js";
+import type {
+	AgentInspectionCounts,
+	AgentLifecycleState,
+	AgentMailboxMessage,
+	AgentRegistryOptions,
+	AgentRunInspectionDetail,
+	AgentRunInspectionSummary,
+	AgentTurnCompletion,
+	ManagedAgent,
+} from "./registry-types.js";
+import {
+	type AnyStructuredSubagentResult,
+	parseAnyStructuredSubagentResult,
+	type SubagentResultFormat,
+} from "./result-contract.js";
+import type { SemanticCompatibility, SemanticSnapshot } from "./semantic-snapshot.js";
+import { resolveStatefulLimits } from "./stateful-limits.js";
+import { copyTurnTerminationReport } from "./timeout-checkpoint.js";
 import { type AgentTurnRunner, normalizeTransport, type SubagentTransport } from "./transport.js";
+import type { TransportTelemetry } from "./transport-types.js";
+import { type TurnLimits, validateTurnLimits } from "./turn-budget.js";
 
-export type AgentLifecycleState =
-	| "starting"
-	| "running"
-	| "idle"
-	| "completed"
-	| "interrupted"
-	| "failed"
-	| "closed";
+const DEFAULT_STATEFUL_LIMITS = resolveStatefulLimits();
+const MAX_PENDING_COMPLETIONS_PER_AGENT = 20;
+const INITIAL_PERSISTENCE_RETRY_DELAY_MS = 25;
+const MAX_PERSISTENCE_RETRY_DELAY_MS = 1_000;
 
-export interface AgentTurn {
-	task: string;
-	output: string;
-	startedAt: number;
-	completedAt: number;
-	exitCode: number;
-	truncated?: boolean;
-}
-
-export interface AgentMailboxMessage {
-	id: string;
-	senderId: string;
-	recipientId: string;
-	content: string;
-	createdAt: number;
-	readAt?: number;
-	deduplicationKey?: string;
-}
-
-export interface ManagedAgent {
-	id: string;
-	agent: string;
-	parentId?: string;
-	rootId: string;
-	depth: number;
-	children: string[];
-	state: AgentLifecycleState;
-	createdAt: number;
-	updatedAt: number;
-	cwd: string;
-	agentScope?: "user" | "project" | "both";
-	thinkingLevel?: SubagentThinkingLevel;
-	currentTask?: string;
-	history: AgentTurn[];
-	error?: string;
-	context?: string;
-	contextSourceIds?: string[];
-	contextTruncated?: boolean;
-	workspaceMode?: "worktree";
-	target?: TargetPolicyAudit;
-	policy?: { inherited: string[]; overridden: string[]; unsupported: string[] };
-	mailbox: AgentMailboxMessage[];
-	currentMailboxMessageIds?: string[];
-}
-
-export interface AgentRunInspectionSummary {
-	id: string;
-	agent: string;
-	state: AgentLifecycleState;
-	createdAt: number;
-	updatedAt: number;
-	historyCount: number;
-	unreadMessages: number;
-}
-
-export interface AgentRunInspectionDetail extends AgentRunInspectionSummary {
-	cwd: string;
-	thinkingLevel?: SubagentThinkingLevel;
-	currentTask?: string;
-	error?: string;
-	workspaceMode?: "worktree";
-	target?: TargetPolicyAudit;
-	policy?: { inherited: string[]; overridden: string[]; unsupported: string[] };
-}
-
-export interface AgentInspectionCounts {
-	activeAgents: number;
-	retainedAgents: number;
-}
-
-export interface TurnOutcome {
-	output: string;
-	exitCode: number;
-	aborted?: boolean;
-	truncated?: boolean;
-	error?: string;
-	policy?: ManagedAgent["policy"];
-}
-
-export interface AgentTurnCompletion {
-	agent: ManagedAgent;
-	task: string;
-	output: string;
-	error?: string;
-}
-
-export interface AgentRegistryOptions {
-	maxAgents?: number;
-	maxActiveTurns?: number;
-	maxHistoryTurns?: number;
-	maxDepth?: number;
-	maxChildrenPerAgent?: number;
-	maxMailboxMessages?: number;
-	maxMailboxMessageBytes?: number;
-	maxTaskBytes?: number;
-	maxTurnOutputBytes?: number;
-	idleTtlMs?: number;
-	now?: () => number;
-	onChange?: (agents: ManagedAgent[]) => void | Promise<void>;
-	onTurnComplete?: (completion: AgentTurnCompletion) => void | Promise<void>;
-}
+export type * from "./registry-types.js";
 
 function positiveInteger(value: number, label: string): number {
 	if (!Number.isSafeInteger(value) || value < 1) {
@@ -129,10 +68,43 @@ function nonNegativeInteger(value: number, label: string): number {
 	return value;
 }
 
+function validateTurnTimeout(value: number): number {
+	if (!Number.isSafeInteger(value) || value < 1 || value > MAX_SUBAGENT_TIMEOUT_MS) {
+		throw new Error(`Subagent timeoutMs must be between 1 and ${MAX_SUBAGENT_TIMEOUT_MS}`);
+	}
+	return value;
+}
+
+function clearCurrentTurn(agent: ManagedAgent): void {
+	agent.currentTask = undefined;
+	agent.currentRunId = undefined;
+	agent.currentTurnGeneration = undefined;
+	agent.currentTimeoutMs = undefined;
+	agent.currentIdleTimeoutMs = undefined;
+	agent.currentMaxTurns = undefined;
+	agent.currentMaxToolCalls = undefined;
+	agent.currentMailboxMessageIds = undefined;
+}
+
 function waitAbortError(): Error {
 	const error = new Error("Subagent wait was aborted");
 	error.name = "AbortError";
 	return error;
+}
+
+function waitForPersistenceRetry(milliseconds: number, signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return Promise.reject(signal.reason);
+	return new Promise((resolve, reject) => {
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(signal.reason);
+		};
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, milliseconds);
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 export class AgentRegistry {
@@ -145,6 +117,7 @@ export class AgentRegistry {
 		resolve: (agent: ManagedAgent) => void;
 	}> = [];
 	private changeQueue: Promise<void> = Promise.resolve();
+	private readonly shutdownController = new AbortController();
 	private readonly maxAgents: number;
 	private readonly maxActiveTurns: number;
 	private readonly maxHistoryTurns: number;
@@ -157,18 +130,28 @@ export class AgentRegistry {
 	private readonly idleTtlMs: number;
 	private readonly transport: SubagentTransport;
 	private readonly now: () => number;
+	private lastCompletionAt = 0;
 
 	constructor(
 		transport: SubagentTransport | AgentTurnRunner,
 		private readonly options: AgentRegistryOptions = {},
 	) {
 		this.transport = normalizeTransport(transport);
-		this.maxAgents = positiveInteger(options.maxAgents ?? 16, "maxAgents");
-		this.maxActiveTurns = positiveInteger(options.maxActiveTurns ?? 4, "maxActiveTurns");
+		this.maxAgents = positiveInteger(
+			options.maxAgents ?? DEFAULT_STATEFUL_LIMITS.maxAgents,
+			"maxAgents",
+		);
+		this.maxActiveTurns = positiveInteger(
+			options.maxActiveTurns ?? DEFAULT_STATEFUL_LIMITS.maxActiveTurns,
+			"maxActiveTurns",
+		);
 		this.maxHistoryTurns = positiveInteger(options.maxHistoryTurns ?? 20, "maxHistoryTurns");
-		this.maxDepth = nonNegativeInteger(options.maxDepth ?? 3, "maxDepth");
+		this.maxDepth = nonNegativeInteger(
+			options.maxDepth ?? DEFAULT_STATEFUL_LIMITS.maxDepth,
+			"maxDepth",
+		);
 		this.maxChildrenPerAgent = positiveInteger(
-			options.maxChildrenPerAgent ?? 8,
+			options.maxChildrenPerAgent ?? DEFAULT_STATEFUL_LIMITS.maxChildrenPerAgent,
 			"maxChildrenPerAgent",
 		);
 		this.maxMailboxMessages = positiveInteger(
@@ -193,10 +176,10 @@ export class AgentRegistry {
 
 	restore(records: readonly ManagedAgent[]): void {
 		const candidates = new Map(
-			records
-				.slice(-this.maxAgents)
-				.filter((record) => record.id && record.state !== "closed")
-				.map((record) => [record.id, record]),
+			projectAgentRecords(
+				records.filter((record) => record.id && record.state !== "closed"),
+				{ maxAgents: this.maxAgents, maxDepth: this.maxDepth },
+			).map((record) => [record.id, record]),
 		);
 		for (const record of candidates.values()) {
 			if (record.parentId && !candidates.has(record.parentId)) continue;
@@ -216,15 +199,33 @@ export class AgentRegistry {
 			}
 			const depth = seen.size - 1;
 			if (cyclic || depth > this.maxDepth) continue;
+			for (const completion of record.pendingCompletions ?? []) {
+				this.lastCompletionAt = Math.max(this.lastCompletionAt, completion.createdAt);
+			}
 			this.agents.set(record.id, {
 				...record,
-				state: "idle",
+				state:
+					record.state === "running" || record.state === "starting" ? "interrupted" : record.state,
 				rootId,
 				depth,
 				currentTask: undefined,
+				turnGeneration: record.turnGeneration ?? 0,
+				currentRunId: undefined,
+				currentTurnGeneration: undefined,
+				pendingCompletions: (record.pendingCompletions ?? []).map((completion) => ({
+					...completion,
+				})),
+				currentTimeoutMs: undefined,
+				currentIdleTimeoutMs: undefined,
+				currentMaxTurns: undefined,
+				currentMaxToolCalls: undefined,
 				currentMailboxMessageIds: undefined,
 				children: [],
 				contextSourceIds: [...(record.contextSourceIds ?? [])],
+				capabilityGrant:
+					record.capabilityGrant?.state === "active"
+						? revokeCapabilityGrant(record.capabilityGrant, "restore-boundary", this.now())
+						: record.capabilityGrant,
 				mailbox: (record.mailbox ?? [])
 					.slice(-this.maxMailboxMessages)
 					.map((message) => ({ ...message, recipientId: record.id })),
@@ -244,14 +245,35 @@ export class AgentRegistry {
 		cwd: string;
 		agentScope?: "user" | "project" | "both";
 		thinkingLevel?: SubagentThinkingLevel;
+		timeoutMs?: number;
+		idleTimeoutMs?: number;
+		maxTurns?: number;
+		maxToolCalls?: number;
 		parentId?: string;
 		context?: string;
 		contextSourceIds?: string[];
 		contextTruncated?: boolean;
+		contextTurns?: number;
+		contextBytes?: number;
 		workspaceMode?: "worktree";
+		spawnIdempotencyKey?: string;
+		spawnRequestHash?: string;
+		contract?: DelegationContract;
+		resultFormat?: SubagentResultFormat;
+		executionPlan?: ExecutionPlan;
+		capabilityGrant?: CapabilityGrant;
+		semanticSnapshot?: SemanticSnapshot;
+		semanticCompatibility?: SemanticCompatibility;
 		target?: TargetPolicyAudit;
 	}): Promise<ManagedAgent> {
 		if (!input.task.trim()) throw new Error("Subagent tasks cannot be empty");
+		if (input.timeoutMs !== undefined) validateTurnTimeout(input.timeoutMs);
+		validateTurnLimits(input);
+		const existing = this.findBySpawnIdempotencyKey(
+			input.spawnIdempotencyKey,
+			input.spawnRequestHash,
+		);
+		if (existing) return existing;
 		const task = truncateUtf8(input.task, this.maxTaskBytes).text;
 		const expired = this.evictExpired();
 		let expiryReleaseError: unknown;
@@ -287,13 +309,33 @@ export class AgentRegistry {
 			cwd: input.cwd,
 			agentScope: input.agentScope,
 			thinkingLevel: input.thinkingLevel,
+			timeoutMs: input.timeoutMs,
+			currentTimeoutMs: input.timeoutMs,
+			idleTimeoutMs: input.idleTimeoutMs,
+			currentIdleTimeoutMs: input.idleTimeoutMs,
+			maxTurns: input.maxTurns,
+			currentMaxTurns: input.maxTurns,
+			maxToolCalls: input.maxToolCalls,
+			currentMaxToolCalls: input.maxToolCalls,
 			currentTask: task,
+			turnGeneration: 0,
+			pendingCompletions: [],
 			history: [],
 			mailbox: [],
 			context: input.context,
 			contextSourceIds: input.contextSourceIds,
 			contextTruncated: input.contextTruncated,
+			contextTurns: input.contextTurns,
+			contextBytes: input.contextBytes,
 			workspaceMode: input.workspaceMode,
+			spawnIdempotencyKey: input.spawnIdempotencyKey,
+			spawnRequestHash: input.spawnRequestHash,
+			contract: input.contract,
+			resultFormat: input.resultFormat,
+			executionPlan: input.executionPlan,
+			capabilityGrant: input.capabilityGrant,
+			semanticSnapshot: input.semanticSnapshot,
+			semanticCompatibility: input.semanticCompatibility,
 			target: input.target,
 		};
 		this.agents.set(record.id, record);
@@ -302,22 +344,76 @@ export class AgentRegistry {
 			parent.updatedAt = now;
 		}
 		await this.changed();
-		this.startTurn(record, task);
+		this.startTurn(record, task, input);
 		return this.copy(record);
 	}
 
-	async followUp(id: string, task: string): Promise<ManagedAgent> {
+	findBySpawnIdempotencyKey(
+		key: string | undefined,
+		requestHash: string | undefined,
+	): ManagedAgent | undefined {
+		if (!key) return undefined;
+		const existing = [...this.agents.values()].find(
+			(agent) => agent.state !== "closed" && agent.spawnIdempotencyKey === key,
+		);
+		if (!existing) return undefined;
+		if (!requestHash || existing.spawnRequestHash !== requestHash) {
+			throw new Error(
+				"The subagent_spawn idempotencyKey was already used with different parameters",
+			);
+		}
+		return this.copy(existing);
+	}
+
+	async followUp(
+		id: string,
+		task: string,
+		options: TurnLimits & { timeoutMs?: number } = {},
+	): Promise<ManagedAgent> {
 		if (!task.trim()) throw new Error("Subagent tasks cannot be empty");
+		if (options.timeoutMs !== undefined) validateTurnTimeout(options.timeoutMs);
+		validateTurnLimits(options);
 		const boundedTask = truncateUtf8(task, this.maxTaskBytes).text;
 		const agent = this.require(id);
-		if (!["idle", "completed", "interrupted", "failed"].includes(agent.state)) {
+		if (
+			![
+				"idle",
+				"completed",
+				"blocked",
+				"needs-input",
+				"abstained",
+				"stale",
+				"interrupted",
+				"failed",
+			].includes(agent.state)
+		) {
 			throw new Error(`Agent ${id} cannot accept follow-up while ${agent.state}`);
 		}
 		const unread = agent.mailbox.filter((message) => !message.readAt);
 		const readAt = this.now();
 		for (const message of unread) message.readAt = readAt;
 		agent.currentMailboxMessageIds = unread.map((message) => message.id);
-		this.startTurn(agent, boundedTask);
+		this.startTurn(agent, boundedTask, options);
+		return this.copy(agent);
+	}
+
+	async updateSemanticState(
+		id: string,
+		executionPlan: ExecutionPlan,
+		capabilityGrant: CapabilityGrant,
+		snapshot: SemanticSnapshot,
+		compatibility: SemanticCompatibility,
+	): Promise<ManagedAgent> {
+		const agent = this.require(id);
+		if (agent.state === "running" || agent.state === "starting" || agent.state === "closed") {
+			throw new Error(`Agent ${id} cannot update semantic state while ${agent.state}`);
+		}
+		agent.executionPlan = copyExecutionPlan(executionPlan);
+		agent.capabilityGrant = structuredClone(capabilityGrant);
+		agent.semanticSnapshot = structuredClone(snapshot);
+		agent.semanticCompatibility = structuredClone(compatibility);
+		agent.updatedAt = this.now();
+		await this.changed();
 		return this.copy(agent);
 	}
 
@@ -410,24 +506,44 @@ export class AgentRegistry {
 		const agent = this.require(id);
 		if (agent.state !== "running" && agent.state !== "starting")
 			throw new Error(`Agent ${id} is not running`);
+		if (agent.capabilityGrant?.state === "active") {
+			agent.capabilityGrant = revokeCapabilityGrant(
+				agent.capabilityGrant,
+				"interrupted",
+				this.now(),
+			);
+		}
+		if (agent.executionPlan) {
+			agent.executionPlan = rotateExecutionPlanGeneration(agent.executionPlan);
+		}
 		if (agent.state === "starting") {
 			const index = this.queue.findIndex((entry) => entry.agent.id === id);
 			if (index >= 0) {
 				const [entry] = this.queue.splice(index, 1);
-				agent.state = "interrupted";
-				agent.currentTask = undefined;
-				agent.currentMailboxMessageIds = undefined;
-				agent.updatedAt = this.now();
-				const completion: AgentTurnCompletion = {
-					agent: this.copy(agent),
-					task: entry.task,
+				const persistedCompletion = {
+					completionId: `completion:${agent.id}:${randomUUID()}`,
+					runId: agent.currentRunId ?? `run:${agent.id}:${randomUUID()}`,
+					generation: agent.currentTurnGeneration ?? agent.turnGeneration ?? 1,
+					task: truncateUtf8(entry.task, 256).text,
 					output: "",
 					error: "Interrupted before execution",
+					createdAt: this.completionCreatedAt(),
+				};
+				agent.state = "interrupted";
+				agent.pendingCompletions = [...(agent.pendingCompletions ?? []), persistedCompletion];
+				clearCurrentTurn(agent);
+				agent.updatedAt = this.now();
+				const persisted = await this.persistTerminalState().then(
+					() => true,
+					() => false,
+				);
+				const completion: AgentTurnCompletion = {
+					...persistedCompletion,
+					agent: this.copy(agent),
 				};
 				entry.resolve(agent);
 				this.running.delete(id);
-				await this.notifyTurnComplete(completion);
-				await this.changed();
+				if (persisted) await this.notifyTurnComplete(completion);
 				return this.copy(agent);
 			}
 		}
@@ -462,6 +578,14 @@ export class AgentRegistry {
 		if (agent.children.some((childId) => this.agents.get(childId)?.state !== "closed")) {
 			throw new Error(`Agent ${id} has active descendants; close the subtree instead`);
 		}
+		if (agent.state === "starting" || agent.state === "running") {
+			if (agent.capabilityGrant?.state === "active") {
+				agent.capabilityGrant = revokeCapabilityGrant(agent.capabilityGrant, "closed", this.now());
+			}
+			if (agent.executionPlan) {
+				agent.executionPlan = rotateExecutionPlanGeneration(agent.executionPlan);
+			}
+		}
 		if (agent.state === "starting") {
 			const index = this.queue.findIndex((entry) => entry.agent.id === id);
 			if (index >= 0) {
@@ -478,8 +602,7 @@ export class AgentRegistry {
 			const parent = this.agents.get(agent.parentId);
 			if (parent) parent.children = parent.children.filter((childId) => childId !== id);
 		}
-		agent.currentTask = undefined;
-		agent.currentMailboxMessageIds = undefined;
+		clearCurrentTurn(agent);
 		let releaseError: unknown;
 		try {
 			await this.transport.release?.(this.copy(agent));
@@ -506,20 +629,44 @@ export class AgentRegistry {
 	}
 
 	async shutdown(): Promise<void> {
+		this.shutdownController.abort(new Error("Subagent registry is shutting down"));
 		for (const entry of this.queue.splice(0)) {
-			entry.agent.state = "idle";
-			entry.agent.currentTask = undefined;
-			entry.agent.currentMailboxMessageIds = undefined;
+			if (entry.agent.capabilityGrant?.state === "active") {
+				entry.agent.capabilityGrant = revokeCapabilityGrant(
+					entry.agent.capabilityGrant,
+					"shutdown",
+					this.now(),
+				);
+			}
+			if (entry.agent.executionPlan) {
+				entry.agent.executionPlan = rotateExecutionPlanGeneration(entry.agent.executionPlan);
+			}
+			entry.agent.state = "interrupted";
+			clearCurrentTurn(entry.agent);
 			entry.resolve(entry.agent);
 			this.running.delete(entry.agent.id);
+		}
+		for (const id of this.controllers.keys()) {
+			const agent = this.agents.get(id);
+			if (agent?.capabilityGrant?.state === "active") {
+				agent.capabilityGrant = revokeCapabilityGrant(
+					agent.capabilityGrant,
+					"shutdown",
+					this.now(),
+				);
+			}
+			if (agent?.executionPlan) {
+				agent.executionPlan = rotateExecutionPlanGeneration(agent.executionPlan);
+			}
 		}
 		for (const controller of this.controllers.values()) controller.abort();
 		await Promise.all([...this.running.values()].map((turn) => turn.catch(() => undefined)));
 		for (const agent of this.agents.values()) {
 			if (agent.state !== "closed") {
-				agent.state = "idle";
-				agent.currentTask = undefined;
-				agent.currentMailboxMessageIds = undefined;
+				if (agent.state === "running" || agent.state === "starting") {
+					agent.state = "interrupted";
+				}
+				clearCurrentTurn(agent);
 			}
 		}
 		let shutdownError: unknown;
@@ -528,7 +675,7 @@ export class AgentRegistry {
 		} catch (error) {
 			shutdownError = error;
 		}
-		await this.changed();
+		await this.changed(true);
 		if (shutdownError) throw shutdownError;
 	}
 
@@ -556,9 +703,25 @@ export class AgentRegistry {
 			...this.inspectSummary(agent),
 			cwd: agent.cwd,
 			thinkingLevel: agent.thinkingLevel,
+			timeoutMs: agent.timeoutMs,
+			currentTimeoutMs: agent.currentTimeoutMs,
+			idleTimeoutMs: agent.idleTimeoutMs,
+			currentIdleTimeoutMs: agent.currentIdleTimeoutMs,
+			maxTurns: agent.maxTurns,
+			currentMaxTurns: agent.currentMaxTurns,
+			maxToolCalls: agent.maxToolCalls,
+			currentMaxToolCalls: agent.currentMaxToolCalls,
 			currentTask: agent.currentTask,
+			currentRunId: agent.currentRunId,
+			currentTurnGeneration: agent.currentTurnGeneration,
 			error: agent.error,
 			workspaceMode: agent.workspaceMode,
+			contextTurns: agent.contextTurns,
+			contextBytes: agent.contextBytes,
+			contextSources: agent.contextSourceIds?.length,
+			contextTruncated: agent.contextTruncated,
+			contract: agent.contract ? structuredClone(agent.contract) : undefined,
+			resultFormat: agent.resultFormat,
 			target: agent.target ? { ...agent.target, trust: { ...agent.target.trust } } : undefined,
 			policy: agent.policy
 				? {
@@ -567,6 +730,20 @@ export class AgentRegistry {
 						unsupported: [...agent.policy.unsupported],
 					}
 				: undefined,
+			structuredResult: agent.structuredResult
+				? copyStructuredResult(agent.structuredResult)
+				: undefined,
+			termination: agent.termination ? copyTurnTerminationReport(agent.termination) : undefined,
+			outcome: agent.outcome ? structuredClone(agent.outcome) : undefined,
+			executionPlan: agent.executionPlan ? copyExecutionPlan(agent.executionPlan) : undefined,
+			capabilityGrant: agent.capabilityGrant ? structuredClone(agent.capabilityGrant) : undefined,
+			semanticSnapshot: agent.semanticSnapshot
+				? structuredClone(agent.semanticSnapshot)
+				: undefined,
+			semanticCompatibility: agent.semanticCompatibility
+				? structuredClone(agent.semanticCompatibility)
+				: undefined,
+			telemetry: agent.telemetry ? copyTelemetry(agent.telemetry) : undefined,
 		};
 	}
 
@@ -583,6 +760,62 @@ export class AgentRegistry {
 		return agent ? this.copy(agent) : undefined;
 	}
 
+	listPendingCompletions(): AgentTurnCompletion[] {
+		return [...this.agents.values()]
+			.flatMap((agent) =>
+				(agent.pendingCompletions ?? []).map((completion) => ({
+					...completion,
+					agent: this.copy(agent),
+				})),
+			)
+			.sort(
+				(left, right) =>
+					left.createdAt - right.createdAt ||
+					left.generation - right.generation ||
+					left.completionId.localeCompare(right.completionId),
+			);
+	}
+
+	async markCompletionDelivered(completionId: string, deliveredAt: number): Promise<void> {
+		const agent = [...this.agents.values()].find((candidate) =>
+			candidate.pendingCompletions?.some((completion) => completion.completionId === completionId),
+		);
+		if (!agent) return;
+		const acknowledged = (agent.pendingCompletions ?? []).find(
+			(completion) => completion.completionId === completionId,
+		);
+		if (!acknowledged) return;
+		agent.pendingCompletions = (agent.pendingCompletions ?? []).filter(
+			(completion) => completion.completionId !== completionId,
+		);
+		if (agent.telemetry) {
+			agent.telemetry = {
+				...agent.telemetry,
+				updatedAt: deliveredAt,
+				timing: { ...agent.telemetry.timing, completionDeliveredAt: deliveredAt },
+			};
+		}
+		agent.updatedAt = Math.max(agent.updatedAt, deliveredAt);
+		try {
+			await this.changed(true);
+		} catch (error) {
+			if (
+				!agent.pendingCompletions?.some(
+					(completion) => completion.completionId === acknowledged.completionId,
+				)
+			) {
+				agent.pendingCompletions = [...(agent.pendingCompletions ?? []), acknowledged].sort(
+					(left, right) => left.createdAt - right.createdAt || left.generation - right.generation,
+				);
+			}
+			if (agent.telemetry?.timing.completionDeliveredAt === deliveredAt) {
+				const { completionDeliveredAt: _discarded, ...timing } = agent.telemetry.timing;
+				agent.telemetry = { ...agent.telemetry, timing };
+			}
+			throw error;
+		}
+	}
+
 	async sweepExpired(): Promise<number> {
 		const removed = this.evictExpired();
 		let releaseError: unknown;
@@ -596,17 +829,43 @@ export class AgentRegistry {
 		return removed.length;
 	}
 
-	private startTurn(agent: ManagedAgent, task: string): void {
+	private startTurn(
+		agent: ManagedAgent,
+		task: string,
+		limits: TurnLimits & { timeoutMs?: number } = {},
+	): void {
+		if ((agent.pendingCompletions?.length ?? 0) >= MAX_PENDING_COMPLETIONS_PER_AGENT) {
+			throw new Error(
+				`Agent ${agent.id} has ${MAX_PENDING_COMPLETIONS_PER_AGENT} undelivered completions; wait for delivery before another turn`,
+			);
+		}
+		agent.turnGeneration = (agent.turnGeneration ?? 0) + 1;
+		agent.currentTurnGeneration = agent.turnGeneration;
+		agent.currentRunId = `run:${agent.id}:${randomUUID()}`;
 		agent.state = "starting";
 		agent.error = undefined;
 		agent.currentTask = task;
+		agent.currentTimeoutMs = limits.timeoutMs ?? agent.timeoutMs;
+		agent.currentIdleTimeoutMs = limits.idleTimeoutMs ?? agent.idleTimeoutMs;
+		agent.currentMaxTurns = limits.maxTurns ?? agent.maxTurns;
+		agent.currentMaxToolCalls = limits.maxToolCalls ?? agent.maxToolCalls;
+		agent.structuredResult = undefined;
+		agent.termination = undefined;
+		agent.outcome = undefined;
 		agent.updatedAt = this.now();
+		agent.telemetry = {
+			phase: "queued",
+			queuePosition: this.queue.length + 1,
+			updatedAt: agent.updatedAt,
+			timing: { queuedAt: agent.updatedAt },
+		};
 		let resolveQueued!: (agent: ManagedAgent) => void;
 		const completion = new Promise<ManagedAgent>((resolve) => {
 			resolveQueued = resolve;
 		});
 		this.running.set(agent.id, completion);
 		this.queue.push({ agent, task, resolve: resolveQueued });
+		this.updateQueuePositions();
 		void this.changed();
 		this.pumpQueue();
 	}
@@ -616,6 +875,7 @@ export class AgentRegistry {
 			const next = this.queue.shift();
 			if (!next) return;
 			this.runQueuedTurn(next.agent, next.task, next.resolve);
+			this.updateQueuePositions();
 		}
 	}
 
@@ -624,50 +884,168 @@ export class AgentRegistry {
 		task: string,
 		resolveQueued: (agent: ManagedAgent) => void,
 	): void {
+		if (
+			agent.capabilityGrant &&
+			agent.executionPlan &&
+			!isCapabilityGrantActive(agent.capabilityGrant, agent.executionPlan, this.now())
+		) {
+			agent.state = "failed";
+			agent.error = "Capability grant expired or no longer matches the accepted plan";
+			agent.outcome = classifyStructuredOutcome("failed", "capability-grant-invalid");
+			const persistedCompletion = {
+				completionId: `completion:${agent.id}:${randomUUID()}`,
+				runId: agent.currentRunId ?? `run:${agent.id}:${randomUUID()}`,
+				generation: agent.currentTurnGeneration ?? agent.turnGeneration ?? 1,
+				task: truncateUtf8(task, 256).text,
+				output: "",
+				error: truncateUtf8(agent.error, 512).text,
+				createdAt: this.completionCreatedAt(),
+			};
+			agent.pendingCompletions = [...(agent.pendingCompletions ?? []), persistedCompletion];
+			clearCurrentTurn(agent);
+			agent.updatedAt = this.now();
+			void this.persistTerminalState()
+				.then(() =>
+					this.notifyTurnComplete({
+						...persistedCompletion,
+						agent: this.copy(agent),
+					}),
+				)
+				.catch(() => undefined)
+				.finally(() => {
+					resolveQueued(agent);
+					this.running.delete(agent.id);
+				});
+			return;
+		}
 		const controller = new AbortController();
 		this.controllers.set(agent.id, controller);
 		agent.state = "running";
 		agent.updatedAt = this.now();
 		const startedAt = this.now();
+		const runId = agent.currentRunId ?? `run:${agent.id}:${randomUUID()}`;
+		const turnGeneration = agent.currentTurnGeneration ?? agent.turnGeneration ?? 1;
 		const completionKey = `completion:${agent.id}:${randomUUID()}`;
+		const acceptedPlanId = agent.executionPlan?.id;
 		let completionContent = "";
 		let completionOutput = "";
 		let completionError: string | undefined;
 		void this.transport
-			.runTurn(this.copy(agent), task, controller.signal)
+			.runTurn(this.copy(agent), task, controller.signal, (progress) => {
+				agent.telemetry = {
+					...progress,
+					queuePosition: undefined,
+					timing: {
+						queuedAt: agent.telemetry?.timing.queuedAt,
+						...progress.timing,
+					},
+				};
+			})
 			.then(async (outcome) => {
 				const output = truncateUtf8(outcome.output, this.maxTurnOutputBytes).text;
 				const error = outcome.error
 					? truncateUtf8(outcome.error, this.maxTurnOutputBytes).text
 					: undefined;
 				agent.history.push({
+					runId,
+					generation: turnGeneration,
 					task,
 					output,
 					startedAt,
 					completedAt: this.now(),
 					exitCode: outcome.exitCode,
 					truncated: outcome.truncated,
+					termination: outcome.termination
+						? copyTurnTerminationReport(outcome.termination)
+						: undefined,
 				});
 				agent.history = agent.history.slice(-this.maxHistoryTurns);
-				agent.state = outcome.aborted
-					? "interrupted"
-					: outcome.exitCode === 0
-						? "completed"
-						: "failed";
+				agent.structuredResult =
+					outcome.structuredResult ?? parseAnyStructuredSubagentResult(output, agent.resultFormat);
+				agent.outcome =
+					outcome.outcome ??
+					(outcome.aborted
+						? classifyStructuredOutcome("interrupted", "transport-aborted")
+						: agent.structuredResult?.version === "pi-subagents:result:v2"
+							? classifyStructuredOutcome(
+									agent.structuredResult.status,
+									agent.structuredResult.reasonCode,
+								)
+							: agent.resultFormat !== undefined &&
+									agent.resultFormat !== "text" &&
+									agent.structuredResult === undefined
+								? classifyStructuredOutcome("contract-invalid", "malformed-structured-result")
+								: undefined);
+				const staleGeneration = Boolean(
+					acceptedPlanId && agent.executionPlan?.id !== acceptedPlanId,
+				);
+				if (staleGeneration) {
+					agent.outcome = classifyStructuredOutcome("stale", "cancelled-generation");
+				}
+				agent.state = staleGeneration
+					? "stale"
+					: outcome.aborted
+						? "interrupted"
+						: outcome.exitCode !== 0
+							? "failed"
+							: lifecycleStateForOutcome(agent.outcome?.status);
 				agent.error = error;
+				if (agent.capabilityGrant?.state === "active") {
+					agent.capabilityGrant = revokeCapabilityGrant(
+						agent.capabilityGrant,
+						"turn-settled",
+						this.now(),
+					);
+				}
 				agent.policy = outcome.policy;
+				agent.telemetry = outcome.telemetry
+					? {
+							...outcome.telemetry,
+							timing: {
+								queuedAt: agent.telemetry?.timing.queuedAt,
+								...outcome.telemetry.timing,
+							},
+						}
+					: agent.telemetry;
+				agent.termination = outcome.termination
+					? copyTurnTerminationReport(outcome.termination)
+					: undefined;
 				completionOutput = output;
 				completionError = error;
 				completionContent = output || error || `${agent.id} ${agent.state}`;
 				return agent;
 			})
 			.catch((error) => {
-				agent.state = controller.signal.aborted ? "interrupted" : "failed";
+				const staleGeneration = Boolean(
+					acceptedPlanId && agent.executionPlan?.id !== acceptedPlanId,
+				);
+				agent.state = staleGeneration
+					? "stale"
+					: controller.signal.aborted
+						? "interrupted"
+						: "failed";
+				agent.outcome = classifyStructuredOutcome(
+					staleGeneration ? "stale" : controller.signal.aborted ? "interrupted" : "failed",
+					staleGeneration
+						? "cancelled-generation"
+						: controller.signal.aborted
+							? "transport-aborted"
+							: "transport-error",
+				);
+				if (agent.capabilityGrant?.state === "active") {
+					agent.capabilityGrant = revokeCapabilityGrant(
+						agent.capabilityGrant,
+						"turn-failed",
+						this.now(),
+					);
+				}
 				agent.error = truncateUtf8(
 					error instanceof Error ? error.message : String(error),
 					this.maxTurnOutputBytes,
 				).text;
 				agent.history.push({
+					runId,
+					generation: turnGeneration,
 					task,
 					output: "",
 					startedAt,
@@ -675,33 +1053,64 @@ export class AgentRegistry {
 					exitCode: controller.signal.aborted ? 130 : 1,
 				});
 				agent.history = agent.history.slice(-this.maxHistoryTurns);
+				agent.telemetry = {
+					...(agent.telemetry ?? {
+						phase: "failed",
+						updatedAt: this.now(),
+						timing: { queuedAt: startedAt },
+					}),
+					phase: controller.signal.aborted ? "interrupted" : "failed",
+					failurePhase: agent.telemetry?.phase ?? "running",
+					updatedAt: this.now(),
+				};
 				completionError = agent.error;
 				completionContent = agent.error;
 				return agent;
 			})
 			.finally(async () => {
-				const turnCompletion: AgentTurnCompletion = {
-					agent: this.copy(agent),
-					task,
-					output: completionOutput,
-					error: completionError,
+				const persistedCompletion = {
+					completionId: completionKey,
+					runId,
+					generation: turnGeneration,
+					task: truncateUtf8(task, 256).text,
+					output: truncateUtf8(completionOutput, MAX_TOOL_MESSAGE_BYTES).text,
+					error: completionError ? truncateUtf8(completionError, 512).text : undefined,
+					createdAt: this.completionCreatedAt(),
 				};
+				agent.pendingCompletions = [...(agent.pendingCompletions ?? []), persistedCompletion];
 				if (agent.parentId) {
 					const parent = this.agents.get(agent.parentId);
 					if (parent && parent.state !== "closed") {
 						this.enqueueMessage(parent, completionContent, agent.id, completionKey);
 					}
 				}
-				agent.currentTask = undefined;
-				agent.currentMailboxMessageIds = undefined;
+				clearCurrentTurn(agent);
 				agent.updatedAt = this.now();
+				const persisted = await this.persistTerminalState().then(
+					() => true,
+					() => false,
+				);
 				this.controllers.delete(agent.id);
+				const turnCompletion: AgentTurnCompletion = {
+					...persistedCompletion,
+					agent: this.copy(agent),
+				};
 				this.running.delete(agent.id);
 				resolveQueued(agent);
 				this.pumpQueue();
-				await this.notifyTurnComplete(turnCompletion);
-				await this.changed();
+				if (persisted) await this.notifyTurnComplete(turnCompletion);
 			});
+	}
+
+	private updateQueuePositions(): void {
+		for (const [index, entry] of this.queue.entries()) {
+			if (!entry.agent.telemetry) continue;
+			entry.agent.telemetry = {
+				...entry.agent.telemetry,
+				queuePosition: index + 1,
+				updatedAt: this.now(),
+			};
+		}
 	}
 
 	private enqueueMessage(
@@ -755,11 +1164,22 @@ export class AgentRegistry {
 		return [...this.agents.values()].filter((agent) => agent.state !== "closed").length;
 	}
 
+	private completionCreatedAt(): number {
+		this.lastCompletionAt = Math.max(this.now(), this.lastCompletionAt + 1);
+		return this.lastCompletionAt;
+	}
+
 	private evictExpired(): ManagedAgent[] {
 		const cutoff = this.now() - this.idleTtlMs;
 		const protectedIds = new Set<string>();
 		for (const agent of this.agents.values()) {
-			if (agent.state !== "running" && agent.state !== "starting") continue;
+			if (
+				agent.state !== "running" &&
+				agent.state !== "starting" &&
+				(agent.pendingCompletions?.length ?? 0) === 0
+			) {
+				continue;
+			}
 			let current: ManagedAgent | undefined = agent;
 			while (current) {
 				protectedIds.add(current.id);
@@ -804,6 +1224,25 @@ export class AgentRegistry {
 		for (const agent of closed.slice(this.maxAgents)) this.agents.delete(agent.id);
 	}
 
+	private async persistTerminalState(): Promise<void> {
+		let failures = 0;
+		for (;;) {
+			try {
+				await this.changed(true);
+				return;
+			} catch (error) {
+				if (this.shutdownController.signal.aborted) throw error;
+				failures++;
+				if (failures === 1) continue;
+				const delay = Math.min(
+					INITIAL_PERSISTENCE_RETRY_DELAY_MS * 2 ** (failures - 2),
+					MAX_PERSISTENCE_RETRY_DELAY_MS,
+				);
+				await waitForPersistenceRetry(delay, this.shutdownController.signal);
+			}
+		}
+	}
+
 	private async notifyTurnComplete(completion: AgentTurnCompletion): Promise<void> {
 		try {
 			await this.options.onTurnComplete?.(completion);
@@ -812,16 +1251,17 @@ export class AgentRegistry {
 		}
 	}
 
-	private changed(): Promise<void> {
+	private changed(propagateError = false): Promise<void> {
 		const snapshot = this.list(true);
 		const next = this.changeQueue.then(async () => {
 			try {
 				await this.options.onChange?.(snapshot);
-			} catch {
-				// Persistence is best-effort; lifecycle operations must remain usable if storage fails.
+			} catch (error) {
+				if (propagateError) throw error;
+				// Non-terminal persistence remains best-effort so lifecycle controls stay usable.
 			}
 		});
-		this.changeQueue = next;
+		this.changeQueue = next.catch(() => undefined);
 		return next;
 	}
 
@@ -838,6 +1278,8 @@ export class AgentRegistry {
 			updatedAt: agent.updatedAt,
 			historyCount: agent.history.length,
 			unreadMessages,
+			turnGeneration: agent.turnGeneration ?? 0,
+			pendingCompletionCount: agent.pendingCompletions?.length ?? 0,
 		};
 	}
 
@@ -849,8 +1291,12 @@ export class AgentRegistry {
 			currentMailboxMessageIds: agent.currentMailboxMessageIds
 				? [...agent.currentMailboxMessageIds]
 				: undefined,
+			pendingCompletions: (agent.pendingCompletions ?? []).map((completion) => ({
+				...completion,
+			})),
 			history: agent.history.map((turn) => ({ ...turn })),
 			mailbox: agent.mailbox.map((message) => ({ ...message })),
+			contract: agent.contract ? structuredClone(agent.contract) : undefined,
 			target: agent.target ? { ...agent.target, trust: { ...agent.target.trust } } : undefined,
 			policy: agent.policy
 				? {
@@ -859,6 +1305,51 @@ export class AgentRegistry {
 						unsupported: [...agent.policy.unsupported],
 					}
 				: undefined,
+			structuredResult: agent.structuredResult
+				? copyStructuredResult(agent.structuredResult)
+				: undefined,
+			termination: agent.termination ? copyTurnTerminationReport(agent.termination) : undefined,
+			outcome: agent.outcome ? structuredClone(agent.outcome) : undefined,
+			executionPlan: agent.executionPlan ? copyExecutionPlan(agent.executionPlan) : undefined,
+			capabilityGrant: agent.capabilityGrant ? structuredClone(agent.capabilityGrant) : undefined,
+			semanticSnapshot: agent.semanticSnapshot
+				? structuredClone(agent.semanticSnapshot)
+				: undefined,
+			semanticCompatibility: agent.semanticCompatibility
+				? structuredClone(agent.semanticCompatibility)
+				: undefined,
+			telemetry: agent.telemetry ? copyTelemetry(agent.telemetry) : undefined,
 		};
 	}
+}
+
+function lifecycleStateForOutcome(
+	status: import("./result-contract.js").SubagentOutcomeStatus | undefined,
+): AgentLifecycleState {
+	switch (status) {
+		case "blocked":
+		case "needs-input":
+		case "abstained":
+		case "stale":
+			return status;
+		case "failed":
+		case "contract-invalid":
+			return "failed";
+		case "interrupted":
+			return "interrupted";
+		default:
+			return "completed";
+	}
+}
+
+function copyStructuredResult(value: AnyStructuredSubagentResult): AnyStructuredSubagentResult {
+	return structuredClone(value);
+}
+
+function copyTelemetry(value: TransportTelemetry): TransportTelemetry {
+	return {
+		...value,
+		timing: { ...value.timing },
+		usage: value.usage ? { ...value.usage } : undefined,
+	};
 }

@@ -14,23 +14,16 @@ export interface IsolatedWorkspace {
 	repositoryRoot: string;
 }
 
+export async function assertWorkspaceIsolationReady(cwd: string): Promise<void> {
+	await resolveWorkspaceBase(cwd);
+}
+
 export class WorkspaceManager {
 	private readonly owned = new Map<string, IsolatedWorkspace>();
 
 	async create(ownerId: string, cwd: string): Promise<IsolatedWorkspace> {
 		if (this.owned.has(ownerId)) throw new Error(`Workspace owner already exists: ${ownerId}`);
-		const resolvedCwd = path.resolve(cwd);
-		const repositoryRoot = (
-			await execFileAsync("git", ["-C", resolvedCwd, "rev-parse", "--show-toplevel"])
-		).stdout.trim();
-		const relativeCwd = path.relative(repositoryRoot, resolvedCwd);
-		if (relativeCwd.startsWith("..") || path.isAbsolute(relativeCwd)) {
-			throw new Error("Subagent cwd is outside the Git repository");
-		}
-		const status = (await execFileAsync("git", ["-C", repositoryRoot, "status", "--porcelain"]))
-			.stdout;
-		if (status.trim())
-			throw new Error("Isolated subagent workspace requires a clean Git repository");
+		const { repositoryRoot, relativeCwd } = await resolveWorkspaceBase(cwd);
 		const rootPath = await fs.promises.mkdtemp(path.join(os.tmpdir(), WORKTREE_PREFIX));
 		let registered = false;
 		try {
@@ -67,6 +60,40 @@ export class WorkspaceManager {
 			await fs.promises.rm(rootPath, { recursive: true, force: true });
 			await fs.promises.rm(`${rootPath}.owner`, { force: true });
 			throw error;
+		}
+	}
+
+	async cleanupPersisted(ownerId: string, cwd: string): Promise<void> {
+		const rootPath = findGeneratedWorktreeRoot(cwd);
+		if (!rootPath || !(await this.isOwned(rootPath, ownerId))) return;
+		let repositoryRoot: string | undefined;
+		try {
+			const commonDirectory = (
+				await execFileAsync("git", ["-C", rootPath, "rev-parse", "--git-common-dir"])
+			).stdout.trim();
+			const resolvedCommonDirectory = await fs.promises.realpath(
+				path.resolve(rootPath, commonDirectory),
+			);
+			repositoryRoot = path.dirname(resolvedCommonDirectory);
+		} catch {
+			// The ownership marker still permits bounded filesystem cleanup below.
+		}
+		if (repositoryRoot) {
+			await execFileAsync("git", [
+				"-C",
+				repositoryRoot,
+				"worktree",
+				"remove",
+				"--force",
+				rootPath,
+			]).catch(() => undefined);
+		}
+		await fs.promises.rm(rootPath, { recursive: true, force: true });
+		await fs.promises.rm(`${rootPath}.owner`, { force: true });
+		if (repositoryRoot) {
+			await execFileAsync("git", ["-C", repositoryRoot, "worktree", "prune"]).catch(
+				() => undefined,
+			);
 		}
 	}
 
@@ -113,5 +140,35 @@ export class WorkspaceManager {
 		} catch {
 			return false;
 		}
+	}
+}
+
+async function resolveWorkspaceBase(
+	cwd: string,
+): Promise<{ repositoryRoot: string; relativeCwd: string }> {
+	const resolvedCwd = await fs.promises.realpath(path.resolve(cwd));
+	const reportedRepositoryRoot = (
+		await execFileAsync("git", ["-C", resolvedCwd, "rev-parse", "--show-toplevel"])
+	).stdout.trim();
+	const repositoryRoot = await fs.promises.realpath(reportedRepositoryRoot);
+	const relativeCwd = path.relative(repositoryRoot, resolvedCwd);
+	if (relativeCwd.startsWith("..") || path.isAbsolute(relativeCwd)) {
+		throw new Error("Subagent cwd is outside the Git repository");
+	}
+	const status = (await execFileAsync("git", ["-C", repositoryRoot, "status", "--porcelain"]))
+		.stdout;
+	if (status.trim()) {
+		throw new Error("Isolated subagent workspace requires a clean Git repository");
+	}
+	return { repositoryRoot, relativeCwd };
+}
+
+function findGeneratedWorktreeRoot(cwd: string): string | undefined {
+	let current = path.resolve(cwd);
+	while (true) {
+		if (path.basename(current).startsWith(WORKTREE_PREFIX)) return current;
+		const parent = path.dirname(current);
+		if (parent === current) return undefined;
+		current = parent;
 	}
 }

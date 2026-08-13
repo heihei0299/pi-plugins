@@ -8,10 +8,13 @@ Use it when you want to ask a temporary question, inspect context, or get a shor
 
 ## ✨ Features
 
-- Adds a `/btw` menu for starting a side thread or changing pi-btw settings.
-- Keeps `/btw <question>` as a direct fast path.
-- Answers side questions in a temporary, scrollable UI.
+- Adds a `/btw` menu for starting or resuming an in-memory side thread or changing pi-btw settings.
+- Keeps `/btw <question>` as a direct fast path that always starts a fresh side thread.
+- Answers side questions in a dedicated, scrollable full-screen UI.
+- Keeps mouse-drag copying stable while the main agent continues running in the background.
 - Supports follow-up questions in the same ephemeral side thread.
+- Resumes any non-empty side thread retained by the current Pi session, listed by its first question.
+- Queues Pi-style `Steering` questions while an answer is running and processes them one at a time.
 - Optionally brings the latest answer, a question-to-end suffix, an exact line range, or the entire side thread into the main editor.
 - Uses the current session branch as context.
 - Uses Pi's current model or an independent model selected in `pi-btw.json`.
@@ -55,11 +58,20 @@ Examples:
 /btw is this API name idiomatic?
 ```
 
-Running `/btw` alone opens a two-row menu. **Start side thread** is selected first, so pressing
-`Enter` opens an empty ephemeral side thread; **Settings** changes the starting thinking level
-and whether shortcut changes are remembered. `/btw <question>` bypasses this menu, and its answer
-opens above the side-thread editor. A compact `btw · side thread` header stays fixed above the
-content so the ephemeral workspace remains recognizable while scrolling. Messages use Pi's normal
+Running `/btw` alone opens a menu with **Start side thread** selected first. When the current Pi
+session has non-empty side threads in memory, **Resume side thread** opens a bounded choice list;
+**Settings** changes the starting thinking level and whether shortcut changes are remembered.
+Each Resume row keeps the first question as its fixed title, shows its question count, and the list
+is ordered by the newest recorded answer or visible error. Opening and closing a thread without a
+new result does not reorder it. `/btw <question>` bypasses this menu and always starts a fresh side
+thread. Its answer opens above the side-thread editor. The side thread uses a dedicated full-screen
+terminal view.
+The main agent continues running in the background, but its screen rendering stays suspended until
+`/btw` closes, so new main-thread output cannot move a mouse selection inside the side thread.
+Drag the primary mouse button across side-thread text to select and copy it through Pi's terminal
+clipboard support. Returning from `/btw` redraws the main view with everything produced while it
+was hidden. A compact `btw · side thread` header stays fixed above the content so the ephemeral
+workspace remains recognizable while scrolling. Messages use Pi's normal
 user and assistant presentation without numbered turns or role labels. Type each question and press
 `Enter`; no follow-up shortcut is required.
 Previous side questions and answers remain available to the model and visible for that
@@ -68,10 +80,17 @@ invocation. The side-thread header shows its current thinking level. Press Pi's 
 supported by the side-thread model; every later question uses the displayed level until it is
 changed again. By default, each shortcut change is also written to `pi-btw.json` for the next
 invocation. Turn **Remember thinking level changes** off in Settings to keep changes local to the
-current side thread. Neither path changes the main session's thinking level. While a response is
-running, the transcript stays visible above a compact `Answering…` status.
-The footer shows `PgUp`/`PgDn` only when history can scroll; press `Ctrl+C` to cancel an
-in-progress answer or leave the side thread.
+current side thread. Neither path changes the main session's thinking level.
+While a response is running, the transcript and composer remain visible above an `Answering…`
+status.
+Type another question and press `Enter` to queue it as `Steering`; queued questions are shown in
+submission order and answered one at a time after the active response completes.
+A queued question uses the side thread's thinking level when its turn begins.
+A failed active response is shown in the transcript and does not discard later steering questions.
+The footer shows `PgUp`/`PgDn` only when history can scroll; press `Ctrl+C` to cancel the active
+response and discard the ephemeral side-thread draft and steering queue. Completed questions,
+answers, and visible errors remain available through Resume until the current extension instance
+ends. Steering remains entirely inside pi-btw and never appends to the main conversation or editor.
 
 After at least one successful answer, press `Ctrl+R` to bring selected context to the main
 editor. The scope menu shows the size of the latest question and answer and the entire side
@@ -95,9 +114,11 @@ into Pi's main editor. It never sends the draft automatically. If the main edito
 draft, append is the recommended default. Replace is labeled as destructive and requires a second
 confirmation; Cancel returns to the side thread without changing either draft. Concurrent editor
 updates made while these menus are open are preserved. A success message reports whether context
-was loaded, appended, or replaced and its approximate size. Without an explicit bring-to-main
-action, closing `/btw`, reloading Pi, or switching sessions still discards the side thread without
-adding it to the main conversation.
+was loaded, appended, or replaced and its approximate size.
+Without an explicit bring-to-main action, closing `/btw` never adds the side thread to the main
+conversation. Non-empty threads remain only in memory for Resume within the current Pi session.
+`/new`, Pi `/resume`, `/reload`, extension replacement, and process restart discard every retained
+thread. Unsent drafts, steering queues, interrupted answers, and model credentials are never retained.
 
 ## ⚙️ Model and thinking level
 

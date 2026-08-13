@@ -25,8 +25,10 @@ import {
 	getAnsweredTurns,
 	summarizeBringToMain,
 } from "./bring-to-main.js";
+import { type RunBtwFullscreen, runBtwFullscreen } from "./fullscreen-ui.js";
 import {
 	type BtwCommandMenuResult,
+	type BtwResumeThreadSummary,
 	runBtwMenuPreservingEditor,
 	showBtwCommandMenu,
 } from "./menu.js";
@@ -104,6 +106,15 @@ interface ResolveBtwModelOptions {
 export interface ResolvedBtwModel {
 	model: Model<Api>;
 	auth: SideQuestionAuth;
+}
+
+export interface BtwThreadState {
+	id: string;
+	title?: string;
+	thread: SideThread;
+	thinkingLevel: BtwThinkingLevel;
+	createdAt: number;
+	updatedAt: number;
 }
 
 export async function resolveBtwModel({
@@ -209,10 +220,12 @@ export interface BtwExtensionDependencies {
 	showCommandMenu?: (
 		pi: ExtensionAPI,
 		ctx: ExtensionCommandContext,
+		resumeThreads: readonly BtwResumeThreadSummary[],
 	) => Promise<BtwCommandMenuResult>;
 	loadSettings?: typeof loadSettingsForCommand;
 	resolveModel?: typeof resolveBtwModelWithLoader;
 	runThread?: typeof runBtwThread;
+	runFullscreen?: RunBtwFullscreen;
 }
 
 export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependencies = {}) {
@@ -220,6 +233,22 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
 	const loadSettings = dependencies.loadSettings ?? loadSettingsForCommand;
 	const resolveModel = dependencies.resolveModel ?? resolveBtwModelWithLoader;
 	const runThread = dependencies.runThread ?? runBtwThread;
+	const runFullscreen = dependencies.runFullscreen ?? runBtwFullscreen;
+	// Pi creates a fresh extension instance after session replacement or reload.
+	const resumableThreads = new Map<string, BtwThreadState>();
+	let nextThreadNumber = 1;
+	const listResumeThreads = (): BtwResumeThreadSummary[] =>
+		[...resumableThreads.values()]
+			.reverse()
+			.filter((state) => state.thread.turns.length > 0 && state.title)
+			.sort(
+				(first, second) => second.updatedAt - first.updatedAt || second.createdAt - first.createdAt,
+			)
+			.map((state) => ({
+				id: state.id,
+				title: state.title ?? "Untitled side thread",
+				questionCount: state.thread.turns.length,
+			}));
 	pi.registerCommand("btw", {
 		description: "Ask a quick side question without adding it to the main conversation",
 		handler: async (args, ctx) => {
@@ -228,7 +257,12 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
 				ctx.ui.notify("/btw requires interactive TUI mode", "error");
 				return;
 			}
-			if (!question && (await showCommandMenu(pi, ctx)) !== "start") return;
+
+			let menuResult: BtwCommandMenuResult = "start";
+			if (!question) {
+				menuResult = await showCommandMenu(pi, ctx, listResumeThreads());
+				if (menuResult === "closed") return;
+			}
 
 			const settings = await loadSettings(ctx);
 			const resolution = await resolveModel(settings, ctx);
@@ -241,13 +275,46 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
 				return;
 			}
 
-			await runThread({
-				initialQuestion: question || undefined,
-				selected: resolution.selected,
-				thinkingLevel: settings.thinkingLevel ?? pi.getThinkingLevel(),
-				rememberThinkingLevelChanges: effectiveRememberThinkingLevelChanges(settings),
-				ctx,
-			});
+			let state =
+				typeof menuResult === "object" ? resumableThreads.get(menuResult.threadId) : undefined;
+			if (typeof menuResult === "object" && !state) {
+				notifySafely(ctx, "The selected /btw side thread is no longer available", "warning");
+				return;
+			}
+			const startingTurnCount = state?.thread.turns.length ?? 0;
+
+			try {
+				await runFullscreen(ctx, (fullscreenCtx) => {
+					if (!state) {
+						const createdAt = Date.now();
+						state = {
+							id: `btw-${nextThreadNumber}`,
+							thread: createSideThread(
+								buildConversationContext(fullscreenCtx.sessionManager.getBranch()),
+							),
+							thinkingLevel: settings.thinkingLevel ?? pi.getThinkingLevel(),
+							createdAt,
+							updatedAt: createdAt,
+						};
+						nextThreadNumber += 1;
+					}
+					return runThread({
+						initialQuestion: question || undefined,
+						selected: resolution.selected,
+						thinkingLevel: state.thinkingLevel,
+						rememberThinkingLevelChanges: effectiveRememberThinkingLevelChanges(settings),
+						state,
+						ctx: fullscreenCtx,
+					});
+				});
+			} finally {
+				if (state?.title && state.thread.turns.length > 0) {
+					if (state.thread.turns.length > startingTurnCount) {
+						resumableThreads.delete(state.id);
+					}
+					resumableThreads.set(state.id, state);
+				}
+			}
 		},
 	});
 }
@@ -255,6 +322,7 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
 async function showCommandMenuForBtw(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
+	resumeThreads: readonly BtwResumeThreadSummary[],
 ): Promise<BtwCommandMenuResult> {
 	const currentModel = ctx.model;
 	const availableModels = ctx.modelRegistry.getAll();
@@ -271,6 +339,7 @@ async function showCommandMenuForBtw(
 	return showBtwCommandMenu(ctx, {
 		currentThinkingLevel,
 		availableThinkingLevels: model ? getSupportedThinkingLevels(model) : BTW_THINKING_LEVELS,
+		resumeThreads,
 	});
 }
 
@@ -330,11 +399,18 @@ interface RunBtwThreadDependencies {
 	chooseBringToMain?: typeof chooseBringToMain;
 	deliverBringToMain?: typeof loadBringToMainDraft;
 	persistThinkingLevel?: (level: BtwThinkingLevel) => Promise<unknown>;
+	now?: () => number;
 }
 
 export type BtwThreadResult = { kind: "closed" };
 
 type BtwThreadThinkingControl = Omit<BtwThinkingControl, "keybindings">;
+
+interface BtwThreadSteeringControl {
+	questions: readonly string[];
+	submit: (question: string) => void;
+	thinking: BtwThreadThinkingControl;
+}
 
 type BtwBringToMainChoice =
 	| BtwThreadResult
@@ -354,6 +430,7 @@ interface RunBtwThreadOptions {
 	thinkingLevel: BtwThinkingLevel;
 	rememberThinkingLevelChanges?: boolean;
 	settingsPath?: string;
+	state?: BtwThreadState;
 	ctx: ExtensionCommandContext;
 	dependencies?: RunBtwThreadDependencies;
 }
@@ -364,6 +441,7 @@ export async function runBtwThread({
 	thinkingLevel,
 	rememberThinkingLevelChanges = false,
 	settingsPath,
+	state,
 	ctx,
 	dependencies = {},
 }: RunBtwThreadOptions): Promise<BtwThreadResult> {
@@ -374,44 +452,52 @@ export async function runBtwThread({
 	const persistThinkingLevel =
 		dependencies.persistThinkingLevel ??
 		((level: BtwThinkingLevel) => updateBtwSettings({ thinkingLevel: level }, { settingsPath }));
-	const thread = createSideThread(buildConversationContext(ctx.sessionManager.getBranch()));
+	const now = dependencies.now ?? Date.now;
+	const thread =
+		state?.thread ?? createSideThread(buildConversationContext(ctx.sessionManager.getBranch()));
 	const thinkingLevels = getSupportedThinkingLevels(selected.model);
 	const pendingWrites = new Set<Promise<void>>();
-	let activeThinkingLevel = clampThinkingLevel(selected.model, thinkingLevel);
+	const steeringQuestions: string[] = [];
+	let activeThinkingLevel = clampThinkingLevel(
+		selected.model,
+		state?.thinkingLevel ?? thinkingLevel,
+	);
+	if (state) state.thinkingLevel = activeThinkingLevel;
 	let pendingQuestion = initialQuestion;
 	let composerDraft: string | undefined;
+	const createThinkingControl = (): BtwThreadThinkingControl => ({
+		level: activeThinkingLevel,
+		levels: thinkingLevels,
+		onChange: (level) => {
+			if (!thinkingLevels.includes(level)) return;
+			activeThinkingLevel = level;
+			if (state) state.thinkingLevel = level;
+			if (!rememberThinkingLevelChanges) return;
+			let write!: Promise<void>;
+			write = Promise.resolve()
+				.then(() => persistThinkingLevel(level))
+				.then(() => undefined)
+				.catch((error: unknown) => {
+					notifySafely(
+						ctx,
+						`Thinking level changed to ${level}, but could not be remembered in pi-btw.json: ${formatError(error)}`,
+						"warning",
+					);
+				})
+				.finally(() => pendingWrites.delete(write));
+			pendingWrites.add(write);
+		},
+	});
 
 	try {
 		while (true) {
 			if (!pendingQuestion) {
-				const thinking: BtwThreadThinkingControl = {
-					level: activeThinkingLevel,
-					levels: thinkingLevels,
-					onChange: (level) => {
-						if (!thinkingLevels.includes(level)) return;
-						activeThinkingLevel = level;
-						if (!rememberThinkingLevelChanges) return;
-						let write!: Promise<void>;
-						write = Promise.resolve()
-							.then(() => persistThinkingLevel(level))
-							.then(() => undefined)
-							.catch((error: unknown) => {
-								notifySafely(
-									ctx,
-									`Thinking level changed to ${level}, but could not be remembered in pi-btw.json: ${formatError(error)}`,
-									"warning",
-								);
-							})
-							.finally(() => pendingWrites.delete(write));
-						pendingWrites.add(write);
-					},
-				};
 				const action = await interact(
 					thread,
 					thread.turns.length > 0,
 					ctx,
 					composerDraft,
-					thinking,
+					createThinkingControl(),
 				);
 				if (action.kind === "close") return { kind: "closed" };
 				if (action.kind === "bringToMain") {
@@ -430,7 +516,11 @@ export async function runBtwThread({
 				pendingQuestion = action.question;
 			}
 
-			const result = await ask(thread, pendingQuestion, selected, activeThinkingLevel, ctx);
+			const result = await ask(thread, pendingQuestion, selected, activeThinkingLevel, ctx, {
+				questions: steeringQuestions,
+				submit: (question) => steeringQuestions.push(question),
+				thinking: createThinkingControl(),
+			});
 			if (result.kind === "aborted") {
 				notifySafely(ctx, "Cancelled", "info");
 				return { kind: "closed" };
@@ -442,8 +532,12 @@ export async function runBtwThread({
 					answer: result.message,
 				});
 			}
+			if (state) {
+				state.title ||= sanitizeSingleLine(pendingQuestion) || "Untitled side thread";
+				state.updatedAt = now();
+			}
 
-			pendingQuestion = undefined;
+			pendingQuestion = steeringQuestions.shift();
 		}
 	} finally {
 		await Promise.allSettled([...pendingWrites]);
@@ -766,9 +860,10 @@ async function askThreadQuestion(
 	selected: ResolvedBtwModel,
 	thinkingLevel: BtwThinkingLevel,
 	ctx: ExtensionCommandContext,
+	steering: BtwThreadSteeringControl,
 ) {
 	return ctx.ui.custom<Awaited<ReturnType<typeof completeSideThreadTurn>>>(
-		(tui, theme, _keybindings, done) => {
+		(tui, theme, keybindings, done) => {
 			let settled = false;
 			const view = new BtwAnsweringView(
 				tui,
@@ -781,6 +876,13 @@ async function askThreadQuestion(
 					done({ kind: "aborted" });
 				},
 				thinkingLevel,
+				{
+					steering: {
+						questions: steering.questions,
+						onSubmit: steering.submit,
+						thinking: { ...steering.thinking, keybindings },
+					},
+				},
 			);
 			completeSideThreadTurn({
 				thread,

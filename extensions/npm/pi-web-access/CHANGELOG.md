@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-11
+
+### Added
+- Added Bocha web search provider support. Thanks @jingyulong for PR #243.
+- Added `maxInlineContentChars` to configure the direct content and stored-content slice limit, with a 200,000-character maximum. Thanks @be4zad for issue #244.
+
+### Fixed
+- Hardened the fetched-content cache against symlink traversal and unsafe permissions, and bounded it to 128 entries and 128 MiB with oldest-entry eviction. Thanks `@HerbertGao` for issue #240 and PR #241.
+
+## [0.21.0] - 2026-08-10
+
+### Added
+- Added per-tool and per-command registration gates plus image and PDF extraction gates. Thanks @jaudiger for issue #234.
+- Added `summaryGenerationDeadlineMs` to configure the summary model deadline for curator and auto-summary workflows. Thanks @cataldoc for issue #237.
+
+### Fixed
+- Store full fetched content in an external cache instead of embedding it in session JSONL entries, preventing large search-heavy sessions from ballooning on restore. Thanks Igor Samokhovets (`@samohovets`) for issue #236.
+- Document `get_search_content` parameter constraints in the tool schema. Thanks `@iwangjie` for PR #233.
+
+## [0.20.0] - 2026-08-10
+
+### Added
+- Added keyless DuckDuckGo HTML search as an explicit and routing provider. Thanks @lmilojevicc for issue #228.
+- Added Datalab hosted PDF-to-Markdown extraction as an optional PDF provider. Thanks José Antonio Galiano Sandoval (`@jagaliano`) for PR #226.
+
+### Changed
+- Tightened Datalab JSON response validation and Gemini Web fetch initialization internals.
+
+### Fixed
+- Fix Gemini Web "fetch failed" (`UND_ERR_HEADERS_OVERFLOW`) when running inside a host agent whose global undici dispatcher uses HTTP/1.1 with the default 16 KiB `maxHeaderSize`: Google's `/app` page exceeds that budget. Gemini Web requests now use a dedicated undici agent with a 4 MiB header budget. Thanks José Antonio Galiano Sandoval (`@jagaliano`) for PR #230.
+- Preserve collapsed `web_search` result background padding. Thanks `@SheffeyG` for PR #224.
+
 ## [0.19.0] - 2026-08-08
 
 ### Added

@@ -1,15 +1,47 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { discoverAgents } from "./agents/discovery.js";
+import type {
+	CompletionDelivery,
+	ConsultationCwdPolicy,
+	ConsultResourcePolicy,
+	DelegationCwdPolicy,
+} from "./agents/types.js";
 import {
-	type CompletionDelivery,
-	type ConsultationCwdPolicy,
-	type ConsultResourcePolicy,
-	type DelegationCwdPolicy,
-	discoverAgents,
-} from "./agents.js";
+	completionLabel,
+	consultationCwdLabel,
+	consultResourceLabel,
+	currentWorkflow,
+	delegationCwdLabel,
+	formatManagerSummary,
+	helpLines,
+	showSubagentHelp,
+	showSubagentStatus,
+	statusLines,
+} from "./config-status.js";
+import {
+	applyAgentModel,
+	applyAgentThinking,
+	applyAgentTimeout,
+	applyExecutionProfileFromUi,
+	executionAgentPickerScreen,
+	executionAgentScreen,
+	executionModelInputScreen,
+	executionModelScreen,
+	executionProfileScreen,
+	executionThinkingScreen,
+	executionTimeoutInputScreen,
+	resetAgentExecution,
+} from "./execution-ui.js";
+import {
+	applyBlockingParallelLimitSetting,
+	blockingParallelLimitScreen,
+} from "./parallel-limit-ui.js";
 import type { ManagedAgent } from "./registry.js";
+import { safeTerminalLine as safeTerminalText } from "./safe-text.js";
+import type { DelegationWorkflow } from "./settings/inspection.js";
 import {
-	type DelegationWorkflow,
 	hasOwn,
+	inspectBlockingParallelLimitSettings,
 	inspectCompletionDeliverySettings,
 	inspectConsultResourceSettings,
 	inspectCwdPolicySettings,
@@ -24,6 +56,20 @@ import {
 	updateDelegationWorkflowSetting,
 } from "./settings.js";
 import { formatStatefulAgentLine, type StatefulSubagentRuntimeStatus } from "./stateful.js";
+import {
+	applyStatefulLimitSetting,
+	formatDetachedLimitSummary,
+	formatEmptyStatefulRuntime,
+	statefulLimitInputScreen,
+	statefulLimitListScreen,
+} from "./stateful-limit-ui.js";
+import { isStatefulLimitField, type StatefulLimitField } from "./stateful-limits.js";
+import {
+	applyTransportSetting,
+	responsivenessSetupScreen,
+	transportSettingsScreen,
+} from "./transport-ui.js";
+import { showWorkflowPreview, workflowLabel } from "./workflow-ui.js";
 
 const SUBCOMMANDS = [
 	{ value: "settings", label: "settings", description: "Configure subagent user settings" },
@@ -34,10 +80,12 @@ const TOOL_VIEWPORT_SIZE = 10;
 
 export interface SubagentSettingsRuntime {
 	getBlockingEnabled(): boolean;
+	getMaxParallelTasks(): number;
 	getCompletionDelivery(): CompletionDelivery;
 	getConsultResourcePolicy(): ConsultResourcePolicy;
 	getConsultationCwdPolicy(): ConsultationCwdPolicy;
 	getDelegationCwdPolicy(): DelegationCwdPolicy;
+	setMaxParallelTasks(value: number): void;
 	setCompletionDelivery(value: CompletionDelivery): void;
 	setConsultResourcePolicy(value: ConsultResourcePolicy): void;
 	setConsultationCwdPolicy(value: ConsultationCwdPolicy): void;
@@ -47,7 +95,7 @@ export interface SubagentSettingsRuntime {
 	clearAgents(): Promise<number>;
 }
 
-interface MenuOwner {
+export interface SubagentMenuOwner {
 	generation: number;
 	controller: AbortController;
 }
@@ -61,8 +109,8 @@ interface ToolDraft {
 	selected: Set<string>;
 }
 
-export function registerSubagentConfigCommand(pi: ExtensionAPI, runtime: SubagentSettingsRuntime) {
-	const owner: MenuOwner = { generation: 0, controller: new AbortController() };
+export function registerSubagentConfigLifecycle(pi: ExtensionAPI): SubagentMenuOwner {
+	const owner: SubagentMenuOwner = { generation: 0, controller: new AbortController() };
 	pi.on("session_start", () => {
 		owner.generation += 1;
 		owner.controller.abort(new DOMException("Subagent session replaced", "AbortError"));
@@ -72,13 +120,21 @@ export function registerSubagentConfigCommand(pi: ExtensionAPI, runtime: Subagen
 		owner.generation += 1;
 		owner.controller.abort(new DOMException("Subagent session shut down", "AbortError"));
 	});
+	return owner;
+}
+
+export function registerSubagentConfigCommand(
+	pi: ExtensionAPI,
+	runtime: SubagentSettingsRuntime,
+	owner = registerSubagentConfigLifecycle(pi),
+) {
 	registerSubagentPrimaryCommand(pi, runtime, owner);
 }
 
 function registerSubagentPrimaryCommand(
 	pi: ExtensionAPI,
 	runtime: SubagentSettingsRuntime,
-	owner: MenuOwner,
+	owner: SubagentMenuOwner,
 ) {
 	pi.registerCommand("subagents", {
 		description: "Manage current-session subagents and user settings",
@@ -116,7 +172,7 @@ async function showSubagentManager(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	runtime: SubagentSettingsRuntime,
-	owner: MenuOwner,
+	owner: SubagentMenuOwner,
 ) {
 	if (ctx.mode !== "tui") {
 		showSubagentStatus(ctx, runtime);
@@ -128,12 +184,27 @@ async function showSubagentManager(
 	if (!isCurrent()) return;
 	let availableAgents = discoverAgents(ctx.cwd, "user", readSubagentSettings() ?? {}).agents;
 	let toolDraft: ToolDraft | undefined;
+	let selectedExecutionAgent: (typeof availableAgents)[number] | undefined;
+	let selectedStatefulLimit: StatefulLimitField = "maxAgents";
 	type Screen =
 		| "main"
 		| "workflow"
 		| "agents"
 		| "settings"
 		| "advanced"
+		| "performance"
+		| "responsiveness"
+		| "transport"
+		| "execution-profiles"
+		| "execution-agent-picker"
+		| "execution-agent"
+		| "execution-thinking"
+		| "execution-model"
+		| "execution-model-input"
+		| "execution-timeout"
+		| "parallel-limit"
+		| "stateful-limits"
+		| "stateful-limit-input"
 		| "status"
 		| "help"
 		| "agent-picker"
@@ -141,6 +212,16 @@ async function showSubagentManager(
 	type Action =
 		| "set-workflow"
 		| "clear-agents"
+		| "set-transport"
+		| "apply-execution-profile"
+		| "pick-execution-agent"
+		| "set-agent-thinking"
+		| "set-agent-model"
+		| "set-agent-timeout"
+		| "reset-agent-execution"
+		| "set-parallel-limit"
+		| "pick-stateful-limit"
+		| "set-stateful-limit"
 		| "set-completion"
 		| "set-consult-resources"
 		| "set-consultation-cwd"
@@ -183,7 +264,7 @@ async function showSubagentManager(
 						{
 							id: "advanced",
 							label: "Advanced settings",
-							description: "Agent permissions, runtime details, and settings path",
+							description: "Agent permissions, parallel limit, runtime details, and settings path",
 							to: "advanced",
 						},
 						{ id: "help", label: "Help", to: "help" },
@@ -240,7 +321,9 @@ async function showSubagentManager(
 				return {
 					kind: "actions",
 					title: "Current-session Subagents",
-					lines: agents.length ? agents.map(formatStatefulAgentLine) : [formatEmptyRuntime(status)],
+					lines: agents.length
+						? agents.map(formatStatefulAgentLine)
+						: [formatEmptyStatefulRuntime(status)],
 					items: [
 						...(agents.length > 0
 							? [
@@ -258,26 +341,85 @@ async function showSubagentManager(
 				};
 			},
 			settings: () => subagentSettingsScreen(runtime),
-			advanced: () => ({
+			advanced: () => {
+				const limit = inspectBlockingParallelLimitSettings();
+				return {
+					kind: "actions",
+					title: "Advanced Subagent Settings",
+					items: [
+						{
+							id: "agent-tools",
+							label: "Agent tool permissions",
+							description: "Customize persistent per-agent tool allow-lists",
+							action: "load-agent-picker",
+						},
+						{
+							id: "status",
+							label: "Runtime details",
+							description: "Show transport, configured source, and settings path",
+							to: "status",
+						},
+						{
+							id: "parallel-limit",
+							label: "Maximum parallel workers",
+							description: `Current: ${runtime.getMaxParallelTasks()} per blocking call`,
+							to: "parallel-limit",
+							disabled: limit.error !== undefined,
+							disabledReason: limit.error
+								? `Repair ${safeTerminalText(limit.path)} before editing this setting`
+								: undefined,
+						},
+						{
+							id: "stateful-limits",
+							label: "Detached agent limits",
+							description: formatDetachedLimitSummary(runtime.getRuntimeStatus()),
+							to: "stateful-limits",
+						},
+						{
+							id: "performance",
+							label: "Performance and execution",
+							description: "Transport, responsiveness, profiles, and agent defaults",
+							to: "performance",
+						},
+						{ id: "back", label: "Back", action: "back" },
+					],
+					hint: "back",
+				};
+			},
+			performance: () => ({
 				kind: "actions",
-				title: "Advanced Subagent Settings",
+				title: "Performance and Execution",
 				items: [
 					{
-						id: "agent-tools",
-						label: "Agent tool permissions",
-						description: "Customize persistent per-agent tool allow-lists",
-						action: "load-agent-picker",
+						id: "responsiveness",
+						label: "Responsiveness setup",
+						description: "Preview automatic retained transport and completion guidance",
+						to: "responsiveness",
 					},
+					{ id: "transport", label: "Detached transport", to: "transport" },
+					{ id: "profiles", label: "Execution profiles", to: "execution-profiles" },
 					{
-						id: "status",
-						label: "Runtime details",
-						description: "Show transport, configured source, and settings path",
-						to: "status",
+						id: "agents",
+						label: "Agent execution defaults",
+						description: "Model, thinking level, and timeout",
+						to: "execution-agent-picker",
 					},
 					{ id: "back", label: "Back", action: "back" },
 				],
 				hint: "back",
 			}),
+			responsiveness: () => responsivenessSetupScreen(runtime),
+			transport: () => transportSettingsScreen(runtime),
+			"execution-profiles": () => executionProfileScreen(),
+			"execution-agent-picker": () => executionAgentPickerScreen(availableAgents),
+			"execution-agent": () => executionAgentScreen(selectedExecutionAgent),
+			"execution-thinking": () => executionThinkingScreen(selectedExecutionAgent),
+			"execution-model": () => executionModelScreen(selectedExecutionAgent, ctx),
+			"execution-model-input": () => executionModelInputScreen(selectedExecutionAgent),
+			"execution-timeout": () => executionTimeoutInputScreen(selectedExecutionAgent),
+			"parallel-limit": () => blockingParallelLimitScreen(runtime),
+			"stateful-limits": () => statefulLimitListScreen(runtime),
+			"stateful-limit-input": () => statefulLimitInputScreen(selectedStatefulLimit, runtime),
 			status: () => ({
 				kind: "detail",
 				title: "Subagent runtime details",
@@ -351,7 +493,7 @@ async function showSubagentManager(
 			}),
 		},
 		actions: {
-			"set-workflow": async ({ itemId }) => {
+			"set-workflow": async ({ itemId, signal }) => {
 				if (!isWorkflow(itemId)) return { kind: "rejected" };
 				const snapshot = inspectDelegationWorkflowSettings();
 				if (snapshot.error) return { kind: "rejected" };
@@ -364,9 +506,10 @@ async function showSubagentManager(
 				if (requiresReload && blockReloadWithRetainedAgents(ctx, runtime)) {
 					return { kind: "rejected" };
 				}
-				if (!(await showWorkflowPreview(ctx, active, itemId, requiresReload))) {
-					return { kind: "rejected" };
+				if (!(await showWorkflowPreview(ctx, active, itemId, requiresReload, signal))) {
+					return signal.aborted || !isCurrent() ? { kind: "close" } : { kind: "rejected" };
 				}
+				if (signal.aborted || !isCurrent()) return { kind: "close" };
 				if (requiresReload && blockReloadWithRetainedAgents(ctx, runtime)) {
 					return { kind: "rejected" };
 				}
@@ -393,21 +536,71 @@ async function showSubagentManager(
 				await ctx.reload();
 				return { kind: "close" };
 			},
-			"clear-agents": async () => {
+			"clear-agents": async ({ signal }) => {
 				const agents = runtime.listAgents();
 				if (agents.length === 0) return { kind: "stay" };
 				const confirmed = await ctx.ui.confirm(
 					"Clear current-session subagents?",
 					`Close and delete ${agents.length} retained agent${agents.length === 1 ? "" : "s"}?`,
+					{ signal },
 				);
+				if (signal.aborted || !isCurrent()) return { kind: "close" };
 				if (!confirmed) return { kind: "rejected" };
+				if (
+					runtime
+						.listAgents()
+						.map((agent) => agent.id)
+						.join("\0") !== agents.map((agent) => agent.id).join("\0")
+				) {
+					ctx.ui.notify(
+						"Detached agents changed while confirming; review the list again.",
+						"warning",
+					);
+					return { kind: "rejected" };
+				}
 				const cleared = await runtime.clearAgents();
+				if (signal.aborted || !isCurrent()) return { kind: "close" };
 				ctx.ui.notify(
 					`Cleared ${cleared} current-session subagent${cleared === 1 ? "" : "s"}.`,
 					"info",
 				);
 				return { kind: "stay" };
 			},
+			"set-transport": async ({ itemId, signal }) =>
+				applyTransportSetting(itemId, ctx, runtime, signal, isCurrent),
+			"apply-execution-profile": async ({ itemId, signal }) =>
+				applyExecutionProfileFromUi(itemId, ctx, signal, isCurrent),
+			"pick-execution-agent": async ({ itemId }) => {
+				selectedExecutionAgent = availableAgents.find((agent) => agent.name === itemId);
+				return selectedExecutionAgent
+					? { kind: "to", screen: "execution-agent" as const }
+					: { kind: "rejected" as const };
+			},
+			"set-agent-thinking": async ({ value }) =>
+				applyAgentThinking(selectedExecutionAgent, value, ctx),
+			"set-agent-model": async ({ itemId, value }) => {
+				const selected = value ?? (itemId.startsWith("model:") ? itemId.slice(6) : undefined);
+				return applyAgentModel(
+					selectedExecutionAgent,
+					selected === "__inherited__" ? undefined : selected,
+					ctx,
+				);
+			},
+			"set-agent-timeout": async ({ value }) =>
+				applyAgentTimeout(selectedExecutionAgent, value, ctx),
+			"reset-agent-execution": async () => resetAgentExecution(selectedExecutionAgent, ctx),
+			"set-parallel-limit": async ({ value }) =>
+				applyBlockingParallelLimitSetting(value, ctx, runtime),
+			"pick-stateful-limit": async ({ itemId }) => {
+				if (!isStatefulLimitField(itemId)) return { kind: "rejected" };
+				selectedStatefulLimit = itemId;
+				return { kind: "to", screen: "stateful-limit-input" };
+			},
+			"set-stateful-limit": async ({ value, signal }) =>
+				applyStatefulLimitSetting(selectedStatefulLimit, value, ctx, runtime, {
+					signal,
+					isCurrent,
+				}),
 			"set-completion": async ({ value }) => applyCompletionSetting(value, ctx, runtime),
 			"set-consult-resources": async ({ value }) =>
 				applyConsultResourceSetting(value, ctx, runtime),
@@ -491,7 +684,7 @@ async function showSubagentManager(
 async function showSubagentSettings(
 	ctx: ExtensionCommandContext,
 	runtime: SubagentSettingsRuntime,
-	owner: MenuOwner,
+	owner: SubagentMenuOwner,
 ) {
 	const snapshot = inspectConsultResourceSettings();
 	if (ctx.mode !== "tui") {
@@ -693,222 +886,8 @@ function blockReloadWithRetainedAgents(
 	return true;
 }
 
-async function showWorkflowPreview(
-	ctx: ExtensionCommandContext,
-	current: DelegationWorkflow,
-	next: DelegationWorkflow,
-	requiresReload: boolean,
-): Promise<boolean> {
-	const changes = workflowEffects(current, next);
-	return ctx.ui.confirm(
-		requiresReload ? "Save delegation change and reload?" : "Save delegation change?",
-		[
-			`Current: ${workflowLabel(current)}`,
-			`New: ${workflowLabel(next)}`,
-			"",
-			"Effect:",
-			...(changes.length > 0 ? changes : ["Keep the current registered tools"]).map(
-				(effect) => `- ${effect}`,
-			),
-			`- ${requiresReload ? "Reload the extension to apply this tool surface" : "No reload is needed because the active tools already match"}`,
-		].join("\n"),
-	);
-}
-
-function showSubagentStatus(ctx: ExtensionCommandContext, runtime: SubagentSettingsRuntime) {
-	if (ctx.mode !== "tui" && !ctx.hasUI) return;
-	const snapshot = inspectCompletionDeliverySettings();
-	ctx.ui.notify(
-		formatStatus(runtime.getRuntimeStatus(), snapshot, runtime),
-		snapshot.error ? "warning" : "info",
-	);
-}
-
-function showSubagentHelp(ctx: ExtensionCommandContext, runtime: SubagentSettingsRuntime) {
-	if (ctx.mode !== "tui" && !ctx.hasUI) return;
-	ctx.ui.notify(helpLines(runtime).join("\n"), "info");
-}
-
-function statusLines(runtime: SubagentSettingsRuntime): string[] {
-	const snapshot = inspectCompletionDeliverySettings();
-	return formatStatus(runtime.getRuntimeStatus(), snapshot, runtime).split("\n");
-}
-
-function helpLines(runtime: SubagentSettingsRuntime): string[] {
-	const snapshot = inspectCompletionDeliverySettings();
-	const cwdPolicy = inspectCwdPolicySettings();
-	return [
-		"/subagents — choose delegation workflow, manage current agents, and configure agent tools",
-		"/subagents settings — configure target locations, trusted resources, and async completion",
-		"/subagents status — show current-session and user-setting values",
-		"/subagents help — show this help",
-		"Target policies control startup directories and resources, not filesystem access or sandboxing.",
-		"Manage saved folder trust with Pi /trust and restart Pi after changing it.",
-		`Runtime consultation target: ${consultationCwdLabel(runtime.getConsultationCwdPolicy())}`,
-		`Configured consultation target: ${consultationCwdLabel(cwdPolicy.consultation.value)} (${cwdPolicy.consultation.source})`,
-		`Runtime delegation target: ${delegationCwdLabel(runtime.getDelegationCwdPolicy())}`,
-		`Configured delegation target: ${delegationCwdLabel(cwdPolicy.delegation.value)} (${cwdPolicy.delegation.source})`,
-		`User settings: ${safeTerminalText(snapshot.path)}`,
-	];
-}
-
-function formatManagerSummary(
-	runtime: SubagentSettingsRuntime,
-	status: StatefulSubagentRuntimeStatus,
-	configured: ReturnType<typeof inspectDelegationWorkflowSettings>,
-): string {
-	const current = currentWorkflow(runtime, status);
-	const cwdPolicy = inspectCwdPolicySettings();
-	const consult = inspectConsultResourceSettings();
-	return [
-		`Delegation: ${workflowLabel(current)}`,
-		`Completion: ${completionLabel(status.completionDelivery)}`,
-		`Consult target: ${consultationCwdLabel(runtime.getConsultationCwdPolicy())}`,
-		`Delegation target: ${delegationCwdLabel(runtime.getDelegationCwdPolicy())}`,
-		`Consult resources: ${consultResourceLabel(runtime.getConsultResourcePolicy())}`,
-		`Configured consult target: ${consultationCwdLabel(cwdPolicy.consultation.value)} · ${cwdPolicy.consultation.source}`,
-		`Configured delegation target: ${delegationCwdLabel(cwdPolicy.delegation.value)} · ${cwdPolicy.delegation.source}`,
-		`Configured consult resources: ${consultResourceLabel(consult.value)} · ${consult.source}`,
-		`Settings: ${safeTerminalText(cwdPolicy.path)}`,
-		`Agents: ${status.activeAgents} active · ${status.retainedAgents} retained`,
-		...(configured.value !== current
-			? [`Configured after reload: ${workflowLabel(configured.value)}`]
-			: []),
-		...(configured.error ? ["Settings need repair; open Advanced settings for details."] : []),
-	].join("\n");
-}
-
-function formatStatus(
-	status: StatefulSubagentRuntimeStatus,
-	snapshot: ReturnType<typeof inspectCompletionDeliverySettings>,
-	runtime?: SubagentSettingsRuntime,
-): string {
-	const configuredWorkflow = inspectDelegationWorkflowSettings();
-	const consult = inspectConsultResourceSettings();
-	const cwdPolicy = inspectCwdPolicySettings();
-	const current = runtime ? currentWorkflow(runtime, status) : configuredWorkflow.value;
-	return [
-		"Current session",
-		`  Delegation: ${workflowLabel(current)}`,
-		`  Async runtime: ${status.initialized ? "initialized" : status.enabled ? "not initialized" : "disabled"}`,
-		`  Transport: ${status.transport}`,
-		`  Completion: ${completionLabel(status.completionDelivery)}`,
-		`  Consultation target: ${consultationCwdLabel(runtime?.getConsultationCwdPolicy() ?? cwdPolicy.consultation.value)}`,
-		`  Delegation target: ${delegationCwdLabel(runtime?.getDelegationCwdPolicy() ?? cwdPolicy.delegation.value)}`,
-		`  Consultation resources: ${consultResourceLabel(runtime?.getConsultResourcePolicy() ?? consult.value)}`,
-		`  Agents: ${status.activeAgents} active, ${status.retainedAgents} retained`,
-		"User settings",
-		`  Delegation source: ${configuredWorkflow.source}`,
-		`  Configured delegation: ${workflowLabel(configuredWorkflow.value)}`,
-		`  Completion source: ${snapshot.source}`,
-		`  Configured completion: ${completionLabel(snapshot.value)}`,
-		`  Configured consultation target: ${consultationCwdLabel(cwdPolicy.consultation.value)}`,
-		`  Consultation target source: ${cwdPolicy.consultation.source}`,
-		`  Configured delegation target: ${delegationCwdLabel(cwdPolicy.delegation.value)}`,
-		`  Delegation target source: ${cwdPolicy.delegation.source}`,
-		`  Configured consultation resources: ${consultResourceLabel(consult.value)}`,
-		`  Consultation resource source: ${consult.source}`,
-		`  Path: ${safeTerminalText(snapshot.path)}`,
-		configuredWorkflow.error || snapshot.error || cwdPolicy.error
-			? `  Warning: ${safeTerminalText(configuredWorkflow.error ?? snapshot.error ?? cwdPolicy.error ?? "invalid settings")}`
-			: "  Warning: none",
-		configuredWorkflow.value !== current
-			? "Configured delegation differs from this session. Run /reload to apply it."
-			: "Manual file changes require /reload.",
-	].join("\n");
-}
-
-function formatEmptyRuntime(status: StatefulSubagentRuntimeStatus): string {
-	if (!status.enabled) return "Stateful subagents are disabled in user settings.";
-	if (!status.initialized) return "Stateful subagents are not initialized for this session.";
-	return "No current-session subagents.";
-}
-
-function currentWorkflow(
-	runtime: SubagentSettingsRuntime,
-	status: StatefulSubagentRuntimeStatus,
-): DelegationWorkflow {
-	const blocking = runtime.getBlockingEnabled();
-	if (blocking && status.enabled) return "all";
-	if (status.enabled) return "async-only";
-	if (blocking) return "blocking-only";
-	return "disabled";
-}
-
 function isWorkflow(value: string): value is Exclude<DelegationWorkflow, "disabled"> {
 	return value === "all" || value === "async-only" || value === "blocking-only";
-}
-
-function workflowLabel(value: DelegationWorkflow): string {
-	switch (value) {
-		case "all":
-			return "All delegation methods";
-		case "async-only":
-			return "Async only";
-		case "blocking-only":
-			return "Blocking only";
-		case "disabled":
-			return "Delegation disabled";
-	}
-}
-
-function completionLabel(value: CompletionDelivery): string {
-	return value === "auto-resume" ? "Resume automatically when finished" : "Wait until my next turn";
-}
-
-function consultationCwdLabel(value: ConsultationCwdPolicy): string {
-	return value === "current-workspace"
-		? "Current workspace only"
-		: "Anywhere · untrusted targets inherit nothing";
-}
-
-function delegationCwdLabel(value: DelegationCwdPolicy): string {
-	switch (value) {
-		case "trusted-targets":
-			return "Current or saved-trusted folders";
-		case "current-workspace":
-			return "Current workspace only";
-		case "anywhere":
-			return "Anywhere · normal Pi permissions";
-	}
-}
-
-function consultResourceLabel(value: ConsultResourcePolicy): string {
-	switch (value) {
-		case "project-context":
-			return "Project context only";
-		case "none":
-			return "No inherited resources";
-		case "all":
-			return "All trusted resources";
-	}
-}
-
-function workflowEffects(current: DelegationWorkflow, next: DelegationWorkflow): string[] {
-	const blockingEnabled = (value: DelegationWorkflow) =>
-		value === "all" || value === "blocking-only";
-	const asyncEnabled = (value: DelegationWorkflow) => value === "all" || value === "async-only";
-	const effects: string[] = [];
-	if (blockingEnabled(current) !== blockingEnabled(next)) {
-		effects.push(
-			blockingEnabled(next)
-				? "Add blocking `subagent` and read-only `subagent_consult`"
-				: "Remove blocking `subagent` and read-only `subagent_consult`",
-		);
-	}
-	if (asyncEnabled(current) !== asyncEnabled(next)) {
-		effects.push(
-			asyncEnabled(next)
-				? "Add reusable async lifecycle tools"
-				: "Remove reusable async lifecycle tools",
-		);
-	}
-	return effects;
-}
-
-function safeTerminalText(value: string): string {
-	// biome-ignore lint/suspicious/noControlCharactersInRegex: Escape untrusted terminal controls.
-	return value.replace(/[\u0000-\u001f\u007f-\u009f]/gu, "?");
 }
 
 function formatError(error: unknown): string {

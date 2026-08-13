@@ -106,7 +106,7 @@ This clamp is deny-preserving and, like `yoloMode`, applied at composition; when
 | `doublePressToConfirm`      | `true`  | Requires a confirming second press of a decision hotkey in the inline TUI dialog (see below). TUI sessions only; set to `false` for single-press.                                                  |
 | `toolInputPreviewMaxLength` | `200`   | Max characters of inline JSON shown in permission prompts for tool inputs. Omit to use the default. Set to a large value to disable truncation.                                                    |
 | `toolTextSummaryMaxLength`  | `80`    | Max characters of inline pattern/path summaries (grep patterns, find globs, ls paths) in permission prompts. Omit to use the default.                                                              |
-| `piInfrastructureReadPaths` | `[]`    | Extra directories to auto-allow for reads, bypassing the `external_directory` gate. Supports `~`/`$HOME` expansion and wildcard patterns (`*`, `?`).                                               |
+| `piInfrastructureReadPaths` | `[]`    | Extra directories to auto-allow for reads, bypassing the `external_directory` gate. Supports `~`/`$HOME`/`${HOME}` expansion and wildcard patterns (`*`, `?`).                                     |
 | `authorizerChain`           | `[]`    | Ordered names of registered live-authority chain links to consult before the terminal authorizer (see [Authorizer chain](#authorizer-chain--case-by-case-decision-links)).                         |
 
 Both logs write to `~/.pi/agent/extensions/pi-permission-system/logs/`.
@@ -136,7 +136,7 @@ Non-TUI contexts (RPC / frontend-driven sessions) keep the single-select prompt 
 ### `piInfrastructureReadPaths` patterns
 
 Each entry is either a plain directory prefix or a wildcard pattern.
-Plain entries match any path that starts with the given directory (after `~`/`$HOME` expansion).
+Plain entries match any path that starts with the given directory (after `~`/`$HOME`/`${HOME}` expansion).
 Wildcard entries use `*` (any characters, including `/`) and `?` (exactly one character).
 `*` and `**` are equivalent — both cross directory boundaries.
 
@@ -587,9 +587,22 @@ The pattern is stored and displayed as written (`~/.cargo/registry/*`) in logs a
 For caches you only ever **read**, `piInfrastructureReadPaths` is a lighter alternative — it auto-allows read-only tools (`read`, `find`, `grep`, `ls`) and bypasses the gate entirely, but it does not cover `write`/`edit` or bash.
 Use `external_directory` when the allowance must apply to every tool.
 
-Bash commands are also covered: the extension extracts path-like tokens from the command string and applies the same gate when any resolve outside `ctx.cwd`.
-Quoted strings are stripped first to reduce false positives.
-This is a best-effort heuristic — variable expansion and escaped quotes are not parsed, and relative paths inside subshells are not yet resolved against a per-subshell working directory. (The separate `bash` command-pattern surface does evaluate commands nested inside substitutions and subshells; see that section.) OS device paths (`/dev/null`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr`) are always excluded.
+Bash commands are also covered: the extension parses the command and applies the same gate to every token that resolves outside `ctx.cwd`.
+Quoting is understood, so `ls "$HOME/x"` and `ls $HOME/x` are treated alike.
+
+What the bash projection resolves:
+
+- Absolute, home-relative (`~/`), parent-traversal (`../`), and separator-bearing tokens, plus redirect targets (`> out.txt`) and values embedded in long options (`--file=/tmp/patterns`).
+- The plain shell variables `$HOME` / `${HOME}` and `$PWD` / `${PWD}`, so `$HOME/x` is gated exactly as `~/x` and the literal absolute spelling, whether or not the target exists.
+- Relative tokens, against the working directory produced by folding literal current-shell `cd` commands.
+- A bare token (`cat id_rsa`) when it names an existing filesystem entry.
+
+What it deliberately does not resolve: any other variable (`$CONFIG_DIR`), a command substitution (`$(cmd)`), an expansion carrying an operator (`${HOME:-/tmp}`), and a variable reached through an assignment (`CURRENT="$HOME"; ls "$CURRENT"`).
+A non-literal `cd` (`cd "$DIR"`) makes the working directory unknown, after which relative tokens are kept literal rather than resolved against a guess.
+Commands whose payload is opaque (`bash -c`, `eval`, `sudo`, `xargs`) are floored to `ask` instead of projected.
+The governing record is [ADR 0009](https://github.com/gotgenes/pi-packages/blob/main/packages/pi-permission-system/docs/decisions/0009-bash-path-projection-completeness-contract.md), which states what the projection guarantees and which gaps are accepted residuals rather than bugs.
+
+(The separate `bash` command-pattern surface does evaluate commands nested inside substitutions and subshells; see that section.) OS device paths (`/dev/null`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr`) are always excluded.
 
 #### Symlinked paths
 
@@ -644,8 +657,9 @@ To allow-list such a path, write the rule using the path as typed — for exampl
 
 ### Home Directory Expansion in Patterns
 
-Pattern keys in any permission surface can start with `~/` or `$HOME/` (or be exactly `~` / `$HOME`).
+Pattern keys in any permission surface can start with `~/`, `$HOME/`, or `${HOME}/` (or be exactly `~`, `$HOME`, or `${HOME}`).
 They are expanded to the OS home directory at match time, so configs are portable across machines and users.
+A prefix is recognized only when it stands alone or precedes a separator, so a longer name (`~username`, `$HOMEDIR`) and a braced expansion carrying an operator (`${HOME:-/tmp}`) are left alone.
 
 ```jsonc
 {
@@ -661,7 +675,7 @@ They are expanded to the OS home directory at match time, so configs are portabl
 The pattern is stored and displayed as written (e.g. `~/development/*`) in logs and approval dialogs.
 
 Path **values** supplied by tool calls and bash commands are expanded the same way.
-This means `~/...`, `$HOME/...`, and the fully-expanded absolute form all match a single home-anchored pattern: a `read` tool called with path `~/.ssh/config`, `$HOME/.ssh/config`, or `/Users/me/.ssh/config` is all caught by a `"~/.ssh/*": "deny"` rule.
+This means `~/...`, `$HOME/...`, `${HOME}/...`, and the fully-expanded absolute form all match a single home-anchored pattern: a `read` tool called with path `~/.ssh/config`, `$HOME/.ssh/config`, `${HOME}/.ssh/config`, or `/Users/me/.ssh/config` is all caught by a `"~/.ssh/*": "deny"` rule.
 
 ---
 

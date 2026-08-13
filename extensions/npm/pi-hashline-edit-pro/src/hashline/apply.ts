@@ -6,7 +6,9 @@ import {
 	stripDiffPrefixes,
 	swapReversedRanges,
 	warnUnicodeEsc,
-	fmtMismatch,
+	fmtMismatchWithHashes,
+	AnchorMismatchError,
+	assertRangeServed,
 	type RHEdit,
 	type NEdit,
 	type HEdit,
@@ -144,6 +146,7 @@ export function applyEdit(
 	signal?: AbortSignal,
 	precomputedHashes?: string[],
 	filePath?: string,
+	servedHashes?: ReadonlySet<string>,
 	): {
 	content: string;
 	firstChangedLine: number | undefined;
@@ -172,9 +175,13 @@ export function applyEdit(
 		signal,
 	);
 	if (mismatches.length || !initialResolved) {
-		throw new Error(
-			fmtMismatch(mismatches, lineIndex.fileLines, fileHashes, filePath),
+		const feedback = fmtMismatchWithHashes(
+			mismatches,
+			lineIndex.fileLines,
+			fileHashes,
+			filePath,
 		);
+		throw new AnchorMismatchError(feedback.text, feedback.hashes);
 	}
 
 	warnUnicodeEsc(prefixFixed, warnings);
@@ -211,11 +218,20 @@ export function applyEdit(
 			signal,
 		);
 		if (correctedResult.mismatches.length || !correctedResult.resolved) {
-			throw new Error(
-				fmtMismatch(correctedResult.mismatches, lineIndex.fileLines, fileHashes, filePath),
+			const feedback = fmtMismatchWithHashes(
+				correctedResult.mismatches,
+				lineIndex.fileLines,
+				fileHashes,
+				filePath,
 			);
+			throw new AnchorMismatchError(feedback.text, feedback.hashes);
 		}
 		resolved = correctedResult.resolved;
+	}
+
+	if (servedHashes) {
+		abortIf(signal);
+		assertRangeServed(resolved, lineIndex.fileLines, fileHashes, servedHashes, filePath);
 	}
 
 	const spanResult = resToSpan(resolved, content, lineIndex);

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.23.0] - 2026-08-11
+
+### Added
+- Added interactive callback URL pasting to `/mcp-auth` for OAuth flows running on remote or headless machines. Thanks @trevorleibert-mixpanel for PR #330.
+
+### Fixed
+- Stopped load-time MCP initialization from printing a TUI startup error when Pi action methods are not bound yet. Thanks @21307369 for issue #327.
+- Kept interactive OAuth authorization URLs clickable as a single terminal hyperlink. Thanks @rfccg for PR #329.
+
+## [2.22.0] - 2026-08-11
+
+### Added
+- Added the `pi-mcp-adapter/oauth` subpath for URL-bound OAuth token reuse by cooperating Pi extensions. Thanks @ThePhoenixCoding for issue #323.
+- Added `oauth.logoUri` for OAuth Dynamic Client Registration, with validation that requires an absolute HTTP(S) URL. Thanks @grinich for PR #321.
+
+### Fixed
+- Materialized binary MCP resources as private temporary files before model-facing output, with bounded per-session cleanup. Thanks @zenworr and @shaworr for PR #324.
+- Named OAuth callback pages and dynamic client registrations after rebranded Pi hosts, while preserving stock Pi defaults and avoiding guessed client homepages. Thanks @grinich for PR #320.
+
 ## [2.21.2] - 2026-08-09
 
 ### Fixed

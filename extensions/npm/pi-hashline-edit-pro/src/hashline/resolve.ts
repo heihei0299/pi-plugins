@@ -1,7 +1,7 @@
 import { abortIf, rejectUnknownFields, firstNonEmptyIndex, lastNonEmptyIndex, clipLine } from "../utils";
-import { HASH_CLASS, HL_BARE_PREFIX_RE, HL_PREFIX_PLUS_RE, HL_PREFIX_MINUS_RE, canon } from "./hash";
+import { HASH_CLASS, HASH_SEP, HL_BARE_PREFIX_RE, HL_PREFIX_PLUS_RE, HL_PREFIX_MINUS_RE, canon } from "./hash";
 import { parseHashRef, parseText, type Anchor } from "./parse";
-import { NEW_CONTENT_NOT_STRING_MSG } from "../constants";
+import { NEW_CONTENT_NOT_STRING_MSG, MAX_RANGE_STALE_LINES } from "../constants";
 
 export type RAnchor = {
 	line: number;
@@ -39,8 +39,9 @@ export interface NEdit {
 }
 
 export type HTEdit = {
-  new_content: string;
-  hash_bounds: [string, string];
+  replacement_text: string;
+  remove_from: string;
+  remove_to: string;
 };
 
 function resAnchorFromMap(
@@ -73,22 +74,23 @@ function assertAligned(
 	}
 }
 
-export function fmtMismatch(
+export function fmtMismatchWithHashes(
   mismatches: HMismatch[],
   fileLines: string[],
   fileHashes: string[],
   filePath?: string,
-): string {
+): { text: string; hashes: string[] } {
   assertAligned(fileLines, fileHashes, "fmtMismatch");
 
   const out: string[] = [];
+  const hashes: string[] = [];
   const notFound = mismatches.filter((m) => m.kind === "not_found");
   const ambiguous = mismatches.filter((m) => m.kind === "ambiguous");
 
   const refList = notFound.map((m) => `"${m.ref.hash}"`).join(", ");
   if (notFound.length > 0) {
     out.push(
-      `[E_STALE_ANCHOR] ${notFound.length} stale anchor${notFound.length > 1 ? "s" : ""}${filePath ? ` in ${filePath}` : ""}: ${refList}. The file content has changed since those anchors were read. Call read() to get fresh anchors, then copy the 3-char HASH of the start and end of the range you are replacing into hash_bounds of your next replace call.`
+      `[E_STALE_ANCHOR] ${notFound.length} stale anchor${notFound.length > 1 ? "s" : ""}${filePath ? ` in ${filePath}` : ""}: ${refList}. The file content has changed since those anchors were read. Call read() to get fresh anchors, then copy the 3-char HASH of the start and end of the range you are replacing into remove_from and remove_to of your next replace call.`
     );
     for (const m of notFound) {
       const ctx = m.context;
@@ -97,6 +99,7 @@ export function fmtMismatch(
       const to = Math.min(fileLines.length, ctx.line + 1);
       const rows: string[] = [];
       for (let ln = from; ln <= to; ln++) {
+        hashes.push(fileHashes[ln - 1]!);
         rows.push(`    ${ln}: ${fileHashes[ln - 1]}│${clipLine(fileLines[ln - 1] ?? "")}`);
       }
       out.push("");
@@ -106,7 +109,7 @@ export function fmtMismatch(
   if (ambiguous.length > 0) {
     if (out.length > 0) out.push("");
     out.push(
-      `[E_AMBIGUOUS_ANCHOR] ${ambiguous.length} ambiguous anchor${ambiguous.length > 1 ? "s" : ""}${filePath ? ` in ${filePath}` : ""}. Call read() to get fresh anchors, then copy the 3-char HASH of the start and end of the range you are replacing into hash_bounds of your next replace call.`
+      `[E_AMBIGUOUS_ANCHOR] ${ambiguous.length} ambiguous anchor${ambiguous.length > 1 ? "s" : ""}${filePath ? ` in ${filePath}` : ""}. Call read() to get fresh anchors, then copy the 3-char HASH of the start and end of the range you are replacing into remove_from and remove_to of your next replace call.`
     );
     for (const m of ambiguous) {
       const sample = (m.candidates ?? []).slice(0, 5);
@@ -114,6 +117,7 @@ export function fmtMismatch(
         (m.candidates?.length ?? 0) > sample.length
           ? `, ... (+${(m.candidates?.length ?? 0) - sample.length} more)`
           : "";
+      for (const line of sample) hashes.push(fileHashes[line - 1]!);
       const lines = sample
         .map((line) => {
           const content = clipLine(fileLines[line - 1] ?? "");
@@ -126,36 +130,42 @@ export function fmtMismatch(
     }
   }
 
-  return out.join("\n");
+  return { text: out.join("\n"), hashes };
 }
 
-const ITEM_KS = new Set(["new_content", "hash_bounds"]);
-
-function isStrPair(value: unknown): value is [string, string] {
-	return (
-		Array.isArray(value) &&
-		value.length === 2 &&
-		value.every((item) => typeof item === "string")
-	);
+export function fmtMismatch(
+  mismatches: HMismatch[],
+  fileLines: string[],
+  fileHashes: string[],
+  filePath?: string,
+): string {
+  return fmtMismatchWithHashes(mismatches, fileLines, fileHashes, filePath).text;
 }
+
+const ITEM_KS = new Set(["replacement_text", "remove_from", "remove_to"]);
 
 function assertItem(edit: Record<string, unknown>): void {
-  rejectUnknownFields(edit, ITEM_KS, "Edit", "The edit takes only { new_content, hash_bounds }.");
+  rejectUnknownFields(edit, ITEM_KS, "Edit", "The edit takes only { replacement_text, remove_from, remove_to }.");
 
-  if ("hash_bounds" in edit && !isStrPair(edit.hash_bounds)) {
+  if ("remove_from" in edit && typeof edit.remove_from !== "string") {
     throw new Error(
-      `[E_BAD_SHAPE] Field "hash_bounds" must be a pair of anchor strings [start, end].`,
+      `[E_BAD_SHAPE] Field "remove_from" must be an anchor string (3-char hash).`,
     );
   }
-  if (!("new_content" in edit)) {
-    throw new Error(`[E_BAD_SHAPE] The edit requires a "new_content" field. Provide the replacement text (use "" to delete).`);
+  if ("remove_to" in edit && typeof edit.remove_to !== "string") {
+    throw new Error(
+      `[E_BAD_SHAPE] Field "remove_to" must be an anchor string (3-char hash).`,
+    );
   }
-  if (typeof edit.new_content !== "string") {
+  if (!("replacement_text" in edit)) {
+    throw new Error(`[E_BAD_SHAPE] The edit requires a "replacement_text" field. Provide the replacement text (use "" to delete).`);
+  }
+  if (typeof edit.replacement_text !== "string") {
     throw new Error(NEW_CONTENT_NOT_STRING_MSG);
   }
-  if (!isStrPair(edit.hash_bounds)) {
+  if (typeof edit.remove_from !== "string" || typeof edit.remove_to !== "string") {
     throw new Error(
-      `[E_BAD_SHAPE] The edit requires a "hash_bounds" pair of anchor strings [start, end].`,
+      `[E_BAD_SHAPE] The edit requires "remove_from" and "remove_to" anchor strings (3-char hashes from read output).`,
     );
   }
 }
@@ -165,18 +175,18 @@ const ANCHOR_ROW_RE = new RegExp(`^([+-]?)(${HASH_CLASS})│`);
 export function resEdit(edit: HTEdit, warnings?: string[]): HEdit {
   assertItem(edit as Record<string, unknown>);
 
-  const replaceLines = parseText(edit.new_content);
-  const bounds = edit.hash_bounds.map((ref) => {
+  const replaceLines = parseText(edit.replacement_text);
+  const bounds = [edit.remove_from, edit.remove_to].map((ref) => {
     const trimmed = ref.trim();
     const match = trimmed.match(ANCHOR_ROW_RE);
     if (match) {
       let message: string;
       if (match[1] === "+") {
-        message = `[E_BAD_REF] Autocorrected: stripped diff-preview marker copied from the diff preview in hash_bounds entry "${trimmed}".`;
+        message = `[E_BAD_REF] Autocorrected: stripped diff-preview marker copied from the diff preview in remove_from/remove_to entry "${trimmed}".`;
       } else if (match[1] === "-") {
-        message = `[E_BAD_REF] Autocorrected: stripped leading "-" marker in hash_bounds entry "${trimmed}".`;
+        message = `[E_BAD_REF] Autocorrected: stripped leading "-" marker in remove_from/remove_to entry "${trimmed}".`;
       } else {
-        message = `[E_BAD_REF] Autocorrected: stripped "HASH│" prefix copied from read output in hash_bounds entry "${trimmed}".`;
+        message = `[E_BAD_REF] Autocorrected: stripped "HASH│" prefix copied from read output in remove_from/remove_to entry "${trimmed}".`;
       }
       warnings?.push(message);
       return match[2]!;
@@ -215,7 +225,7 @@ export function stripBarePrefixes(
 	});
 	if (stripped.length === 0) return edit;
 	const locations = stripped
-		.map((s) => `new_content line ${s.lineIndex + 1}`)
+		.map((s) => `replacement_text line ${s.lineIndex + 1}`)
 		.join(", ");
 	const matchedCount = stripped.filter((s) => s.matched).length;
 	const evidence =
@@ -251,7 +261,7 @@ export function stripDiffPrefixes(
 		return line;
 	});
 	if (stripped.length === 0) return edit;
-	const locations = stripped.map((i) => `new_content line ${i + 1}`).join(", ");
+	const locations = stripped.map((i) => `replacement_text line ${i + 1}`).join(", ");
 	warnings.push(
 		`[E_INVALID_PATCH] Autocorrected: stripped diff-preview marker copied from the diff preview in ${locations}.`
 	);
@@ -278,7 +288,7 @@ export function swapReversedRanges(
 		return edit;
 	}
 	warnings.push(
-		`[E_BAD_OP] Autocorrected: hash_bounds was reversed (start ${startRef.hash} is after end ${endRef.hash}); swapped the pair.`
+		`[E_BAD_OP] Autocorrected: remove_from and remove_to were reversed (remove_from ${startRef.hash} is after remove_to ${endRef.hash}); swapped the pair.`
 	);
 	return { ...edit, hash_bounds: [endRef, startRef] as [Anchor, Anchor] };
 }
@@ -476,6 +486,66 @@ export function valEdit(
 		mismatches,
 		boundaryDups,
 	};
+}
+
+export class RangeStaleError extends Error {
+  readonly firstMismatchLine: number;
+  readonly rangeHashes: string[];
+  constructor(message: string, firstMismatchLine: number, rangeHashes: string[]) {
+    super(message);
+    this.name = "RangeStaleError";
+    this.firstMismatchLine = firstMismatchLine;
+    this.rangeHashes = rangeHashes;
+  }
+}
+
+export class AnchorMismatchError extends Error {
+  readonly feedbackHashes: string[];
+  constructor(message: string, feedbackHashes: string[]) {
+    super(message);
+    this.name = "AnchorMismatchError";
+    this.feedbackHashes = feedbackHashes;
+  }
+}
+
+export function assertRangeServed(
+  resolved: RHEdit,
+  fileLines: string[],
+  fileHashes: string[],
+  served: ReadonlySet<string>,
+  filePath?: string,
+): void {
+  assertAligned(fileLines, fileHashes, "assertRangeServed");
+  const startLine = resolved.hash_bounds[0].line;
+  const endLine = resolved.hash_bounds[1].line;
+  const mismatchLines: number[] = [];
+  for (let line = startLine; line <= endLine; line++) {
+    if (!served.has(fileHashes[line - 1]!)) mismatchLines.push(line);
+  }
+  if (mismatchLines.length === 0) return;
+
+  const rangeLength = endLine - startLine + 1;
+  const shownLength = Math.min(rangeLength, MAX_RANGE_STALE_LINES);
+  const rows: string[] = [];
+  const shownHashes: string[] = [];
+  for (let line = startLine; line < startLine + shownLength; line++) {
+    const hash = fileHashes[line - 1]!;
+    shownHashes.push(hash);
+    rows.push(`${hash}${HASH_SEP}${fileLines[line - 1]}`);
+  }
+  const location = filePath ? ` in ${filePath}` : "";
+  const first = mismatchLines[0]!;
+  const mismatchText =
+    mismatchLines.length === 1
+      ? `Line ${first} of the replaced range (lines ${startLine}-${endLine})${location} does not match`
+      : `${mismatchLines.length} of ${rangeLength} line(s) in the replaced range (lines ${startLine}-${endLine})${location} do not match`;
+  const capHint =
+    rangeLength > shownLength
+      ? `\n\n[The range has ${rangeLength} lines; showing the first ${shownLength}. Call read() with offset=${startLine + shownLength} to see the rest.]`
+      : "";
+  const message =
+    `[E_RANGE_STALE] ${mismatchText} what was previously shown: the file changed on disk after the anchors were read, or the line(s) were never shown. Nothing was modified. Current range with fresh anchors:\n\n${rows.join("\n")}${capHint}`;
+  throw new RangeStaleError(message, first, shownHashes);
 }
 
 export { warnUnicodeEsc };

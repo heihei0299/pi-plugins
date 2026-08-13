@@ -25,6 +25,10 @@ import { loadOnboardingState, markSetupCompleted as persistSetupCompleted, markS
 import { openPath, resolveServerUrl, sanitizeTerminalText } from "./utils.ts";
 import { isAbortError } from "./runtime-owner.ts";
 
+function terminalHyperlink(label: string, url: string): string {
+  return `\u001B]8;;${sanitizeTerminalText(url)}\u001B\\${sanitizeTerminalText(label)}\u001B]8;;\u001B\\`;
+}
+
 export async function showStatus(state: McpExtensionState, ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
 
@@ -273,11 +277,17 @@ export async function authenticateServer(
       ...(authStorageOptions.baseDir ? { authStorageOptions } : {}),
       onAuthorizationUrl: (authorizationUrl) => {
         ui.notify(
-          `Open this URL to authenticate ${serverName}:\n\n${authorizationUrl}\n\n` +
-          "After approving, return to Pi; the local callback will complete automatically.",
+          `Open this URL to authenticate ${serverName}:\n\n${terminalHyperlink(authorizationUrl, authorizationUrl)}\n\n` +
+          "After approving, Pi will complete automatically if the browser can reach its localhost callback. " +
+          "On a remote machine, copy the full localhost URL from the browser address bar and paste it into Pi.",
           "info"
         );
       },
+      onAuthorizationInput: (_authorizationUrl, inputSignal) => ui.input(
+        `Complete ${serverName} OAuth`,
+        "Paste the full callback URL, or wait for automatic completion",
+        { signal: inputSignal },
+      ),
       ...(signal ? { signal } : {}),
       ...(runtime ? { runtime } : {}),
     });

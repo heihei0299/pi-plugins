@@ -1,7 +1,8 @@
 import { realpathSync } from "node:fs";
 import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type AgentScope, discoverAgents, type SubagentSettings } from "./agents.js";
+import { discoverAgents } from "./agents/discovery.js";
+import type { AgentScope, SubagentSettings } from "./agents/types.js";
 import type { AgentRegistry, ManagedAgent } from "./registry.js";
 import { safeTerminalLine } from "./safe-text.js";
 import { readSubagentSettings } from "./settings.js";

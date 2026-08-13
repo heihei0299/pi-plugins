@@ -1,24 +1,17 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
-const MANAGE_ACTIONS = ["list", "interrupt", "close"] as const;
+const MANAGE_ACTIONS = ["interrupt", "close"] as const;
 const MAILBOX_ACTIONS = ["send", "read"] as const;
 const MAX_MAILBOX_MESSAGE_LENGTH = 16 * 1024;
 
 export const ManageParamsSchema = Type.Object(
 	{
 		action: StringEnum(MANAGE_ACTIONS, {
-			description:
-				"Use list to inspect agents, interrupt to stop active work, or close to release agents.",
+			description: "Interrupt active work or close an agent and release its resources.",
 		}),
 		agentId: Type.Optional(
 			Type.String({ minLength: 1, description: "Required for interrupt and close." }),
-		),
-		includeClosed: Type.Optional(
-			Type.Boolean({
-				default: false,
-				description: "List closed records as well as retained agents.",
-			}),
 		),
 		subtree: Type.Optional(
 			Type.Boolean({
@@ -57,9 +50,11 @@ export const MailboxParamsSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
-export type ValidatedManageParams =
-	| { action: "list"; includeClosed?: boolean }
-	| { action: "interrupt" | "close"; agentId: string; subtree?: boolean };
+export type ValidatedManageParams = {
+	action: "interrupt" | "close";
+	agentId: string;
+	subtree?: boolean;
+};
 
 export type ValidatedMailboxParams =
 	| {
@@ -73,20 +68,18 @@ export type ValidatedMailboxParams =
 
 export function validateManageParams(params: unknown): ValidatedManageParams {
 	const values = parameterRecord(params, "subagent_manage");
-	assertKnownKeys("subagent_manage", values, ["action", "agentId", "includeClosed", "subtree"]);
+	assertKnownKeys("subagent_manage", values, ["action", "agentId", "subtree"]);
 	const action = values.action;
+	if (action === "list") {
+		throw new Error(
+			'subagent_manage no longer supports "list"; use subagent_inspect action "list_runs"',
+		);
+	}
 	if (
 		typeof action !== "string" ||
 		!MANAGE_ACTIONS.includes(action as (typeof MANAGE_ACTIONS)[number])
 	) {
 		throw new Error(`subagent_manage action must be one of: ${MANAGE_ACTIONS.join(", ")}`);
-	}
-	if (action === "list") {
-		assertOptionalBoolean("subagent_manage", action, values, "includeClosed");
-		return {
-			action,
-			...(values.includeClosed === undefined ? {} : { includeClosed: values.includeClosed }),
-		} as ValidatedManageParams;
 	}
 	assertRequiredString("subagent_manage", action, values, "agentId");
 	assertOptionalBoolean("subagent_manage", action, values, "subtree");

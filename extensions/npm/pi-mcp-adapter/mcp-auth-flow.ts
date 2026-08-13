@@ -31,6 +31,7 @@ import {
   getOAuthState,
   clearOAuthState,
   getAuthBaseDir,
+  OAuthCredentialStoreError,
   type AuthStorageOptions,
   type StoredTokens,
 } from "./mcp-auth.ts"
@@ -48,6 +49,10 @@ export interface McpOAuthRuntime {
 
 export interface AuthenticateOptions {
   onAuthorizationUrl?: (authorizationUrl: string) => void | Promise<void>
+  onAuthorizationInput?: (
+    authorizationUrl: string,
+    signal: AbortSignal,
+  ) => Promise<string | undefined>
   authStorageOptions?: AuthStorageOptions
   signal?: AbortSignal
   runtime?: McpOAuthRuntime
@@ -210,6 +215,27 @@ export function extractOAuthConfig(definition: ServerEntry): McpOAuthConfig {
       throw new Error("OAuth clientUri must not be empty")
     }
     config.clientUri = clientUri
+  }
+  if (definition.oauth?.logoUri !== undefined) {
+    if (typeof definition.oauth.logoUri !== "string") {
+      throw new Error("OAuth logoUri must be a string")
+    }
+    const logoUri = interpolateEnvVars(definition.oauth.logoUri).trim()
+    if (!logoUri) {
+      throw new Error("OAuth logoUri must not be empty")
+    }
+    // Consent screens fetch this server-side, so a local path silently renders
+    // nothing. Fail here instead, where the message can say why.
+    let parsed: URL
+    try {
+      parsed = new URL(logoUri)
+    } catch {
+      throw new Error("OAuth logoUri must be an absolute http(s) URL")
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      throw new Error("OAuth logoUri must be an absolute http(s) URL")
+    }
+    config.logoUri = logoUri
   }
   if (definition.oauth?.skipIssuerMetadataValidation !== undefined) {
     if (typeof definition.oauth.skipIssuerMetadataValidation !== "boolean") {
@@ -546,6 +572,53 @@ export function parseAuthorizationCodeInput(input: string, expectedState?: strin
   return parseAuthorizationRedirectInput(input, expectedState).code
 }
 
+type AuthorizationResponse = {
+  input: AuthorizationCodeInput
+  source: "callback" | "manual"
+}
+
+/**
+ * Wait for either the localhost callback or a manually pasted redirect URL.
+ * The manual input prompt is dismissed as soon as either path finishes.
+ */
+export async function waitForAuthorizationResponse(
+  callbackPromise: Promise<AuthorizationCodeInput>,
+  authorizationUrl: string,
+  expectedState: string,
+  onAuthorizationInput?: AuthenticateOptions["onAuthorizationInput"],
+  signal?: AbortSignal,
+): Promise<AuthorizationResponse> {
+  if (!onAuthorizationInput) {
+    return {
+      input: await abortable(callbackPromise, signal),
+      source: "callback",
+    }
+  }
+
+  const inputController = new AbortController()
+  try {
+    const response = await abortable(Promise.race([
+      callbackPromise.then((input) => ({ input, source: "callback" as const })),
+      onAuthorizationInput(authorizationUrl, inputController.signal).then((input) => ({
+        input,
+        source: "manual" as const,
+      })),
+    ]), signal)
+
+    if (response.source === "callback") return response
+    if (!response.input?.trim()) throw new Error("OAuth authentication cancelled")
+    if (!getSearchParamsFromInput(response.input.trim())) {
+      throw new Error("Paste the full OAuth callback URL, including its code and state parameters")
+    }
+    return {
+      input: parseAuthorizationRedirectInput(response.input, expectedState),
+      source: "manual",
+    }
+  } finally {
+    inputController.abort()
+  }
+}
+
 /**
  * Complete OAuth authentication from manual user input.
  */
@@ -706,12 +779,22 @@ export async function authenticate(
         console.warn(`MCP Auth: Failed to open browser for ${serverName}; waiting for manual callback`, { error })
       }
 
-      const callbackResult = await abortable(callbackPromise, signal)
+      const authorizationResponse = await waitForAuthorizationResponse(
+        callbackPromise,
+        authorizationUrl,
+        oauthState,
+        options.onAuthorizationInput,
+        signal,
+      )
+      if (authorizationResponse.source === "manual") {
+        cancelPendingCallback(oauthState)
+      }
 
-      // The callback server accepted only the flow-local reserved state.
+      // The callback server accepted only the flow-local reserved state. Manual
+      // input is checked against the same state before token exchange.
       throwIfAborted(signal)
 
-      return await completeAuth(serverName, callbackResult, {
+      return await completeAuth(serverName, authorizationResponse.input, {
         ...options,
         ...(signal ? { signal } : {}),
         runtime,
@@ -799,7 +882,7 @@ export async function getValidToken(
         authProvider.deactivate()
       }
     } catch (error) {
-      if (isAbortError(error, signal)) throw error
+      if (isAbortError(error, signal) || error instanceof OAuthCredentialStoreError) throw error
       console.error(`MCP Auth: Token refresh failed for ${serverName}`, { error })
       return null
     }

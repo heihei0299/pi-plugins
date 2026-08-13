@@ -9,6 +9,8 @@ export interface InhibitorCommand {
 	description: string;
 	releaseOnStdinClose?: boolean;
 	custom?: boolean;
+	/** Display mode also needs D-Bus because logind idle inhibition misses some compositors. */
+	addDbusIdleInhibit?: boolean;
 }
 
 export function getInhibitorCommand(mode: CaffeinateMode): InhibitorCommand | undefined {
@@ -29,7 +31,7 @@ export function getInhibitorCommand(mode: CaffeinateMode): InhibitorCommand | un
 			return windowsPowerInhibitorCommand("powershell.exe", mode);
 		}
 		if (commandExists("systemd-inhibit")) {
-			const what = mode === "sleep" ? "sleep" : "idle:sleep";
+			const what = mode === "display" ? "idle:sleep" : "sleep";
 			return parentBoundUnixCommand(
 				"systemd-inhibit",
 				[
@@ -41,6 +43,7 @@ export function getInhibitorCommand(mode: CaffeinateMode): InhibitorCommand | un
 					"infinity",
 				],
 				`systemd-inhibit (${formatMode(mode)})`,
+				mode === "display",
 			);
 		}
 		if (commandExists("caffeinate")) {
@@ -48,6 +51,7 @@ export function getInhibitorCommand(mode: CaffeinateMode): InhibitorCommand | un
 				"caffeinate",
 				macCaffeinateArgs(mode),
 				caffeinateDescription(mode),
+				mode === "display",
 			);
 		}
 	}
@@ -67,6 +71,7 @@ function parentBoundUnixCommand(
 	command: string,
 	args: string[],
 	description: string,
+	addDbusIdleInhibit = false,
 ): InhibitorCommand {
 	return {
 		command: "sh",
@@ -79,6 +84,7 @@ function parentBoundUnixCommand(
 			...args,
 		],
 		description,
+		...(addDbusIdleInhibit ? { addDbusIdleInhibit: true } : {}),
 	};
 }
 

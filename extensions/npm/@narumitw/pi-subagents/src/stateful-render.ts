@@ -43,6 +43,10 @@ function renderStatefulCall(tool: StatefulRenderTool, args: Record<string, unkno
 			safeLine(args.workspaceMode, "shared", 64),
 		];
 		if (typeof args.thinkingLevel === "string") metadata.push(`thinking:${args.thinkingLevel}`);
+		if (typeof args.timeoutMs === "number") metadata.push(`timeout:${args.timeoutMs}ms`);
+		if (typeof args.idleTimeoutMs === "number") metadata.push(`idle:${args.idleTimeoutMs}ms`);
+		if (typeof args.maxTurns === "number") metadata.push(`turns:${args.maxTurns}`);
+		if (typeof args.maxToolCalls === "number") metadata.push(`tools:${args.maxToolCalls}`);
 		return new Text(
 			[
 				toolHeader(theme, "subagent_spawn", args.agent, metadata),
@@ -53,9 +57,14 @@ function renderStatefulCall(tool: StatefulRenderTool, args: Record<string, unkno
 		);
 	}
 	if (tool === "send") {
+		const metadata = ["follow-up"];
+		if (typeof args.timeoutMs === "number") metadata.push(`timeout:${args.timeoutMs}ms`);
+		if (typeof args.idleTimeoutMs === "number") metadata.push(`idle:${args.idleTimeoutMs}ms`);
+		if (typeof args.maxTurns === "number") metadata.push(`turns:${args.maxTurns}`);
+		if (typeof args.maxToolCalls === "number") metadata.push(`tools:${args.maxToolCalls}`);
 		return new Text(
 			[
-				toolHeader(theme, "subagent_send", args.agentId, ["follow-up"]),
+				toolHeader(theme, "subagent_send", args.agentId, metadata),
 				`  ${theme.fg("dim", safeLine(args.task, "...", 2 * 1024))}`,
 			].join("\n"),
 			0,
@@ -66,7 +75,6 @@ function renderStatefulCall(tool: StatefulRenderTool, args: Record<string, unkno
 		const metadata: string[] = [];
 		if (typeof args.agentId === "string") metadata.push(`id:${safeLine(args.agentId, "", 256)}`);
 		if (args.subtree === true) metadata.push("subtree");
-		if (args.includeClosed === true) metadata.push("include closed");
 		return new Text(toolHeader(theme, "subagent_manage", args.action, metadata), 0, 0);
 	}
 	const metadata = [`id:${safeLine(args.agentId, "...", 256)}`];
@@ -112,12 +120,43 @@ function renderAgentResult(
 		`${statusBadge(theme, lifecycleStatus(state))} · ${theme.fg("accent", safeLine(agent.id, "agent", 256))} · ${theme.fg("toolOutput", safeLine(agent.agent, "subagent", 256))} · ${theme.fg("muted", state)}`,
 	];
 	const thinking = stringValue(agent.thinkingLevel);
+	const timeout =
+		typeof agent.currentTimeoutMs === "number"
+			? agent.currentTimeoutMs
+			: typeof agent.timeoutMs === "number"
+				? agent.timeoutMs
+				: 0;
+	const idleTimeout =
+		typeof agent.currentIdleTimeoutMs === "number"
+			? agent.currentIdleTimeoutMs
+			: typeof agent.idleTimeoutMs === "number"
+				? agent.idleTimeoutMs
+				: 0;
+	const maxTurns =
+		typeof agent.currentMaxTurns === "number"
+			? agent.currentMaxTurns
+			: typeof agent.maxTurns === "number"
+				? agent.maxTurns
+				: 0;
+	const maxToolCalls =
+		typeof agent.currentMaxToolCalls === "number"
+			? agent.currentMaxToolCalls
+			: typeof agent.maxToolCalls === "number"
+				? agent.maxToolCalls
+				: 0;
 	const unread = typeof agent.unreadMessages === "number" ? agent.unreadMessages : 0;
-	if (thinking || unread > 0) {
+	if (thinking || timeout || idleTimeout || maxTurns || maxToolCalls || unread > 0) {
 		lines.push(
 			theme.fg(
 				"dim",
-				[thinking && `thinking:${safeLine(thinking, "", 128)}`, unread > 0 && `unread:${unread}`]
+				[
+					thinking && `thinking:${safeLine(thinking, "", 128)}`,
+					timeout && `timeout:${timeout}ms`,
+					idleTimeout && `idle:${idleTimeout}ms`,
+					maxTurns && `turns:${maxTurns}`,
+					maxToolCalls && `tools:${maxToolCalls}`,
+					unread > 0 && `unread:${unread}`,
+				]
 					.filter(Boolean)
 					.join(" · "),
 			),
@@ -237,6 +276,11 @@ function lifecycleStatus(state: string): RenderStatus {
 			return "running";
 		case "idle":
 			return "idle";
+		case "blocked":
+		case "needs-input":
+		case "abstained":
+		case "stale":
+			return "warning";
 		case "failed":
 			return "failed";
 		case "interrupted":

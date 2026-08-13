@@ -5,8 +5,17 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import type { AgentConfig, AgentScope, AgentSource, SubagentThinkingLevel } from "./agents.js";
+import type { SchedulingDecision } from "./adaptive-scheduler.js";
+import type {
+	AgentConfig,
+	AgentScope,
+	AgentSource,
+	SubagentThinkingLevel,
+} from "./agents/types.js";
+import { type CapabilityGrant, revokeCapabilityGrant } from "./capability-grant.js";
 import type { TargetPolicyAudit } from "./cwd-policy.js";
+import type { DelegationContract } from "./delegation-contract.js";
+import type { ExecutionPlan } from "./execution-plan.js";
 import {
 	appendBounded,
 	DEFAULT_MAX_CONTEXT_BYTES,
@@ -16,25 +25,50 @@ import {
 	MAX_SUBAGENT_TIMEOUT_MS,
 	truncateUtf8,
 } from "./limits.js";
+import type { OrchestrationMetrics } from "./orchestration-metrics.js";
+import { type ClassifiedSubagentOutcome, classifyStructuredOutcome } from "./outcome.js";
+import type { PanelSynthesis } from "./panel-contract.js";
+import type { PanelEvidenceArtifact } from "./panel-evidence.js";
+import type { PanelFailure } from "./panel-failure.js";
+import type { PanelPhaseBudgets, PanelPreset } from "./panel-planning.js";
 import { resolvePiInvocation } from "./pi-invocation.js";
 import { JsonLineDecoder } from "./protocol.js";
+import {
+	type AnyStructuredSubagentResult,
+	parseAnyStructuredSubagentResult,
+	type SubagentResultFormat,
+} from "./result-contract.js";
+import {
+	formatResultFailure as formatBaseResultFailure,
+	getResultFinalOutput as getBaseResultFinalOutput,
+	getFinalOutput,
+	isResultError as isBaseResultError,
+} from "./runner-result.js";
+import {
+	addUsageValue,
+	mergeUsageStats,
+	protocolUsageCost,
+	protocolUsageCount,
+	type UsageStats,
+} from "./runner-usage.js";
+import {
+	formatTimeoutCheckpoint,
+	formatTurnTerminationMessage,
+	journalMessages,
+	TimeoutProgressJournal,
+	TURN_TERMINATION_VERSION,
+	type TurnTerminationReport,
+} from "./timeout-checkpoint.js";
+import {
+	buildTimeoutFinalizationPrompt,
+	resolveTimeoutFinalizationMs,
+} from "./timeout-finalization.js";
+import { TurnBudgetMonitor, type TurnBudgetStop, type TurnLimits } from "./turn-budget.js";
+import type { WorkItemLedgerSnapshot } from "./work-item-ledger.js";
 
 export const KILL_GRACE_MS = 5000;
 
-export interface UsageStats {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	costInput?: number;
-	costOutput?: number;
-	costCacheRead?: number;
-	costCacheWrite?: number;
-	totalTokens?: number;
-	contextTokens: number;
-	turns: number;
-}
+export type { UsageStats } from "./runner-usage.js";
 export type RecentActivityItem =
 	| { type: "text"; text: string }
 	| { type: "toolCall"; name: string; args: Record<string, unknown> };
@@ -42,21 +76,6 @@ export type RecentActivityItem =
 const MAX_RECENT_ACTIVITY_ITEMS = 10;
 const MAX_RECENT_ACTIVITY_BYTES = 8 * 1024;
 const MAX_RECENT_ACTIVITY_ARGUMENT_BYTES = 1024;
-const MAX_USAGE_VALUE = Number.MAX_SAFE_INTEGER;
-
-function protocolUsageCount(value: unknown): number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
-}
-
-function protocolUsageCost(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0
-		? Math.min(value, MAX_USAGE_VALUE)
-		: 0;
-}
-
-function addUsageValue(current: number, addition: number): number {
-	return Math.min(MAX_USAGE_VALUE, current + addition);
-}
 
 export interface SingleResult {
 	agent: string;
@@ -76,6 +95,10 @@ export interface SingleResult {
 	errorMessage?: string;
 	step?: number;
 	finalOutput?: string;
+	partialOutput?: string;
+	timeoutSummary?: string;
+	timeoutSummaryError?: string;
+	termination?: TurnTerminationReport;
 	timedOut?: boolean;
 	timeoutMs?: number;
 	aborted?: boolean;
@@ -89,51 +112,71 @@ export interface SingleResult {
 		overridden: string[];
 		unsupported: string[];
 	};
+	contract?: DelegationContract;
+	resultFormat?: SubagentResultFormat;
+	structuredResult?: AnyStructuredSubagentResult;
+	resultContractInvalid?: boolean;
+	outcome?: ClassifiedSubagentOutcome;
+	attemptCount?: number;
+	hedged?: boolean;
+	executionPlan?: ExecutionPlan;
+	capabilityGrant?: CapabilityGrant;
+}
+
+export interface PanelDetails {
+	id: string;
+	preset: PanelPreset;
+	sharedTaskPreview: string;
+	state: "running" | "completed" | "degraded" | "insufficient-panel" | "failed" | "cancelled";
+	reviewerIds: string[];
+	validReviewCount: number;
+	failedReviewCount: number;
+	blockingObjectionCount: number;
+	dissentCount: number;
+	budgets: PanelPhaseBudgets;
+	evidence: PanelEvidenceArtifact[];
+	failures: PanelFailure[];
+	synthesis?: PanelSynthesis;
+	synthesizerResult?: SingleResult;
+	cleanupComplete: boolean;
 }
 
 export interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
+	mode: "single" | "parallel" | "chain" | "workflow" | "panel";
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
 	aggregator?: SingleResult;
+	workflow?: WorkItemLedgerSnapshot;
+	schedulerDecisions?: SchedulingDecision[];
+	metrics?: OrchestrationMetrics;
+	panel?: PanelDetails;
 	isError?: boolean;
 }
 
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			const text = msg.content
-				.filter((part) => part.type === "text")
-				.map((part) => part.text)
-				.join("\n");
-			if (text) return text;
-		}
-	}
-	return "";
-}
-
 export function getResultFinalOutput(result: SingleResult): string {
-	return result.finalOutput ?? getFinalOutput(result.messages);
+	return getBaseResultFinalOutput(result);
 }
 
 export function isResultError(result: SingleResult): boolean {
 	return (
-		(result.exitCode !== 0 && result.exitCode !== -1) ||
-		result.timedOut === true ||
-		result.stopReason === "timeout" ||
-		result.stopReason === "error" ||
-		result.stopReason === "aborted"
+		isBaseResultError(result) ||
+		result.resultContractInvalid === true ||
+		(result.outcome !== undefined &&
+			result.outcome.status !== "completed" &&
+			result.outcome.status !== "partial")
 	);
 }
 
 export function formatResultFailure(result: SingleResult): string {
-	const error = result.errorMessage || result.stderr.trim();
-	const output = getResultFinalOutput(result);
-	const combined =
-		error && output ? `${error}\n\nPartial output:\n${output}` : error || output || "(no output)";
-	return truncateUtf8(combined, DEFAULT_MAX_CONTEXT_BYTES).text;
+	const contractError = result.resultContractInvalid
+		? `Subagent returned an invalid ${result.resultFormat ?? "structured"} result contract`
+		: result.outcome && !["completed", "partial"].includes(result.outcome.status)
+			? `Subagent outcome ${result.outcome.status}${result.outcome.reasonCode ? ` (${result.outcome.reasonCode})` : ""}; recovery: ${result.outcome.recoveryActions.join(", ") || "none"}`
+			: undefined;
+	return contractError
+		? formatBaseResultFailure({ ...result, errorMessage: contractError })
+		: formatBaseResultFailure(result);
 }
 
 function boundMessageText(
@@ -262,9 +305,11 @@ export function buildFanInContext(
 			const error = result.errorMessage || result.stderr.trim();
 			const resultText = failed
 				? `${error ? "Error" : output ? "Partial output" : "Error"}:\n${formatResultFailure(result)}`
-				: output
-					? `Output:\n${output}`
-					: "Output: (no output)";
+				: result.structuredResult
+					? `Structured result:\n${JSON.stringify(result.structuredResult)}`
+					: output
+						? `Output:\n${output}`
+						: "Output: (no output)";
 			return [
 				`## Result ${index + 1}: ${result.agent} (${status})`,
 				`Task: ${result.task}`,
@@ -405,6 +450,30 @@ export interface ChildLaunchPolicy {
 	projectTrust?: boolean;
 	baseSystemPrompt?: string;
 	appendSystemPromptPaths?: string[];
+	/** Internal timeout recovery control; omitted means enabled. */
+	finalizeOnTimeout?: boolean;
+	/** Internal hard deadline for the summary attempt. */
+	timeoutFinalizationMs?: number;
+	/** Optional stateful result contract retained during timeout finalization. */
+	timeoutResultFormat?: SubagentResultFormat;
+	/** Optional non-wall-clock limits for this turn. */
+	turnLimits?: TurnLimits;
+	/** Override the timeout reason when an orchestration deadline caps this child. */
+	workTimeoutReason?: "work_timeout" | "orchestration_timeout";
+	/** Public limit value reported when the effective child timeout is only the remaining budget. */
+	workTimeoutReportLimit?: number;
+	/** Absolute blocking-workflow deadline that also caps model finalization. */
+	orchestrationDeadlineAt?: number;
+	/** Completion contract requested for this turn. */
+	resultFormat?: SubagentResultFormat;
+	/** Normalized request contract retained in result details. */
+	contract?: DelegationContract;
+	/** Original task summary shown in result details when the executed prompt has contract metadata. */
+	displayTask?: string;
+	/** Immutable audit or enforcement decision made before launch. */
+	executionPlan?: ExecutionPlan;
+	/** Executor-owned authority lifetime bound to the accepted plan generation. */
+	capabilityGrant?: CapabilityGrant;
 }
 
 export async function runSingleAgent(
@@ -455,10 +524,11 @@ export async function runSingleAgent(
 	let latestAssistantOutput = "";
 	let terminalAssistantOutput: string | undefined;
 
+	const progressJournal = new TimeoutProgressJournal();
 	const currentResult: SingleResult = {
 		agent: agentName,
 		agentSource: agent.source,
-		task,
+		task: launchPolicy?.displayTask ?? task,
 		exitCode: 0,
 		messages: [],
 		stderr: "",
@@ -475,6 +545,10 @@ export async function runSingleAgent(
 		thinkingLevel,
 		step,
 		timeoutMs,
+		contract: launchPolicy?.contract,
+		resultFormat: launchPolicy?.resultFormat,
+		executionPlan: launchPolicy?.executionPlan,
+		capabilityGrant: launchPolicy?.capabilityGrant,
 	};
 	const selectedAssistantOutput = () =>
 		terminalAssistantOutput !== undefined
@@ -579,17 +653,25 @@ export async function runSingleAgent(
 		}
 		let wasAborted = false;
 		let timedOut = false;
+		let budgetStop:
+			| TurnBudgetStop
+			| { reason: "work_timeout" | "orchestration_timeout"; limit: number }
+			| undefined;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			let settled = false;
 			let cleanupTermination: (() => void) | undefined;
 			let timeout: NodeJS.Timeout | undefined;
+			let terminationDeadline: NodeJS.Timeout | undefined;
 			let abortHandler: (() => void) | undefined;
+			let budgetMonitor: TurnBudgetMonitor | undefined;
 			const finish = (code: number) => {
 				if (settled) return;
 				settled = true;
 				if (timeout) clearTimeout(timeout);
+				if (terminationDeadline) clearTimeout(terminationDeadline);
 				cleanupTermination?.();
+				budgetMonitor?.dispose();
 				if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
 				resolve(code);
 			};
@@ -647,6 +729,7 @@ export async function runSingleAgent(
 				const event = raw as { type?: string; message?: Message };
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message;
+					journalMessages(progressJournal, [msg]);
 					if (msg.role === "assistant") {
 						const output = truncateUtf8(getFinalOutput([msg]), DEFAULT_MAX_OUTPUT_BYTES);
 						currentResult.truncated ||= output.truncated;
@@ -659,6 +742,10 @@ export async function runSingleAgent(
 					addMessage(msg);
 					if (msg.role === "assistant") {
 						currentResult.usage.turns++;
+						budgetMonitor?.recordToolCalls(
+							msg.content.filter((part) => part.type === "toolCall").length,
+						);
+						budgetMonitor?.recordAssistantTurn(msg.stopReason);
 						const usage = msg.usage;
 						if (usage && typeof usage === "object") {
 							const input = protocolUsageCount(usage.input);
@@ -719,6 +806,8 @@ export async function runSingleAgent(
 					}
 					emitUpdate();
 				} else if (event.type === "tool_result_end" && event.message) {
+					journalMessages(progressJournal, [event.message]);
+					budgetMonitor?.recordActivity();
 					addMessage(event.message);
 					emitUpdate();
 				}
@@ -732,21 +821,47 @@ export async function runSingleAgent(
 					currentResult.truncated = true;
 				},
 			});
-
-			timeout = setTimeout(() => {
-				timedOut = true;
-				currentResult.timedOut = true;
-				currentResult.stopReason = "timeout";
-				setErrorMessage(`Subagent timed out after ${timeoutMs}ms`);
+			const beginTermination = (exitCode: number) => {
+				if (cleanupTermination || settled) return;
+				cleanupTermination = terminateProcess(proc);
+				terminationDeadline = setTimeout(() => {
+					decoder.finish();
+					proc.stdin?.destroy();
+					proc.stdout?.destroy();
+					proc.stderr?.destroy();
+					finish(exitCode);
+				}, KILL_GRACE_MS + 1_000);
+			};
+			const stopForBudget = (
+				stop: TurnBudgetStop | { reason: "work_timeout" | "orchestration_timeout"; limit: number },
+			) => {
+				if (budgetStop || settled || wasAborted) return;
+				budgetStop = stop;
+				timedOut = stop.reason.endsWith("timeout");
+				currentResult.timedOut = timedOut || undefined;
+				currentResult.stopReason = timedOut ? "timeout" : "limit";
+				const message = formatTurnTerminationMessage(stop.reason, stop.limit);
+				setErrorMessage(message);
 				const bounded = appendBounded(
 					currentResult.stderr,
-					`\nSubagent timed out after ${timeoutMs}ms.`,
+					`\n${message}.`,
 					DEFAULT_MAX_STDERR_BYTES,
 				);
 				currentResult.stderr = bounded.text;
 				currentResult.truncated ||= bounded.truncated;
 				emitUpdate();
-				cleanupTermination = terminateProcess(proc);
+				beginTermination(124);
+			};
+			budgetMonitor = new TurnBudgetMonitor({
+				...launchPolicy?.turnLimits,
+				onExceeded: stopForBudget,
+			});
+
+			timeout = setTimeout(() => {
+				stopForBudget({
+					reason: launchPolicy?.workTimeoutReason ?? "work_timeout",
+					limit: launchPolicy?.workTimeoutReportLimit ?? timeoutMs,
+				});
 			}, timeoutMs);
 			timeout.unref();
 
@@ -765,10 +880,10 @@ export async function runSingleAgent(
 			});
 			proc.on("close", (code) => {
 				decoder.finish();
-				finish(timedOut ? 124 : wasAborted ? 130 : (code ?? 0));
+				finish(budgetStop ? 124 : wasAborted ? 130 : (code ?? 0));
 			});
 			proc.on("error", (error) => {
-				currentResult.launchFailed = true;
+				currentResult.launchFailed = currentResult.processStarted ? undefined : true;
 				const message = setErrorMessage(error.message);
 				const bounded = appendBounded(
 					currentResult.stderr,
@@ -777,27 +892,162 @@ export async function runSingleAgent(
 				);
 				currentResult.stderr = bounded.text;
 				currentResult.truncated ||= bounded.truncated;
-				finish(1);
+				if (currentResult.processStarted) beginTermination(1);
+				else finish(1);
 			});
 
 			if (signal) {
 				abortHandler = () => {
-					if (timedOut || settled) return;
+					if (budgetStop || settled) return;
 					wasAborted = true;
 					currentResult.aborted = true;
 					currentResult.stopReason = "aborted";
 					setErrorMessage("Subagent was aborted");
-					cleanupTermination = terminateProcess(proc);
+					beginTermination(130);
 				};
 				if (signal.aborted) abortHandler();
 				else signal.addEventListener("abort", abortHandler, { once: true });
 			}
 		});
 
-		currentResult.exitCode = exitCode;
+		if (signal?.aborted && budgetStop) {
+			budgetStop = undefined;
+			timedOut = false;
+			currentResult.timedOut = undefined;
+			currentResult.aborted = true;
+			currentResult.stopReason = "aborted";
+			setErrorMessage("Subagent was aborted");
+		}
+		currentResult.exitCode = currentResult.aborted ? 130 : exitCode;
 		const final = truncateUtf8(selectedAssistantOutput(), DEFAULT_MAX_OUTPUT_BYTES);
 		currentResult.finalOutput = final.text;
 		currentResult.truncated ||= final.truncated;
+		if (budgetStop) {
+			currentResult.partialOutput = currentResult.finalOutput || undefined;
+			currentResult.termination = {
+				version: TURN_TERMINATION_VERSION,
+				reason: budgetStop.reason,
+				limit: budgetStop.limit,
+				checkpoint: progressJournal.checkpoint(task, currentResult.partialOutput),
+				finalization: { attempted: false, status: "skipped", durationMs: 0 },
+			};
+		}
+		const remainingFinalizationMs = launchPolicy?.orchestrationDeadlineAt
+			? Math.floor(launchPolicy.orchestrationDeadlineAt - Date.now())
+			: undefined;
+		if (
+			budgetStop &&
+			budgetStop.reason !== "orchestration_timeout" &&
+			launchPolicy?.finalizeOnTimeout !== false &&
+			!signal?.aborted &&
+			(remainingFinalizationMs === undefined || remainingFinalizationMs > 0)
+		) {
+			const finalizationStartedAt = Date.now();
+			const requestedFinalizationMs = resolveTimeoutFinalizationMs(
+				timeoutMs,
+				launchPolicy?.timeoutFinalizationMs,
+			);
+			const finalizationMs = Math.min(
+				requestedFinalizationMs,
+				remainingFinalizationMs ?? requestedFinalizationMs,
+			);
+			const summary = await runSingleAgent(
+				defaultCwd,
+				agents,
+				agentName,
+				buildTimeoutFinalizationPrompt({
+					task,
+					partialOutput: currentResult.partialOutput,
+					recentActivity: currentResult.recentActivity,
+					checkpoint: currentResult.termination?.checkpoint,
+					terminationReason: budgetStop.reason,
+					resultFormat: launchPolicy?.timeoutResultFormat,
+				}),
+				cwd,
+				step,
+				signal,
+				thinkingLevel,
+				finalizationMs,
+				undefined,
+				makeDetails,
+				invocationOverride,
+				{
+					...launchPolicy,
+					tools: [],
+					disableExtensions: true,
+					disableSkills: true,
+					disablePromptTemplates: true,
+					disableContextFiles: true,
+					appendSystemPromptPaths: undefined,
+					finalizeOnTimeout: false,
+					turnLimits: undefined,
+					workTimeoutReason: "work_timeout",
+					workTimeoutReportLimit: finalizationMs,
+					orchestrationDeadlineAt: undefined,
+				},
+			);
+			mergeUsageStats(currentResult.usage, summary.usage);
+			const summaryOutput = getResultFinalOutput(summary).trim();
+			if (summary.exitCode === 0 && summaryOutput) {
+				currentResult.timeoutSummary = summaryOutput;
+				currentResult.finalOutput = summaryOutput;
+				if (currentResult.termination) {
+					currentResult.termination.finalization = {
+						attempted: true,
+						status: "completed",
+						durationMs: Date.now() - finalizationStartedAt,
+					};
+				}
+			} else {
+				currentResult.timeoutSummaryError =
+					summary.errorMessage || summary.stderr.trim() || "Summary produced no final text";
+				if (currentResult.termination) {
+					currentResult.termination.finalization = {
+						attempted: true,
+						status: summary.timedOut ? "timed_out" : "failed",
+						durationMs: Date.now() - finalizationStartedAt,
+						error: currentResult.timeoutSummaryError,
+					};
+				}
+			}
+			currentResult.truncated ||= summary.truncated;
+		}
+		if (currentResult.termination && !currentResult.finalOutput.trim()) {
+			currentResult.finalOutput = formatTimeoutCheckpoint(currentResult.termination.checkpoint);
+		}
+		if (currentResult.exitCode === 0 && launchPolicy?.resultFormat !== undefined) {
+			currentResult.structuredResult = parseAnyStructuredSubagentResult(
+				currentResult.finalOutput ?? "",
+				launchPolicy.resultFormat,
+			);
+			currentResult.resultContractInvalid =
+				launchPolicy.resultFormat !== "text" && currentResult.structuredResult === undefined;
+			if (
+				currentResult.structuredResult?.version === "pi-subagents:result:v2" &&
+				launchPolicy.executionPlan
+			) {
+				currentResult.structuredResult.provenance = {
+					...currentResult.structuredResult.provenance,
+					...(launchPolicy.executionPlan.taskId
+						? { taskId: launchPolicy.executionPlan.taskId }
+						: {}),
+					taskGeneration: launchPolicy.executionPlan.taskGeneration,
+					executionPlanId: launchPolicy.executionPlan.id,
+					cancellationLineage: [...launchPolicy.executionPlan.cancellationLineage],
+				};
+			}
+			if (currentResult.structuredResult?.version === "pi-subagents:result:v2") {
+				currentResult.outcome = classifyStructuredOutcome(
+					currentResult.structuredResult.status,
+					currentResult.structuredResult.reasonCode,
+				);
+			} else if (currentResult.resultContractInvalid) {
+				currentResult.outcome = classifyStructuredOutcome(
+					"contract-invalid",
+					"malformed-structured-result",
+				);
+			}
+		}
 		if (
 			currentResult.exitCode === 0 &&
 			currentResult.stopReason !== "error" &&
@@ -806,6 +1056,13 @@ export async function runSingleAgent(
 			currentResult.exitCode = 1;
 			currentResult.stopReason = "error";
 			setErrorMessage("Subagent completed without final text");
+		}
+		if (currentResult.capabilityGrant?.state === "active") {
+			currentResult.capabilityGrant = revokeCapabilityGrant(
+				currentResult.capabilityGrant,
+				"turn-settled",
+				Date.now(),
+			);
 		}
 		currentResult.policy = {
 			inherited: ["environment"],
