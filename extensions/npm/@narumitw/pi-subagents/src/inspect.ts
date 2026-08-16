@@ -1,11 +1,5 @@
 import * as path from "node:path";
-import { StringEnum } from "@earendil-works/pi-ai";
-import {
-	CONFIG_DIR_NAME,
-	type ExtensionAPI,
-	type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
-import { type Static, Type } from "typebox";
+import { CONFIG_DIR_NAME, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents/discovery.js";
 import type {
 	AgentConfig,
@@ -16,7 +10,7 @@ import type {
 import { projectCapabilityManifest } from "./capabilities.js";
 import { resolveConsultTools } from "./consult-policy.js";
 import { buildContextSnapshot, type ContextMode } from "./context.js";
-import { renderInspectCall, renderInspectResult } from "./inspect-render.js";
+import { INSPECT_ACTIONS } from "./inspect-tool.js";
 import { DEFAULT_MAX_CONTEXT_BYTES } from "./limits.js";
 import { resolvePiInvocation } from "./pi-invocation.js";
 import type { AgentRunInspectionDetail, AgentRunInspectionSummary } from "./registry.js";
@@ -36,47 +30,10 @@ import type { StatefulSubagentRuntimeStatus } from "./stateful.js";
 import type { WorkItemLedgerSnapshot } from "./work-item-ledger.js";
 import { inspectSessionWorkflows } from "./work-item-persistence.js";
 
-const INSPECT_ACTIONS = [
-	"list_agents",
-	"get_agent",
-	"list_runs",
-	"get_run",
-	"list_workflows",
-	"get_workflow",
-	"list_models",
-	"preview_context",
-	"status",
-	"diagnose",
-] as const;
-
-const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	default: "user",
-	description: "Agent definition scope. Project scopes require a trusted project.",
-});
-
-const LimitSchema = Type.Number({ minimum: 1, maximum: 100, multipleOf: 1 });
-const ContextModeSchema = Type.Union([
-	StringEnum(["none", "all", "summary"] as const),
-	Type.Number({ minimum: 1, multipleOf: 1 }),
-]);
 const MAX_DETAILS_LIST_BYTES = 40 * 1024;
 
-export const SubagentInspectParams = Type.Object(
-	{
-		action: StringEnum(INSPECT_ACTIONS),
-		agent: Type.Optional(Type.String({ minLength: 1 })),
-		agentId: Type.Optional(Type.String({ minLength: 1 })),
-		workflowId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
-		agentScope: Type.Optional(AgentScopeSchema),
-		limit: Type.Optional(LimitSchema),
-		includeClosed: Type.Optional(Type.Boolean({ default: false })),
-		context: Type.Optional(ContextModeSchema),
-		contextEntryIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
-	},
-	{ additionalProperties: false },
-);
-
-export type SubagentInspectParams = Static<typeof SubagentInspectParams>;
+export { registerSubagentInspect } from "./inspect-registration.js";
+export { SubagentInspectParams } from "./inspect-tool.js";
 
 export interface SubagentInspectRuntime {
 	getBlockingEnabled(): boolean;
@@ -105,26 +62,6 @@ type ValidatedInspectOperation =
 	| { action: "preview_context"; context: ContextMode; contextEntryIds?: string[] }
 	| { action: "status" }
 	| { action: "diagnose" };
-
-export function registerSubagentInspect(pi: ExtensionAPI, runtime: SubagentInspectRuntime): void {
-	pi.registerTool({
-		name: "subagent_inspect",
-		label: "Inspect Subagents",
-		description:
-			"Inspect available subagent definitions, models, retained runs, persisted blocking workflows, runtime status, and diagnostics without changing subagent or workspace state. This tool never starts a child, sends or acknowledges messages, interrupts or closes runs, changes settings, or modifies files.",
-		promptSnippet: "Inspect subagent metadata and runtime state without changing it",
-		parameters: SubagentInspectParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<InspectToolResult> {
-			return executeSubagentInspect(validateInspectParams(params), ctx, runtime);
-		},
-		renderCall(args, theme) {
-			return renderInspectCall(args, theme);
-		},
-		renderResult(result, options, theme, context) {
-			return renderInspectResult(result, options, theme, context);
-		},
-	});
-}
 
 export function validateInspectParams(params: unknown): ValidatedInspectOperation {
 	const values = parameterRecord(params);
@@ -195,11 +132,12 @@ export function validateInspectParams(params: unknown): ValidatedInspectOperatio
 	return { action };
 }
 
-async function executeSubagentInspect(
-	operation: ValidatedInspectOperation,
+export async function executeSubagentInspect(
+	params: unknown,
 	ctx: ExtensionContext,
 	runtime: SubagentInspectRuntime,
 ): Promise<InspectToolResult> {
+	const operation = validateInspectParams(params);
 	if (operation.action === "list_agents" || operation.action === "get_agent") {
 		assertTrustedScope(operation.agentScope, ctx);
 		const settings = inspectSubagentSettings().settings;

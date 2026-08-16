@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { pbkdf2Sync, createDecipheriv } from "node:crypto";
 import { copyFileSync, existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir, homedir, platform } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { isAbsolute, join, sep } from "node:path";
 import { isBrowserCookieAccessAllowed } from "./gemini-web-config.ts";
 
@@ -18,6 +18,12 @@ interface BrowserConfig {
 type SqliteRow = Record<string, unknown>;
 type SqliteFailure = "unavailable" | "query";
 
+interface BrowserCookieEntry {
+	name: string;
+	value: string;
+	path: string;
+}
+
 const GOOGLE_ORIGINS = [
 	"https://gemini.google.com",
 	"https://accounts.google.com",
@@ -33,6 +39,7 @@ const ALL_COOKIE_NAMES = new Set([
 const MACOS_BROWSER_CONFIGS: BrowserConfig[] = [
 	{ name: "Helium", baseDir: "Library/Application Support/net.imput.helium", keychainService: "Helium Storage Key", keychainAccount: "Helium" },
 	{ name: "Chrome", baseDir: "Library/Application Support/Google/Chrome", keychainService: "Chrome Safe Storage", keychainAccount: "Chrome" },
+	{ name: "Brave", baseDir: "Library/Application Support/BraveSoftware/Brave-Browser", keychainService: "Brave Safe Storage", keychainAccount: "Brave" },
 	{ name: "Arc", baseDir: "Library/Application Support/Arc/User Data", keychainService: "Arc Safe Storage", keychainAccount: "Arc" },
 ];
 
@@ -50,16 +57,32 @@ export function getLastGoogleCookieDiagnostic(): string | null {
 	return lastCookieDiagnostic;
 }
 
+export function getLastBrowserCookieDiagnostic(): string | null {
+	return lastCookieDiagnostic;
+}
+
 export async function getGoogleCookies(
 	options?: { profile?: string; requiredCookies?: string[] },
 ): Promise<{ cookies: CookieMap; warnings: string[] } | null> {
+	return getBrowserCookiesForHosts({
+		hosts: GOOGLE_ORIGINS.map((origin) => new URL(origin).hostname),
+		profile: options?.profile,
+		requiredCookies: options?.requiredCookies,
+		cookieNames: ALL_COOKIE_NAMES,
+		requiredLabel: "Gemini",
+	});
+}
+
+export async function getBrowserCookiesForHosts(
+	options: { hosts: string[]; profile?: string; requiredCookies?: string[]; cookieNames?: Iterable<string>; requiredLabel?: string; requestUrl?: URL },
+): Promise<{ cookies: CookieMap; warnings: string[]; cookieHeader?: string } | null> {
 	lastCookieDiagnostic = null;
 	if (!isBrowserCookieAccessAllowed()) {
-		lastCookieDiagnostic = "Browser cookie access is disabled; enable allowBrowserCookies to use Gemini Web cookies.";
+		lastCookieDiagnostic = "Browser cookie access is disabled; enable allowBrowserCookies to use browser cookies.";
 		return null;
 	}
 
-	const currentPlatform = platform();
+	const currentPlatform = process.platform;
 	const configs = currentPlatform === "darwin" ? MACOS_BROWSER_CONFIGS : currentPlatform === "linux" ? LINUX_BROWSER_CONFIGS : [];
 	if (configs.length === 0) {
 		lastCookieDiagnostic = "Chromium cookie extraction is unsupported on this platform.";
@@ -67,17 +90,23 @@ export async function getGoogleCookies(
 	}
 
 	const warningSet = new Set<string>();
-	const rawProfile = typeof options?.profile === "string" ? options.profile.trim() : "";
-	const requestedProfile = normalizeProfileName(options?.profile);
+	const rawProfile = typeof options.profile === "string" ? options.profile.trim() : "";
+	const requestedProfile = normalizeProfileName(options.profile);
 	if (rawProfile && !requestedProfile) {
 		lastCookieDiagnostic = "Configured Chromium profile must be a profile directory name, not a path.";
 		return null;
 	}
-	const requiredCookies = normalizeCookieNames(options?.requiredCookies);
-	const hosts = GOOGLE_ORIGINS.map((origin) => new URL(origin).hostname);
+	const requiredCookies = normalizeCookieNames(options.requiredCookies);
+	const cookieNames = normalizeCookieNames(options.cookieNames ? [...options.cookieNames] : undefined);
+	const hosts = normalizeHosts(options.hosts);
+	if (hosts.length === 0) {
+		lastCookieDiagnostic = "No valid cookie hosts were requested.";
+		return null;
+	}
 	const home = homedir();
 	let sawCookieDatabase = false;
 	let sawRequiredCookies = false;
+	let sawAnyHostCookie = false;
 	let sawBackendFailure: SqliteFailure | undefined;
 	let sawUnsafeProfilePath = false;
 
@@ -117,25 +146,36 @@ export async function getGoogleCookies(
 				const metaVersion = await readMetaVersion(tempDb);
 				if (metaVersion.failure) sawBackendFailure = metaVersion.failure;
 				if (metaVersion.value === null) continue;
-				const rowsResult = await queryCookieRows(tempDb, hosts, ALL_COOKIE_NAMES);
+				const rowsResult = await queryCookieRows(tempDb, hosts, cookieNames ?? null, Boolean(options.requestUrl));
 				if (rowsResult.status === "failure") {
 					sawBackendFailure = rowsResult.failure;
 					continue;
 				}
 
+				const entries: BrowserCookieEntry[] = [];
 				const cookies: CookieMap = {};
 				for (const row of rowsResult.rows) {
 					const name = typeof row.name === "string" ? row.name : "";
-					if (!ALL_COOKIE_NAMES.has(name) || cookies[name]) continue;
+					if (!name) continue;
 					let value = typeof row.value === "string" && row.value.length > 0 ? row.value : null;
 					if (!value && typeof row.encrypted_value_hex === "string" && /^[0-9a-f]*$/i.test(row.encrypted_value_hex)) {
 						value = decryptCookieValue(Buffer.from(row.encrypted_value_hex, "hex"), key, metaVersion.value >= 24);
 					}
-					if (value) cookies[name] = value;
+					if (!value) continue;
+					const path = typeof row.path === "string" && row.path.startsWith("/") ? row.path : "/";
+					if (options.requestUrl && !pathMatches(options.requestUrl.pathname || "/", path)) continue;
+					entries.push({ name, value, path });
+					if (!cookies[name]) cookies[name] = value;
 				}
 
+				if (entries.length > 0) sawAnyHostCookie = true;
 				if (requiredCookies?.length && !requiredCookies.every((name) => Boolean(cookies[name]))) continue;
-				return { cookies, warnings: [...warningSet] };
+				if (entries.length === 0) continue;
+				return {
+					cookies,
+					warnings: [...warningSet],
+					...(options.requestUrl ? { cookieHeader: buildCookieHeader(entries) } : {}),
+				};
 			} finally {
 				rmSync(tempDir, { recursive: true, force: true });
 			}
@@ -153,7 +193,11 @@ export async function getGoogleCookies(
 			? `Chromium profile '${requestedProfile}' does not contain a cookie database.`
 			: "No detected Chromium profile contains a cookie database.";
 	} else if (requiredCookies?.length && !sawRequiredCookies) {
-		lastCookieDiagnostic = "No detected Chromium profile contains the required Gemini cookies.";
+		lastCookieDiagnostic = `No detected Chromium profile contains the required ${options.requiredLabel ?? "browser"} cookies.`;
+	} else if (!sawAnyHostCookie) {
+		lastCookieDiagnostic = options.requestUrl
+			? "No detected Chromium profile contains cookies for the requested URL."
+			: "No detected Chromium profile contains cookies for the requested host.";
 	} else if (warningSet.size > 0) {
 		lastCookieDiagnostic = [...warningSet][0];
 	} else {
@@ -191,6 +235,10 @@ function normalizeCookieNames(names: string[] | undefined): string[] | undefined
 	if (!names?.length) return undefined;
 	const normalized = names.filter((name): name is string => typeof name === "string").map((name) => name.trim()).filter(Boolean);
 	return normalized.length > 0 ? [...new Set(normalized)] : undefined;
+}
+
+function normalizeHosts(hosts: string[]): string[] {
+	return [...new Set(hosts.map(host => host.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "")).filter(Boolean))];
 }
 
 function listBrowserProfiles(home: string, config: BrowserConfig): string[] {
@@ -246,7 +294,7 @@ function removePkcs7Padding(buf: Buffer): Buffer {
 	return !padding || padding > 16 ? buf : buf.subarray(0, buf.length - padding);
 }
 
-function readBrowserPassword(config: BrowserConfig, currentPlatform: ReturnType<typeof platform>): Promise<string | null> {
+function readBrowserPassword(config: BrowserConfig, currentPlatform: typeof process.platform): Promise<string | null> {
 	const cacheKey = `${currentPlatform}:${config.name}`;
 	const cached = browserPasswordCache.get(cacheKey);
 	if (cached) return cached;
@@ -386,19 +434,58 @@ async function hasCookieNames(dbPath: string, hosts: string[], names: string[]):
 	return { present: names.every((name) => present.has(name)) };
 }
 
-async function queryCookieRows(dbPath: string, hosts: string[], names: Iterable<string>): Promise<QueryResult> {
-	return runSqliteQuery(dbPath, `SELECT name, value, host_key, hex(encrypted_value) AS encrypted_value_hex FROM cookies WHERE ${buildCookieWhere(hosts, names)} ORDER BY expires_utc DESC`);
+async function queryCookieRows(dbPath: string, hosts: string[], names: Iterable<string> | null, filterExpired: boolean): Promise<QueryResult> {
+	const columns = await readCookieColumns(dbPath);
+	if (columns.status === "failure") return columns;
+	const pathExpr = columns.columns.has("path") ? "path" : "'/' AS path";
+	const expiresExpr = columns.columns.has("expires_utc") ? "expires_utc" : "0 AS expires_utc";
+	const expiryFilter = filterExpired && columns.columns.has("expires_utc") ? ` AND (expires_utc = 0 OR expires_utc > ${chromeExpiryNowMicros()})` : "";
+	const partitionFilter = filterExpired ? unpartitionedCookieFilter(columns.columns) : "";
+	return runSqliteQuery(dbPath, `SELECT name, value, host_key, ${pathExpr}, ${expiresExpr}, hex(encrypted_value) AS encrypted_value_hex FROM cookies WHERE ${buildCookieWhere(hosts, names ?? undefined)}${expiryFilter}${partitionFilter} ORDER BY length(path) DESC, expires_utc ASC`);
+}
+
+async function readCookieColumns(dbPath: string): Promise<{ status: "success"; columns: Set<string> } | { status: "failure"; failure: SqliteFailure }> {
+	const result = await runSqliteQuery(dbPath, "PRAGMA table_info(cookies)");
+	if (result.status === "failure") return result;
+	return { status: "success", columns: new Set(result.rows.map(row => typeof row.name === "string" ? row.name : "")) };
+}
+
+function chromeExpiryNowMicros(): number {
+	return (Date.now() + 11644473600000) * 1000;
+}
+
+function unpartitionedCookieFilter(columns: Set<string>): string {
+	const clauses: string[] = [];
+	if (columns.has("top_frame_site_key")) clauses.push("(top_frame_site_key IS NULL OR top_frame_site_key = '')");
+	if (columns.has("partition_key")) clauses.push("(partition_key IS NULL OR partition_key = '')");
+	if (columns.has("is_partitioned")) clauses.push("(is_partitioned IS NULL OR is_partitioned = 0)");
+	return clauses.length > 0 ? ` AND ${clauses.join(" AND ")}` : "";
+}
+
+function buildCookieHeader(entries: BrowserCookieEntry[]): string {
+	return entries
+		.sort((a, b) => b.path.length - a.path.length)
+		.map(({ name, value }) => `${name}=${value}`)
+		.join("; ");
+}
+
+function pathMatches(requestPath: string, cookiePath: string): boolean {
+	if (requestPath === cookiePath) return true;
+	if (!requestPath.startsWith(cookiePath)) return false;
+	if (cookiePath.endsWith("/")) return true;
+	return requestPath[cookiePath.length] === "/";
 }
 
 function buildCookieWhere(hosts: string[], cookieNames?: Iterable<string>): string {
 	const hostClauses: string[] = [];
 	for (const host of hosts) {
-		for (const candidate of expandHosts(host)) {
-			const escaped = escapeSqlString(candidate);
-			hostClauses.push(`host_key = '${escaped}'`, `host_key = '.${escaped}'`, `host_key LIKE '%.${escaped}'`);
+		const escapedHost = escapeSqlString(host);
+		hostClauses.push(`host_key = '${escapedHost}'`);
+		for (const candidate of domainCookieHosts(host)) {
+			hostClauses.push(`host_key = '.${escapeSqlString(candidate)}'`);
 		}
 	}
-	let where = `(${hostClauses.join(" OR ")})`;
+	let where = `(${[...new Set(hostClauses)].join(" OR ")})`;
 	const names = cookieNames ? [...cookieNames].filter(Boolean) : [];
 	if (names.length) where += ` AND name IN (${names.map((name) => `'${escapeSqlString(name)}'`).join(", ")})`;
 	return where;
@@ -408,11 +495,11 @@ function escapeSqlString(value: string): string {
 	return value.replaceAll("'", "''");
 }
 
-function expandHosts(host: string): string[] {
+function domainCookieHosts(host: string): string[] {
 	const parts = host.split(".").filter(Boolean);
-	if (parts.length <= 1) return [host];
-	const candidates = new Set([host]);
-	for (let i = 1; i <= parts.length - 2; i++) candidates.add(parts.slice(i).join("."));
+	if (parts.length <= 1) return [];
+	const candidates = new Set<string>();
+	for (let i = 0; i <= parts.length - 2; i++) candidates.add(parts.slice(i).join("."));
 	return [...candidates];
 }
 

@@ -33,7 +33,7 @@ export interface PermissionGateParams {
   /** Message strings/factories for each outcome. */
   messages: {
     denyReason: string;
-    unavailableReason: string;
+    unavailableReason: (decision: PermissionPromptDecision) => string;
     userDeniedReason: (decision: PermissionPromptDecision) => string;
   };
 }
@@ -65,7 +65,7 @@ export async function applyPermissionGate(
       return {
         action: "block",
         reason: decision.confirmationUnavailable
-          ? messages.unavailableReason
+          ? messages.unavailableReason(decision)
           : messages.userDeniedReason(decision),
       };
     }

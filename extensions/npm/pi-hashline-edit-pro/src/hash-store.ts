@@ -2,7 +2,7 @@ import { existsSync } from "fs";
 import { readFile, rename, mkdir, stat } from "fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { hashStorePath, hashStoreDir, legacyHashStorePath } from "./paths";
-import { errCode, splitLines } from "./utils";
+import { errCode, isRec, splitLines } from "./utils";
 import { initHasher, contentChecksum } from "./hashline/hasher";
 import { HASH_RE } from "./hashline/alphabet";
 import { HASH_STORE_VERSION, HASH_STORE_BUSY_TIMEOUT } from "./constants";
@@ -45,7 +45,23 @@ export function isValidHashList(value: unknown): value is string[] {
   for (const hash of value) {
     if (typeof hash !== "string" || !HASH_RE.test(hash)) return false;
   }
+  if (new Set(value).size !== value.length) return false;
   return true;
+}
+
+export function parseHashList(raw: string, onInvalid: () => void): string[] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    onInvalid();
+    return undefined;
+  }
+  if (!isValidHashList(parsed)) {
+    onInvalid();
+    return undefined;
+  }
+  return parsed;
 }
 
 function isValidSnapshot(value: unknown): value is LegacySnapshot {
@@ -107,6 +123,13 @@ function openDbWithBusyRetry(storePath: string): { db: DatabaseSync; stmts: Prep
 let cachedDb: { path: string; db: DatabaseSync; stmts: Prepared } | null = null;
 let opening: { path: string; promise: Promise<HashStore> } | null = null;
 let exitHandlerRegistered = false;
+interface SnapshotCacheEntry {
+  checksum: string;
+  lineCount: number;
+  hashes: string[];
+}
+const snapshotCache = new Map<string, SnapshotCacheEntry>();
+export const SNAPSHOT_CACHE_LIMIT = 256;
 function openDb(storePath: string): { db: DatabaseSync; stmts: Prepared } {
   const db = new DatabaseSync(storePath, {
     timeout: HASH_STORE_BUSY_TIMEOUT,
@@ -263,7 +286,11 @@ async function openStore(storePath: string): Promise<HashStore> {
   const { db, stmts } = opened;
 
   if (!existed) {
-    await migrateLegacy(db);
+    try {
+      await migrateLegacy(db);
+    } catch (error) {
+      console.error("Hash store migration failed; continuing without legacy import:", error);
+    }
   }
   cachedDb = { path: storePath, db, stmts };
 
@@ -301,23 +328,23 @@ export function shutdownHashStore(): void {
     shutdownDb(cachedDb.db);
     cachedDb = null;
   }
+  snapshotCache.clear();
 }
 
 function withStore(fn: () => void): void {
-  if (cachedDb) {
-    withBusyRetry(() => {
-      cachedDb!.db.exec("BEGIN IMMEDIATE");
-      try {
-        fn();
-        cachedDb!.db.exec("COMMIT");
-      } catch (e) {
-        try { cachedDb!.db.exec("ROLLBACK"); } catch {}
-        throw e;
-      }
-    });
-  } else {
-    fn();
+  if (!cachedDb) {
+    throw new Error("Hash store is not open; transactional update aborted");
   }
+  withBusyRetry(() => {
+    cachedDb!.db.exec("BEGIN IMMEDIATE");
+    try {
+      fn();
+      cachedDb!.db.exec("COMMIT");
+    } catch (e) {
+      try { cachedDb!.db.exec("ROLLBACK"); } catch {}
+      throw e;
+    }
+  });
 }
 
 async function migrateLegacy(db: DatabaseSync): Promise<void> {
@@ -344,11 +371,17 @@ async function migrateLegacy(db: DatabaseSync): Promise<void> {
 
   const rows: [string, string, number, string, number][] = [];
   for (const [key, value] of Object.entries(raw)) {
-    if (!isValidSnapshot(value)) continue;
-    if (new Set(value.hashes).size !== value.hashes.length) {
-      console.warn(`Skipped legacy snapshot with duplicate hashes for ${key}; it will be re-hashed on next read.`);
+    if (
+      isRec(value) &&
+      Array.isArray(value.hashes) &&
+      new Set(value.hashes).size !== value.hashes.length
+    ) {
+      console.warn(
+        `Skipped legacy snapshot with duplicate hashes for ${key}; it will be re-hashed on next read.`,
+      );
       continue;
     }
+    if (!isValidSnapshot(value)) continue;
     rows.push([
       key,
       contentChecksum(value.content),
@@ -358,23 +391,34 @@ async function migrateLegacy(db: DatabaseSync): Promise<void> {
     ]);
   }
   if (rows.length > 0) {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const stmt = db.prepare(
-        "INSERT OR REPLACE INTO snapshots (path, checksum, line_count, hashes, updated_at) VALUES (?, ?, ?, ?, ?)"
-      );
-      for (const row of rows) stmt.run(...row);
-      db.exec("COMMIT");
-    } catch (e) {
-      db.exec("ROLLBACK");
-      throw e;
-    }
+    withBusyRetry(() => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const stmt = db.prepare(
+          "INSERT OR REPLACE INTO snapshots (path, checksum, line_count, hashes, updated_at) VALUES (?, ?, ?, ?, ?)"
+        );
+        for (const row of rows) stmt.run(...row);
+        db.exec("COMMIT");
+      } catch (e) {
+        try { db.exec("ROLLBACK"); } catch {}
+        throw e;
+      }
+    });
   }
 
   try {
     await rename(legacyPath, `${legacyPath}.bak`);
   } catch (error) {
     console.error("Failed to rename legacy hash store after migration:", error);
+  }
+}
+
+function cacheSnapshot(path: string, checksum: string, lineCount: number, hashes: string[]): void {
+  snapshotCache.delete(path);
+  snapshotCache.set(path, { checksum, lineCount, hashes: hashes.slice() });
+  if (snapshotCache.size > SNAPSHOT_CACHE_LIMIT) {
+    const oldest = snapshotCache.keys().next().value;
+    if (oldest !== undefined) snapshotCache.delete(oldest);
   }
 }
 
@@ -386,17 +430,21 @@ export function getSnapshot(
 ): string[] | undefined {
   const checksum = contentChecksum(content);
   const lineCount = splitLines(content).length;
+  const cached = snapshotCache.get(path);
+  if (cached && cached.checksum === checksum && cached.lineCount === lineCount) {
+    snapshotCache.delete(path);
+    snapshotCache.set(path, cached);
+    return cached.hashes.slice();
+  }
   const row = store.stmts.get(path, checksum, lineCount);
   if (!row) return undefined;
-  try {
-    const parsed = JSON.parse(row.hashes as string);
-    if (isValidHashList(parsed)) return parsed;
+  const parsed = parseHashList(row.hashes as string, () => {
     if (deleteCorrupt) store.stmts.deleteOne(path);
-    return undefined;
-  } catch {
-    if (deleteCorrupt) store.stmts.deleteOne(path);
-    return undefined;
-  }
+    snapshotCache.delete(path);
+  });
+  if (!parsed) return undefined;
+  cacheSnapshot(path, checksum, lineCount, parsed);
+  return parsed;
 }
 
 export function upsertSnapshot(
@@ -407,6 +455,7 @@ export function upsertSnapshot(
   hashes: string[],
 ): void {
   store.stmts.upsert(path, checksum, lineCount, JSON.stringify(hashes), Date.now());
+  cacheSnapshot(path, checksum, lineCount, hashes);
 }
 
 export function upsertUndo(store: HashStore, path: string, entry: UndoRecord): void {
@@ -424,23 +473,15 @@ export function upsertUndo(store: HashStore, path: string, entry: UndoRecord): v
 export function getUndoEntry(store: HashStore, path: string): UndoRecord | undefined {
   const row = store.stmts.undoGet(path);
   if (!row) return undefined;
-  try {
-    const parsed = JSON.parse(row.hashes as string);
-    if (!isValidHashList(parsed)) {
-      store.stmts.undoDelete(path);
-      return undefined;
-    }
-    return {
-      content: row.content as string,
-      bom: row.bom as string,
-      ending: row.ending as string,
-      hashes: parsed as string[],
-      resultContent: row.result_content as string,
-    };
-  } catch {
-    store.stmts.undoDelete(path);
-    return undefined;
-  }
+  const parsed = parseHashList(row.hashes as string, () => store.stmts.undoDelete(path));
+  if (!parsed) return undefined;
+  return {
+    content: row.content as string,
+    bom: row.bom as string,
+    ending: row.ending as string,
+    hashes: parsed,
+    resultContent: row.result_content as string,
+  };
 }
 
 export function deleteUndo(store: HashStore, path: string): void {
@@ -477,6 +518,7 @@ export async function pruneMissing(store: HashStore): Promise<void> {
   withStore(() => {
     for (const path of missing) {
       store.stmts.deleteOne(path);
+      snapshotCache.delete(path);
       store.stmts.undoDelete(path);
       store.stmts.servedDelete(path);
     }

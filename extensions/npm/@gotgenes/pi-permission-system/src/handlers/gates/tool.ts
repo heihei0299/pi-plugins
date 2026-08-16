@@ -6,7 +6,8 @@ import {
   type ShellInvocation,
 } from "#src/access-intent/tool-kind";
 import { suggestSessionPattern } from "#src/pattern-suggest";
-import { formatAskPrompt } from "#src/permission-prompts";
+import { renderLegacyMessage } from "#src/presentation/legacy-message";
+import { buildToolAskPayload } from "#src/presentation/tool-ask-payload";
 import { SessionApproval } from "#src/session-approval";
 import type { ToolPreviewFormatter } from "#src/tool-preview-formatter";
 import type { PermissionCheckResult } from "#src/types";
@@ -72,12 +73,15 @@ export function describeToolGate(
     deriveSuggestionValue(gateSurface, check, accessPath),
   );
 
-  const askMessage = formatAskPrompt(
+  const payload = buildToolAskPayload({
     check,
-    tcc.agentName ?? undefined,
-    tcc.input,
+    agentName: tcc.agentName,
+    surface: gateSurface,
+    invokedToolName: tcc.toolName,
+    input: tcc.input,
     formatter,
-  );
+  });
+  const askMessage = renderLegacyMessage(payload);
 
   const decisionValue = deriveDecisionValue(
     gateSurface,
@@ -108,6 +112,7 @@ export function describeToolGate(
       source: "tool_call",
       agentName: tcc.agentName,
       message: askMessage,
+      payload,
       toolCallId: tcc.toolCallId,
       toolName: tcc.toolName,
       sessionLabel: suggestion.label,

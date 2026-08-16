@@ -207,6 +207,7 @@ In the configuration examples below, `30000` is illustrative only. If `requestTi
 | `cwd` | Working directory; supports `${VAR}`, `$env:VAR`, and `~` expansion |
 | `url` | HTTP endpoint (StreamableHTTP with SSE fallback); supports raw `${VAR}` and `$env:VAR` interpolation, and missing URL variables fail before any request is sent |
 | `headers` | HTTP headers; supports `${VAR}` and `$env:VAR` interpolation. A value beginning with `!` runs a command when the HTTP server connects or OAuth authenticates; use `!!` for a literal leading `!`. |
+| `requestHeadersCommand` | Trusted executable run for every HTTP request. It receives a versioned JSON envelope containing `method`, `url`, and the exact `bodyBase64` on stdin, and must return a JSON object of headers on stdout. `command`, `args`, and `env` support environment interpolation. Use for caller-bound request signatures; failures stop the request. |
 | `auth` | `"bearer"` or `"oauth"` |
 | `oauth.grantType` | `"authorization_code"` (default) or `"client_credentials"` for non-interactive machine auth |
 | `oauth.clientId` | Pre-registered OAuth client ID. MCP 2026 prefers pre-registered clients or Client ID Metadata Documents; this adapter falls back to Dynamic Client Registration when the ID is omitted and the server supports it. |
@@ -227,6 +228,7 @@ In the configuration examples below, `30000` is illustrative only. If `requestTi
 | `toolPrefix` | Override global `settings.toolPrefix` for this server (`"server"`, `"short"`, `"none"`, or `"mcp"`) |
 | `includeTools` | `string[]` of tool names or glob patterns to expose (matches original names like `get_screenshot`, generated resource names like `read_figjam`, and prefixed names like `figma_get_screenshot`) |
 | `excludeTools` | `string[]` of tool names or glob patterns to hide (applied after `includeTools`) |
+| `searchKeywords` | `{ "tool-or-glob": ["keyword", ...] }` — extra keywords that boost `mcp({ search })` ranking for matching tools; never shown to the model |
 | `debug` | Show server stderr (default: false) |
 | `trace` | Enable metadata-only JSONL protocol tracing for this server; payloads, prompts, tool arguments/results, authorization data, and URLs are never persisted |
 | `disabled` | Keep the server visible in config and status, but prevent connections, authentication, tools, and resource calls (only literal `true` disables it) |
@@ -265,7 +267,7 @@ The adapter owns only its client socket and closes that connection when the Pi r
 
 ### Remote/headless OAuth
 
-If Pi is running on a remote server, `/mcp-auth <server>` prints the authorization URL and opens a callback input. Open the URL in your local browser. After approval, the browser may fail to load the localhost callback page because localhost refers to your workstation; copy the full URL from its address bar and paste it into Pi. The input closes automatically instead when the browser can reach Pi's callback directly.
+If Pi is running on a remote server, `/mcp-auth <server>` shows a clickable authorization URL first. Open it in your local browser and approve access, then select **Yes** in Pi to open the callback input. The browser may fail to load the localhost callback page because localhost refers to your workstation; copy the full URL from its address bar and paste it into Pi. The authorization screen closes automatically instead when the browser can reach Pi's callback directly.
 
 The same flow is available through the proxy tool for non-interactive clients. Persistent OAuth still requires an available OS credential store; on headless Linux that usually means an unlocked Secret Service/libsecret keyring. The adapter fails closed instead of falling back to plaintext credentials when the secure store is unavailable.
 
@@ -306,6 +308,10 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
     "requestTimeoutMs": 30000,
     "showStatusIcon": true,
     "mcpFooterStatus": "full",
+    "toolResultRendering": "compact",
+    "collapsedResultLines": 1,
+    "notifyOnStartupConnect": true,
+    "warnOnLargeDirectTools": true,
     "hostConfigDiscovery": "off",
     "approveTools": ["github_delete_*", "notion_update_*"],
     "oauthDir": ".pi/mcp-oauth",
@@ -327,12 +333,16 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
 | `requestTimeoutMs` | Global request timeout in milliseconds for live MCP calls (if omitted or `<= 0`, the MCP SDK default timeout is used) |
 | `showStatusIcon` | Show the plug icon in MCP status and connection text (default: `true`). Set to `false` for plain `MCP: ...` text. |
 | `mcpFooterStatus` | MCP footer verbosity: `"full"` (default), `"compact"` for `MCP connected/enabled`, or `"off"` to clear the persistent footer status. `/mcp status` remains available. |
+| `toolResultRendering` | MCP tool result row style: `"compact"` (default) uses self-rendered rows, or `"boxed"` restores the legacy Pi boxed tool row. |
+| `collapsedResultLines` | Number of result text lines to show before expansion: `1`, `2`, or `3`. Defaults to `1` in compact mode and `3` in boxed mode. |
+| `notifyOnStartupConnect` | Show successful startup connection notices (default: `true`). Set to `false` to suppress routine `MCP: N servers connected (M tools)` notices. Connection errors and authentication warnings remain visible. |
 | `hostConfigDiscovery` | Host-specific config policy: `"off"` (default), `"prompt"` (detect/report only), or `"on"` (explicitly load detected host configs as the lowest-precedence fallback) |
 | `agentPluginPaths` | Agent Plugins package directories to load MCP servers from. Relative paths resolve from the active project cwd. |
 | `approveTools` | `true` to require approval before every MCP tool call, or an array of glob patterns such as `["github_delete_*", "notion_update_*"]`. Per-server `approveTools` overrides this. |
 | `oauthDir` | Legacy OAuth `tokens.json` import directory for this MCP config. Relative paths resolve from the active project cwd. `MCP_OAUTH_DIR` still wins when set. Persistent OAuth credentials are stored in the OS credential store, not this directory. |
 | `mcpServers.<name>.oauth.authorizationParams` | Extra authorization URL parameters for provider-specific OAuth extensions. Flow-owned parameters such as `client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`, `response_type`, and `resource` cannot be overridden. |
 | `directTools` | Global default for all servers (default: false). Per-server overrides this. |
+| `warnOnLargeDirectTools` | Show the advisory when 75 or more direct tools resolve (default: `true`). Set to `false` to suppress only this advisory. |
 | `freezeDirectTools` | Keep direct-tool registration stable after the initial sync so automatic reconnects and list-change notifications do not rebuild the system prompt. Use `mcp({ connect: "server" })` or `/mcp reconnect <server>` to refresh deliberately. Default: false. |
 | `scriptMode` | Register the MCP-only `mcpScript` plain-JavaScript tool (default: true). Set to `false` to hide it. |
 | `disableProxyTool` | Hide the `mcp` proxy tool once configured direct tools are fully available from cache. |
@@ -537,7 +547,7 @@ To hide specific tools while still using `directTools: true`, add `excludeTools`
 
 `includeTools` and `excludeTools` filter direct tools, proxy search/list/describe, and the `/mcp` panel view.
 
-Each direct tool costs ~150-300 tokens in the system prompt (name + description + schema). Good for targeted sets of 5-20 tools. For servers with 75+ tools, stick with the proxy or pick specific tools with a `string[]`. If 75+ direct tools resolve, the adapter prints a warning but still registers the tools you configured.
+Each direct tool costs ~150-300 tokens in the system prompt (name + description + schema). Good for targeted sets of 5-20 tools. For servers with 75+ tools, stick with the proxy or pick specific tools with a `string[]`. If 75+ direct tools resolve, the adapter prints an advisory but still registers the tools you configured. Set `settings.warnOnLargeDirectTools` to `false` to suppress this advisory.
 
 Direct tools register from the metadata cache in the Pi agent dir (`~/.pi/agent/mcp-cache.json` by default, or `$PI_CODING_AGENT_DIR/mcp-cache.json` when set), so no server connections are needed at startup. On the first session after adding `directTools` to a new server, the cache won't exist yet — tools fall back to proxy-only while the cache populates, then the extension hot-loads the refreshed direct tools into the current session. Servers that advertise MCP list-change notifications refresh the current session when their tool or resource list changes. On Pi versions that expose `pi.unregisterTool()`, stale direct tools are removed from the registry during refresh; older Pi versions still deactivate them from the active tool set. To force a refresh: `/mcp reconnect <server>`.
 
@@ -648,11 +658,34 @@ Prefer `.mcp.json` for project-local shared MCP config. Use `.pi/mcp.json` only 
 
 `mcp({ connect: "server-name" })` refreshes an already connected server, so new tools, resources, prompts, and instructions can load without restarting Pi.
 
-MCP proxy and direct-tool results render compactly by default: long text shows the first three terminal-wrapped lines plus a `Ctrl+O to expand` hint, while the full result remains available when expanded and is still returned unchanged to the model.
+MCP proxy and direct-tool results use compact self-rendered rows by default. Collapsed success output shows the call title and the first result line, with a `Ctrl+O to expand` hint when more text is hidden. The full result remains available when expanded and is still returned unchanged to the model. Set `settings.toolResultRendering` to `"boxed"` to restore the legacy boxed Pi row, or set `settings.collapsedResultLines` to `2` or `3` when you want more collapsed text.
 
-Search includes both MCP tools and Pi tools (from extensions). Pi tools appear first with `[pi tool]` prefix. Space-separated words are ranked by weighted matches across name, server, and description, then returned one page at a time (`limit` defaults to 12). Use `details.nextOffset` for the next page. Regex search is still available with `regex: true`, but regex results are paginated without ranking.
+Search includes both MCP tools and Pi tools (from extensions). Pi tools appear first with `[pi tool]` prefix. Space-separated words are ranked by weighted matches across name, server, description, and any configured `searchKeywords`, then returned one page at a time (`limit` defaults to 12). Use `details.nextOffset` for the next page. Regex search is still available with `regex: true`, but regex results are paginated without ranking.
 
 Tool names are fuzzy-matched on hyphens and underscores — `context7_resolve_library_id` finds `context7_resolve-library-id`. When `describe` or `tool` cannot resolve a name, the result includes top suggestions so the agent can correct a typo or missing prefix in the same turn.
+
+### Search keywords
+
+Search uses literal matching so a tool whose name and description use different vocabulary than the query won't be found. Per-server `searchKeywords` adds extra vocabulary for matching tools:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "searchKeywords": {
+        "search_code": ["grep"],
+        "*": ["gh"]
+      }
+    }
+  }
+}
+```
+
+With this config, `mcp({ search: "grep" })` finds `github_search_code` even though neither its name nor description contains that word. Similarly, `mcp({ search: "gh" })` finds all tools provided by the github server.
+
+Keys match a tool's original name, prefixed name, or a glob (`*` applies to every tool on the server) and all matching entries combine. Keywords are weighted like description text, with an extra boost when the query exactly matches a configured phrase. They affect ranked and regex search only (including `tools.search` in `mcpScript`): they never appear in tool schemas, `describe` output, direct-tool registration, or the metadata cache, and search with keywords works offline from cached metadata.
 
 When `includeSchemas` is enabled, search and describe render common JSON Schema parameters as compact TypeScript shapes like `{ query: string; limit?: number; }`, with the older schema formatter retained as a fallback for unsupported schemas.
 
@@ -699,4 +732,5 @@ Advertised tool `outputSchema` values support JSON Schema draft-07 and 2020-12. 
 
 - Cross-session server sharing not yet implemented (each Pi session runs its own server processes)
 - Compact MCP result rendering summarizes text, but inline images are still controlled by Pi's image display settings and may render below the compact text summary.
+- Pi still owns one separator row before self-rendered tool output, so compact mode reduces adapter rendering height but cannot promise true zero-gap rows.
 - MCP sampling support is text-only; context inclusion, tools, stop sequences, audio, and image content are rejected with explicit errors.

@@ -1,6 +1,9 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { DebugReviewLogger } from "#src/session-logger";
 import type { InboxProcessor } from "./forwarded-request-server";
+import { getSessionId } from "./forwarder-context";
 import { PERMISSION_FORWARDING_POLL_INTERVAL_MS } from "./permission-forwarding";
+import type { ServingAnnouncer } from "./serving-registry";
 import type { SubagentDetector } from "./subagent-detection";
 
 /**
@@ -12,6 +15,17 @@ export interface ForwardingController {
   stop(): void;
 }
 
+/** Constructor config for {@link ForwardingManager}. */
+export interface ForwardingManagerDeps {
+  /** Single owner of subagent detection; gates whether this session may serve. */
+  detection: SubagentDetector;
+  /** Drains this session's forwarded-permission inbox on each tick. */
+  forwarder: InboxProcessor;
+  /** Publishes that this session is draining its inbox, for forwarding children. */
+  serving: ServingAnnouncer;
+  logger: DebugReviewLogger;
+}
+
 /**
  * Encapsulates the forwarded-permission polling lifecycle.
  *
@@ -19,16 +33,20 @@ export interface ForwardingController {
  * lived as 3 mutable fields on `ExtensionRuntime`. Call `start(ctx)` on each
  * session event that may activate forwarding; call `stop()` on session
  * shutdown.
+ *
+ * While polling, it publishes the session id it polls to the `ServingAnnouncer`
+ * so a forwarding child can tell that someone is draining the inbox it wrote
+ * into — and the review log records that id, so a child forwarding to a
+ * *different* id is visible as a one-line diff against its
+ * `forwarded_permission.request_created` entry (#719).
  */
 export class ForwardingManager {
   private timer: NodeJS.Timeout | null = null;
   private context: ExtensionContext | null = null;
   private processing = false;
+  private servingSessionId: string | null = null;
 
-  constructor(
-    private readonly detection: SubagentDetector,
-    private readonly forwarder: InboxProcessor,
-  ) {}
+  constructor(private readonly deps: ForwardingManagerDeps) {}
 
   /**
    * Start polling if `ctx` has UI and is not a subagent execution context.
@@ -37,11 +55,12 @@ export class ForwardingManager {
    * Stops any existing poll when the context does not qualify for forwarding.
    */
   start(ctx: ExtensionContext): void {
-    if (!ctx.hasUI || this.detection.isSubagent(ctx)) {
+    if (!ctx.hasUI || this.deps.detection.isSubagent(ctx)) {
       this.stop();
       return;
     }
     this.context = ctx;
+    this.announceServing(getSessionId(ctx));
     if (this.timer) {
       return;
     }
@@ -50,7 +69,7 @@ export class ForwardingManager {
         return;
       }
       this.processing = true;
-      void this.forwarder.processInbox(this.context).finally(() => {
+      void this.deps.forwarder.processInbox(this.context).finally(() => {
         this.processing = false;
       });
     }, PERMISSION_FORWARDING_POLL_INTERVAL_MS);
@@ -62,7 +81,42 @@ export class ForwardingManager {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.withdrawServing();
     this.context = null;
     this.processing = false;
+  }
+
+  // ── Private methods ────────────────────────────────────────────────
+
+  /**
+   * Publish `sessionId` as the served session, replacing any previous one.
+   *
+   * A no-op when the id is unchanged, since `start` runs on every
+   * `before_agent_start`, `input`, and `tool_call` — the announcement must not
+   * cost a log line per turn.
+   */
+  private announceServing(sessionId: string): void {
+    if (this.servingSessionId === sessionId) {
+      return;
+    }
+    this.withdrawServing();
+    this.servingSessionId = sessionId;
+    this.deps.serving.markServing(sessionId);
+    this.deps.logger.review("forwarded_permission.serving_started", {
+      sessionId,
+    });
+  }
+
+  /** Withdraw the published session, if any. */
+  private withdrawServing(): void {
+    const sessionId = this.servingSessionId;
+    if (sessionId === null) {
+      return;
+    }
+    this.servingSessionId = null;
+    this.deps.serving.clearServing(sessionId);
+    this.deps.logger.review("forwarded_permission.serving_stopped", {
+      sessionId,
+    });
   }
 }

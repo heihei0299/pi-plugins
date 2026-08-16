@@ -4,6 +4,7 @@ import { Type } from "typebox";
 import { StringEnum, complete, type Api, type ImageContent, type Model, type TextContent } from "@earendil-works/pi-ai/compat";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import { normalizeFetchContentParams } from "./fetch-params.ts";
+import { resolveAuthFetchProfile, type AuthFetchProfile } from "./auth-fetch.ts";
 import { findContent, type FindMode } from "./content-find.ts";
 import { answerFromPage } from "./page-query.ts";
 import { clearCloneCache } from "./github-extract.ts";
@@ -50,6 +51,7 @@ import { isSearch1APIAvailable } from "./search1api.ts";
 import { isSearchinfinityAvailable } from "./searchinfinity.ts";
 import { isQueritAvailable } from "./querit.ts";
 import { isTavilyAvailable } from "./tavily.ts";
+import { isFirecrawlAvailable } from "./firecrawl.ts";
 import { isJinaSearchAvailable } from "./jina-search.ts";
 import { isSerpdiveAvailable } from "./serpdive.ts";
 import { isKagiAvailable } from "./kagi.ts";
@@ -154,6 +156,7 @@ interface ProviderAvailability {
 	searchinfinity: boolean;
 	querit: boolean;
 	tavily: boolean;
+	firecrawl: boolean;
 	jina: boolean;
 	serpdive: boolean;
 	searxng: boolean;
@@ -384,6 +387,7 @@ async function getProviderAvailability(ctx: ExtensionContext): Promise<ProviderA
 		searchinfinity: isSearchinfinityAvailable(),
 		querit: isQueritAvailable(),
 		tavily: isTavilyAvailable(),
+		firecrawl: isFirecrawlAvailable(),
 		jina: isJinaSearchAvailable(),
 		serpdive: isSerpdiveAvailable(),
 		kagi: isKagiAvailable(),
@@ -441,6 +445,7 @@ function firstAvailableProvider(available: ProviderAvailability, preferOpenAI: b
 	if (available.searchinfinity) return "searchinfinity";
 	if (available.querit) return "querit";
 	if (available.tavily) return "tavily";
+	if (available.firecrawl) return "firecrawl";
 	if (available.jina) return "jina";
 	if (available.serpdive) return "serpdive";
 	if (available.kagi) return "kagi";
@@ -495,6 +500,9 @@ function resolveProvider(
 	}
 	if (provider === "tavily" && !available.tavily) {
 		return firstAvailableProvider(available, preferOpenAI, "tavily");
+	}
+	if (provider === "firecrawl" && !available.firecrawl) {
+		return firstAvailableProvider(available, preferOpenAI, "firecrawl");
 	}
 	if (provider === "jina" && !available.jina) {
 		return firstAvailableProvider(available, preferOpenAI, "jina");
@@ -566,8 +574,8 @@ interface PendingCurate {
 const DEFAULT_MAX_INLINE_CONTENT_CHARS = 30_000;
 const MAX_INLINE_CONTENT_CHARS = 200_000;
 
-function getMaxInlineContentChars(): number {
-	const value = loadConfig().maxInlineContentChars;
+function getMaxInlineContentChars(config = loadConfig()): number {
+	const value = config.maxInlineContentChars;
 	if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
 		return DEFAULT_MAX_INLINE_CONTENT_CHARS;
 	}
@@ -576,6 +584,12 @@ function getMaxInlineContentChars(): number {
 
 function stripThumbnails(results: ExtractedContent[]): ExtractedContent[] {
 	return results.map(({ thumbnail, frames, ...rest }) => rest);
+}
+
+function storeFetchResult(pi: { appendEntry(type: string, data: unknown): void }, responseId: string, data: StoredSearchData & { type: "fetch"; urls: ExtractedContent[] }, authProfile?: AuthFetchProfile): boolean {
+	if (authProfile?.cache === "off") return false;
+	pi.appendEntry("web-search-results", storeFetchedContentResult(responseId, data));
+	return true;
 }
 
 function initialContentSlice(content: string, maxChars: number): {
@@ -606,6 +620,17 @@ function normalizeFindQueries(value: string | string[]): string[] {
 	const queries = (Array.isArray(value) ? value : [value]).map(query => query.trim()).filter(Boolean);
 	if (queries.length === 0) throw new Error("findText must contain at least one non-empty string");
 	return queries;
+}
+
+function formatInputValue(value: unknown): string {
+	if (typeof value === "string") return JSON.stringify(value);
+	if (typeof value === "number") return Number.isNaN(value) ? "NaN" : String(value);
+	try {
+		const serialized = JSON.stringify(value);
+		return serialized === undefined ? String(value) : serialized;
+	} catch {
+		return String(value);
+	}
 }
 
 function formatSearchSummary(results: SearchResult[], answer: string): string {
@@ -1636,13 +1661,13 @@ export default function (pi: ExtensionAPI) {
 		name: toolNames.webSearch,
 		label: "Web Search",
 		description:
-			`Search the web using OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Jina, SERPdive, Kagi, Bocha, Ollama, SearXNG, DuckDuckGo, Exa, Perplexity, Gemini, AnySearch, xAI, Bright Data, or SerpBase. Pass a provider array to search only those providers simultaneously, or use provider "all" to search every eligible provider except DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase. Returns an AI-synthesized answer with source citations. OpenAI search uses a Codex subscription or OpenAI API key; xAI search uses a SuperGrok/X Premium subscription or xAI API key. DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase are available only when explicitly selected. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. The configured provider is used when provider is omitted or set to auto; omit provider unless explicitly overriding it. Without a configured provider, auto-selects OpenAI when suitable and available, then Exa, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Jina, SERPdive, Kagi, Bocha, Ollama, Perplexity, Gemini API, or Gemini Web. When SearXNG is configured, it is preferred first for local/private search.`,
+			`Search the web using OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Bocha, Ollama, SearXNG, DuckDuckGo, Exa, Perplexity, Gemini, AnySearch, xAI, Bright Data, or SerpBase. Pass a provider array to search only those providers simultaneously, or use provider "all" to search every eligible provider except DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase. Returns an AI-synthesized answer with source citations. OpenAI search uses a Codex subscription or OpenAI API key; xAI search uses a SuperGrok/X Premium subscription or xAI API key. DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase are available only when explicitly selected. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. The configured provider is used when provider is omitted or set to auto; omit provider unless explicitly overriding it. Without a configured provider, auto-selects OpenAI when suitable and available, then Exa, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Bocha, Ollama, Perplexity, Gemini API, or Gemini Web. When SearXNG is configured, it is preferred first for local/private search.`,
 		promptSnippet:
 			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage. Omit provider unless explicitly overriding the configured default.",
 		parameters: Type.Object({
 			query: Type.Optional(Type.String({ description: "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead." })),
 			queries: Type.Optional(Type.Array(Type.String(), { description: "Multiple queries searched in sequence, each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries to maximize coverage. Good: ['React vs Vue performance benchmarks 2026', 'React vs Vue developer experience comparison', 'React ecosystem size vs Vue ecosystem']. Bad: ['React vs Vue', 'React vs Vue comparison', 'React vs Vue review'] (too similar, redundant results)." })),
-			numResults: Type.Optional(Type.Number({ description: "Results per query (default: 5, max: 20)" })),
+			numResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Results per query (default: 5, max: 20)" })),
 			includeContent: Type.Optional(Type.Boolean({ description: "Fetch full page content (async)" })),
 			recencyFilter: Type.Optional(
 				StringEnum(["day", "week", "month", "year"], { description: "Filter by recency" }),
@@ -2212,7 +2237,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			claim: Type.String({ description: "The assertion to check against web sources." }),
 			queries: Type.Optional(Type.Array(Type.String(), { description: "Search queries (default: the claim)." })),
-			numResults: Type.Optional(Type.Number({ description: "Results per query (default: 5, max: 20)." })),
+			numResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Results per query (default: 5, max: 20)." })),
 			fetchContent: Type.Optional(Type.Boolean({ description: "Fetch up to 5 result pages for exact passage extraction." })),
 			recencyFilter: Type.Optional(StringEnum(["day", "week", "month", "year"], { description: "Filter by recency." })),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains; prefix with - to exclude." })),
@@ -2330,6 +2355,9 @@ export default function (pi: ExtensionAPI) {
 			model: Type.Optional(Type.String({
 				description: "Override the Gemini model for video/YouTube analysis (e.g. 'gemini-3.6-flash'). Defaults to config or gemini-3.6-flash.",
 			})),
+			auth: Type.Optional(Type.Union([Type.String(), Type.Boolean()], {
+				description: "Opt into an authFetch profile for local browser-cookie fetching. Use a profile name, or true only when exactly one profile exists.",
+			})),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
@@ -2354,6 +2382,18 @@ export default function (pi: ExtensionAPI) {
 			if (mode === "answer" && options.model) {
 				return { content: [{ type: "text", text: "Error: use answerModel, not model, with mode answer." }], details: { error: "model is incompatible with mode answer" } };
 			}
+			if (mode === "answer" && options.auth !== undefined) {
+				return { content: [{ type: "text", text: "Error: auth cannot be combined with mode answer." }], details: { error: "auth cannot be combined with mode answer" } };
+			}
+			let authFetchProfile: AuthFetchProfile | undefined;
+			if (options.auth !== undefined) {
+				try {
+					authFetchProfile = resolveAuthFetchProfile(options.auth);
+				} catch (err) {
+					const error = err instanceof Error ? err.message : String(err);
+					return { content: [{ type: "text", text: `Error: ${error}` }], details: { error } };
+				}
+			}
 			if (urlList.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: No URL provided." }],
@@ -2366,13 +2406,13 @@ export default function (pi: ExtensionAPI) {
 				details: { phase: "fetch", progress: 0 },
 			});
 
-			const { answerModel: _answerModel, ...extractionOptions } = options;
+			const { answerModel: _answerModel, auth: _auth, ...extractionOptions } = options;
 			const fetchOptions = mode === "answer"
 				? (() => {
 					const { prompt: _prompt, ...rest } = extractionOptions;
-					return rest;
+					return { ...rest, ...(authFetchProfile ? { authFetchProfile } : {}) };
 				})()
-				: extractionOptions;
+				: { ...extractionOptions, ...(authFetchProfile ? { authFetchProfile } : {}) };
 			const fetchResults = await fetchAllContent(urlList, signal, fetchOptions);
 			const presentedResults = mode === "answer"
 				? await Promise.all(fetchResults.map(async result => {
@@ -2396,7 +2436,6 @@ export default function (pi: ExtensionAPI) {
 			const successful = presentedResults.filter((r) => !r.error).length;
 			const totalChars = presentedResults.reduce((sum, r) => sum + r.content.length, 0);
 
-			// ALWAYS store results (even for single URL)
 			const responseId = generateId();
 			const data = {
 				id: responseId,
@@ -2404,7 +2443,7 @@ export default function (pi: ExtensionAPI) {
 				timestamp: Date.now(),
 				urls: stripThumbnails(fetchResults),
 			} satisfies StoredSearchData & { type: "fetch"; urls: ExtractedContent[] };
-			pi.appendEntry("web-search-results", storeFetchedContentResult(responseId, data));
+			const storedContent = storeFetchResult(pi, responseId, data, authFetchProfile);
 
 			// Single URL: return content directly (possibly truncated) with responseId
 			if (urlList.length === 1) {
@@ -2412,7 +2451,7 @@ export default function (pi: ExtensionAPI) {
 				if (result.error) {
 					return {
 						content: [{ type: "text", text: `Error: ${result.error}` }],
-						details: { urls: urlList, urlCount: 1, successful: 0, error: result.error, responseId, prompt: params.prompt, timestamp: params.timestamp, frames: params.frames },
+						details: { urls: urlList, urlCount: 1, successful: 0, error: result.error, ...(storedContent ? { responseId } : {}), prompt: params.prompt, timestamp: params.timestamp, frames: params.frames },
 					};
 				}
 
@@ -2423,9 +2462,11 @@ export default function (pi: ExtensionAPI) {
 
 				if (truncated) {
 					output += `\n\n---\nShowing ${slice.endOffset} of ${fullLength} chars, ${slice.shownBytes} of ${slice.totalBytes} bytes, and ${slice.shownLines} of ${slice.totalLines} lines. `;
-					output += getSearchContentEnabled
-						? `Use ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0, offset: ${slice.endOffset} }) for the next slice.`
-						: "Content retrieval is not registered.";
+					output += storedContent
+						? getSearchContentEnabled
+							? `Use ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0, offset: ${slice.endOffset} }) for the next slice.`
+							: "Content retrieval is not registered."
+						: "Authenticated fetch cache is off; repeat the fetch to read more.";
 				}
 
 				const content: Array<TextContent | ImageContent> = [];
@@ -2448,7 +2489,7 @@ export default function (pi: ExtensionAPI) {
 						successful: 1,
 						totalChars: fullLength,
 						title: result.title,
-						responseId,
+						...(storedContent ? { responseId } : {}),
 						truncated,
 						hasImage: imageCount > 0,
 						imageCount,
@@ -2476,19 +2517,21 @@ export default function (pi: ExtensionAPI) {
 					output += `- ${title || url} (${content.length} chars)\n`;
 				}
 			}
-			output += getSearchContentEnabled
-				? `\n---\nUse ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0 }) to retrieve bounded content slices.`
-				: "\n---\nContent retrieval is not registered.";
+			output += storedContent
+				? getSearchContentEnabled
+					? `\n---\nUse ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0 }) to retrieve bounded content slices.`
+					: "\n---\nContent retrieval is not registered."
+				: "\n---\nAuthenticated fetch cache is off; repeat the fetch to read content.";
 
 			return {
 				content: [{ type: "text", text: output }],
-				details: { urls: urlList, urlCount: urlList.length, successful, totalChars, responseId },
+				details: { urls: urlList, urlCount: urlList.length, successful, totalChars, ...(storedContent ? { responseId } : {}) },
 			};
 		},
 
 		renderCall(args, theme) {
 			const { urlList, options } = normalizeFetchContentParams(args);
-			const { prompt, timestamp, frames, model, mode, answerModel } = options;
+			const { prompt, timestamp, frames, model, mode, answerModel, auth } = options;
 			if (urlList.length === 0) {
 				return new Text(theme.fg("toolTitle", theme.bold("fetch ")) + theme.fg("error", "(no URL)"), 0, 0);
 			}
@@ -2524,6 +2567,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (answerModel) {
 				lines.push(theme.fg("dim", "  answer model: ") + theme.fg("warning", answerModel));
+			}
+			if (auth !== undefined) {
+				lines.push(theme.fg("dim", "  auth: ") + theme.fg("warning", auth === true ? "true" : auth));
 			}
 			return new Text(lines.join("\n"), 0, 0);
 		},
@@ -2616,7 +2662,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	if (getSearchContentEnabled) pi.registerTool({
+	if (getSearchContentEnabled) {
+		const maxInlineContentChars = getMaxInlineContentChars(initConfig);
+		pi.registerTool({
 		name: toolNames.getSearchContent,
 		label: "Get Search Content",
 		description: `Retrieve bounded content slices or find matching passages in a previous ${storedContentSources} call.`,
@@ -2625,11 +2673,11 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			responseId: Type.String({ description: `The responseId from ${storedContentSources}` }),
 			query: Type.Optional(Type.String({ description: searchQueryDescription })),
-			queryIndex: Type.Optional(Type.Number({ description: "Get content for query at index" })),
+			queryIndex: Type.Optional(Type.Integer({ minimum: 0, description: "Get content for query at index" })),
 			url: Type.Optional(Type.String({ description: "Get content for this URL" })),
-			urlIndex: Type.Optional(Type.Number({ description: "Get content for URL at index" })),
-			offset: Type.Optional(Type.Number({ description: "Character offset for fetched URL content slices (default 0). Cannot be combined with findText." })),
-			limit: Type.Optional(Type.Number({ description: "Maximum characters to return for fetched URL content slices (default and max are set by maxInlineContentChars). Cannot be combined with findText." })),
+			urlIndex: Type.Optional(Type.Integer({ minimum: 0, description: "Get content for URL at index" })),
+			offset: Type.Optional(Type.Integer({ minimum: 0, description: "Character offset for fetched URL content slices (default 0). Cannot be combined with findText." })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: maxInlineContentChars, description: "Maximum characters to return for fetched URL content slices (default and max are set by maxInlineContentChars). Cannot be combined with findText." })),
 			findText: Type.Optional(Type.Union([
 				Type.String({ minLength: 1, maxLength: 500 }),
 				Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { minItems: 1, maxItems: 10 }),
@@ -2639,15 +2687,23 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
 			if (params.findText !== undefined && (params.offset !== undefined || params.limit !== undefined)) {
-				return { content: [{ type: "text", text: "findText cannot be combined with offset or limit" }], details: { error: "Incompatible find options" } };
+				const offset = formatInputValue(params.offset);
+				const limit = formatInputValue(params.limit);
+				return {
+					content: [{ type: "text", text: `findText cannot be combined with offset or limit. Received offset=${offset}, limit=${limit}; omit offset and limit when using findText.` }],
+					details: { error: "Incompatible find options" },
+				};
 			}
 			if (params.findMode !== undefined && params.findText === undefined) {
-				return { content: [{ type: "text", text: "findMode requires findText" }], details: { error: "findMode requires findText" } };
+				return {
+					content: [{ type: "text", text: `findMode ${formatInputValue(params.findMode)} requires findText; provide findText or omit findMode.` }],
+					details: { error: "findMode requires findText" },
+				};
 			}
 			const data = getResult(params.responseId);
 			if (!data) {
 				return {
-					content: [{ type: "text", text: `Error: No stored results for "${params.responseId}"` }],
+					content: [{ type: "text", text: `Error: No stored results for responseId ${formatInputValue(params.responseId)}. Use a responseId returned by ${storedContentSources}.` }],
 					details: { error: "Not found", responseId: params.responseId },
 				};
 			}
@@ -2656,22 +2712,30 @@ export default function (pi: ExtensionAPI) {
 				const artifact = getResearchArtifact(params.responseId);
 				if (!artifact) {
 					return {
-						content: [{ type: "text", text: `Error: artifact ${params.responseId} not found` }],
+						content: [{ type: "text", text: `Error: stored research artifact for responseId ${formatInputValue(params.responseId)} was not found. Use a responseId returned by ${storedContentSources}.` }],
 						details: { error: "Artifact not found", responseId: params.responseId },
 					};
 				}
 				const serialized = JSON.stringify(artifact, null, 2);
-				const maxInlineContentChars = getMaxInlineContentChars();
 				const offset = params.offset ?? 0;
 				const limit = params.limit ?? maxInlineContentChars;
 				if (!Number.isInteger(offset) || offset < 0) {
-					return { content: [{ type: "text", text: "offset must be a non-negative integer" }], details: { error: "Invalid offset", offset } };
+					return {
+						content: [{ type: "text", text: `Invalid offset: received ${formatInputValue(offset)} for responseId ${formatInputValue(params.responseId)}; offset must be a non-negative integer. Use 0 or a larger integer.` }],
+						details: { error: "Invalid offset", offset },
+					};
 				}
 				if (!Number.isInteger(limit) || limit <= 0 || limit > maxInlineContentChars) {
-					return { content: [{ type: "text", text: `limit must be an integer from 1 to ${maxInlineContentChars}` }], details: { error: "Invalid limit", limit, maxLimit: maxInlineContentChars } };
+					return {
+						content: [{ type: "text", text: `Invalid limit: received ${formatInputValue(limit)} for responseId ${formatInputValue(params.responseId)}; limit must be an integer from 1 to ${maxInlineContentChars}. Use a value in that range.` }],
+						details: { error: "Invalid limit", limit, maxLimit: maxInlineContentChars },
+					};
 				}
 				if (offset > serialized.length) {
-					return { content: [{ type: "text", text: `offset ${offset} is out of range (0-${serialized.length})` }], details: { error: "Offset out of range", offset, contentLength: serialized.length } };
+					return {
+						content: [{ type: "text", text: `Offset ${offset} is out of range for responseId ${formatInputValue(params.responseId)}. Received offset ${offset}; valid range is 0-${serialized.length}. Use an offset within that range.` }],
+						details: { error: "Offset out of range", offset, contentLength: serialized.length },
+					};
 				}
 				const endOffset = Math.min(offset + limit, serialized.length);
 				const artifactSlice = serialized.slice(offset, endOffset);
@@ -2690,29 +2754,30 @@ export default function (pi: ExtensionAPI) {
 					if (!queryData) {
 						const available = data.queries.map((q) => `"${q.query}"`).join(", ");
 						return {
-							content: [{ type: "text", text: `Query "${params.query}" not found. Available: ${available}` }],
+							content: [{ type: "text", text: `Query ${formatInputValue(params.query)} was not found for responseId ${formatInputValue(params.responseId)}. Received query=${formatInputValue(params.query)}. Available queries: ${available || "none"}. Use one of the available queries or queryIndex.` }],
 							details: { error: "Query not found" },
 						};
 					}
 				} else if (params.queryIndex !== undefined) {
 					queryData = data.queries[params.queryIndex];
 					if (!queryData) {
+						const available = data.queries.map((q, i) => `${i}: "${q.query}"`).join(", ");
 						return {
-							content: [{ type: "text", text: `Index ${params.queryIndex} out of range (0-${data.queries.length - 1})` }],
+							content: [{ type: "text", text: `Query index ${formatInputValue(params.queryIndex)} is out of range for responseId ${formatInputValue(params.responseId)}. Received queryIndex=${formatInputValue(params.queryIndex)}; valid indexes are 0-${data.queries.length - 1}. Available queries: ${available || "none"}. Use one of the available indexes.` }],
 							details: { error: "Index out of range" },
 						};
 					}
 				} else {
 					const available = data.queries.map((q, i) => `${i}: "${q.query}"`).join(", ");
 					return {
-						content: [{ type: "text", text: `Specify query or queryIndex. Available: ${available}` }],
+						content: [{ type: "text", text: `Specify query or queryIndex for responseId ${formatInputValue(params.responseId)}. Available queries: ${available || "none"}.` }],
 						details: { error: "No query specified" },
 					};
 				}
 
 				if (queryData.error) {
 					return {
-						content: [{ type: "text", text: `Error for "${queryData.query}": ${queryData.error}` }],
+						content: [{ type: "text", text: `Error retrieving query ${formatInputValue(queryData.query)} from responseId ${formatInputValue(params.responseId)}: ${queryData.error}. Check the stored search result and retry with another query or queryIndex if needed.` }],
 						details: { error: queryData.error, query: queryData.query },
 					};
 				}
@@ -2728,7 +2793,10 @@ export default function (pi: ExtensionAPI) {
 						};
 					} catch (err) {
 						const error = err instanceof Error ? err.message : String(err);
-						return { content: [{ type: "text", text: error }], details: { error, query: queryData.query } };
+						return {
+							content: [{ type: "text", text: `Unable to find ${formatInputValue(params.findText)} in query ${formatInputValue(queryData.query)} for responseId ${formatInputValue(params.responseId)}: ${error}. Check findText and use a supported findMode.` }],
+							details: { error, query: queryData.query },
+						};
 					}
 				}
 
@@ -2748,7 +2816,7 @@ export default function (pi: ExtensionAPI) {
 					if (!urlData) {
 						const available = data.urls.map((u) => u.url).join("\n  ");
 						return {
-							content: [{ type: "text", text: `URL not found. Available:\n  ${available}` }],
+							content: [{ type: "text", text: `URL ${formatInputValue(params.url)} was not found for responseId ${formatInputValue(params.responseId)}. Received url=${formatInputValue(params.url)}. Available URLs:\n  ${available || "  none"}\nUse one of the available URLs or urlIndex.` }],
 							details: { error: "URL not found" },
 						};
 					}
@@ -2756,22 +2824,23 @@ export default function (pi: ExtensionAPI) {
 					selectedUrlIndex = params.urlIndex;
 					urlData = data.urls[selectedUrlIndex];
 					if (!urlData) {
+						const available = data.urls.map((u, i) => `${i}: ${u.url}`).join("\n  ");
 						return {
-							content: [{ type: "text", text: `Index ${params.urlIndex} out of range (0-${data.urls.length - 1})` }],
+							content: [{ type: "text", text: `URL index ${formatInputValue(params.urlIndex)} is out of range for responseId ${formatInputValue(params.responseId)}. Received urlIndex=${formatInputValue(params.urlIndex)}; valid indexes are 0-${data.urls.length - 1}. Available URLs:\n  ${available || "  none"}\nUse one of the available indexes.` }],
 							details: { error: "Index out of range" },
 						};
 					}
 				} else {
 					const available = data.urls.map((u, i) => `${i}: ${u.url}`).join("\n  ");
 					return {
-						content: [{ type: "text", text: `Specify url or urlIndex. Available:\n  ${available}` }],
+						content: [{ type: "text", text: `Specify url or urlIndex for responseId ${formatInputValue(params.responseId)}. Available URLs:\n  ${available || "  none"}` }],
 						details: { error: "No URL specified" },
 					};
 				}
 
 				if (urlData.error) {
 					return {
-						content: [{ type: "text", text: `Error for ${urlData.url}: ${urlData.error}` }],
+						content: [{ type: "text", text: `Error retrieving URL ${formatInputValue(urlData.url)} from responseId ${formatInputValue(params.responseId)}: ${urlData.error}. Check the stored fetch result and retry with another URL or urlIndex if needed.` }],
 						details: { error: urlData.error, url: urlData.url },
 					};
 				}
@@ -2786,28 +2855,30 @@ export default function (pi: ExtensionAPI) {
 						};
 					} catch (err) {
 						const error = err instanceof Error ? err.message : String(err);
-						return { content: [{ type: "text", text: error }], details: { error, url: urlData.url } };
+						return {
+							content: [{ type: "text", text: `Unable to find ${formatInputValue(params.findText)} in URL ${formatInputValue(urlData.url)} for responseId ${formatInputValue(params.responseId)}: ${error}. Check findText and use a supported findMode.` }],
+							details: { error, url: urlData.url },
+						};
 					}
 				}
 
-				const maxInlineContentChars = getMaxInlineContentChars();
 				const offset = params.offset ?? 0;
 				const limit = params.limit ?? maxInlineContentChars;
 				if (!Number.isInteger(offset) || offset < 0) {
 					return {
-						content: [{ type: "text", text: "offset must be a non-negative integer" }],
+						content: [{ type: "text", text: `Invalid offset: received ${formatInputValue(offset)} for URL ${formatInputValue(urlData.url)}; offset must be a non-negative integer. Use 0 or a larger integer.` }],
 						details: { error: "Invalid offset", offset },
 					};
 				}
 				if (!Number.isInteger(limit) || limit <= 0 || limit > maxInlineContentChars) {
 					return {
-						content: [{ type: "text", text: `limit must be an integer from 1 to ${maxInlineContentChars}` }],
+						content: [{ type: "text", text: `Invalid limit: received ${formatInputValue(limit)} for URL ${formatInputValue(urlData.url)}; limit must be an integer from 1 to ${maxInlineContentChars}. Use a value in that range.` }],
 						details: { error: "Invalid limit", limit, maxLimit: maxInlineContentChars },
 					};
 				}
 				if (offset > urlData.content.length) {
 					return {
-						content: [{ type: "text", text: `offset ${offset} is out of range (0-${urlData.content.length})` }],
+						content: [{ type: "text", text: `Offset ${offset} is out of range for URL ${formatInputValue(urlData.url)} in responseId ${formatInputValue(params.responseId)}. Received offset ${offset}; valid range is 0-${urlData.content.length}. Use an offset within that range.` }],
 						details: { error: "Offset out of range", offset, contentLength: urlData.content.length },
 					};
 				}
@@ -2839,7 +2910,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			return {
-				content: [{ type: "text", text: "Invalid stored data format" }],
+				content: [{ type: "text", text: `Invalid stored data for responseId ${formatInputValue(params.responseId)}: received type ${formatInputValue(data.type)}. Use a responseId returned by ${storedContentSources}.` }],
 				details: { error: "Invalid data" },
 			};
 		},
@@ -2916,6 +2987,7 @@ export default function (pi: ExtensionAPI) {
 			return new Text(statusLine + "\n" + theme.fg("dim", preview), 0, 0);
 		},
 	});
+	}
 
 	if (isCommandEnabled(initConfig, "websearch")) pi.registerCommand("websearch", {
 		description: "Open web search curator",

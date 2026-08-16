@@ -52,6 +52,15 @@ export interface GateDescriptor {
 }
 
 /**
+ * A decision event's facts, before the runner stamps the request id it minted.
+ *
+ * A gate knows what was decided but not which request it was deciding — the id
+ * is minted in `GateRunner.run`. Producing this type rather than the full event
+ * is what routes every emit through the runner's single stamping site.
+ */
+export type DecisionEventFacts = Omit<PermissionDecisionEvent, "requestId">;
+
+/**
  * Early allow result — gate has determined the action without needing the runner.
  *
  * Used for cases like Pi infrastructure read bypass where the gate short-circuits
@@ -62,7 +71,7 @@ export interface GateBypass {
   /** Optional review log entry to emit. */
   log?: { event: string; details: Record<string, unknown> };
   /** Optional decision event to emit. */
-  decision?: PermissionDecisionEvent;
+  decision?: DecisionEventFacts;
 }
 
 /** Union of possible gate function return values. */

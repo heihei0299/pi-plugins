@@ -187,6 +187,27 @@ export const unifiedConfigSchema = z
         "Require a confirming second press of a decision hotkey (`y`/`s`/`n`/`r`) in the inline permission dialog before it commits — the first press arms the action and shows a `Press y again to approve.` hint.\n\nApplies to interactive **TUI** sessions only; the non-TUI (RPC/frontend) prompt keeps its single-select flow. Set to `false` to commit decisions on the first hotkey press.",
       default: true,
     }),
+    forwardingTimeoutMs: z.number().int().min(1).optional().meta({
+      description:
+        "How long a subagent waits for the parent session to answer a forwarded permission request, in milliseconds. Omit to use the default (600000, ten minutes).",
+      markdownDescription:
+        "How long a subagent waits for the parent session to answer a forwarded permission request, in milliseconds.\n\nOmit to use the default (`600000`, ten minutes). A child whose in-process parent is not draining its inbox at all gives up in a couple of seconds regardless of this value, so lower it only to bound how long you are willing to leave an *unanswered* prompt pending.",
+      default: 600000,
+    }),
+    promptMaxRows: z.number().int().min(1).optional().meta({
+      description:
+        "Maximum rows a permission prompt renders before eliding its evidence. Omit to use the default (24).",
+      markdownDescription:
+        "Maximum rows a permission prompt renders before eliding its evidence.\n\nOmit to use the default (24). The request's own facts — the requesting agent, the tool, the matched rule, the decision-relevant value — are never elided by this budget; what gives way is the supporting evidence, and `Ctrl+O` expands the prompt to the complete request.",
+      default: 24,
+    }),
+    promptFieldMaxWidth: z.number().int().min(1).optional().meta({
+      description:
+        "Maximum characters of any one field shown in a permission prompt. Omit to use the default (400).",
+      markdownDescription:
+        "Maximum characters of any one field shown in a permission prompt.\n\nOmit to use the default (400). This is what bounds a single pathological field — a long here-string command, say — that would otherwise fill the prompt through wrapping. A shortened field is marked with an ellipsis, and `Ctrl+O` shows it in full.",
+      default: 400,
+    }),
     toolInputPreviewMaxLength: z.number().int().min(1).optional().meta({
       description:
         "Maximum character length of the inline-JSON tool-input preview shown in permission prompts. Omit to use the default (200). Set to a large value to disable truncation.",

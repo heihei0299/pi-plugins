@@ -1,9 +1,10 @@
 import type { BashProgram } from "#src/access-intent/bash/program";
 import type { ScopedPermissionResolver } from "#src/permission-resolver";
+import { renderLegacyMessage } from "#src/presentation/legacy-message";
+import { buildBashExternalDirectoryAskPayload } from "#src/presentation/path-ask-payload";
 import { SessionApproval } from "#src/session-approval";
 import { deriveApprovalPattern } from "#src/session-rules";
 import type { GateResult } from "./descriptor";
-import { formatBashExternalDirectoryAskPrompt } from "./external-directory-messages";
 import { selectUncoveredExternalPaths } from "./external-directory-policy";
 import { accessFactsFromPath } from "./helpers";
 import type { ToolCallContext } from "./types";
@@ -76,12 +77,15 @@ export function describeBashExternalDirectoryGate(
     resolvedPath: path.resolvedAlias(),
   }));
 
-  const bashExtMessage = formatBashExternalDirectoryAskPrompt(
+  const payload = buildBashExternalDirectoryAskPayload({
     command,
-    disclosures,
-    tcc.cwd,
-    tcc.agentName ?? undefined,
-  );
+    externalPaths: disclosures,
+    cwd: tcc.cwd,
+    agentName: tcc.agentName,
+    toolName: tcc.toolName,
+    matchedPattern: preCheck.matchedPattern,
+  });
+  const bashExtMessage = renderLegacyMessage(payload);
 
   const patterns = uncoveredPaths.map((p) => deriveApprovalPattern(p));
 
@@ -100,6 +104,7 @@ export function describeBashExternalDirectoryGate(
       source: "tool_call",
       agentName: tcc.agentName,
       message: bashExtMessage,
+      payload,
       toolCallId: tcc.toolCallId,
       toolName: tcc.toolName,
       command,

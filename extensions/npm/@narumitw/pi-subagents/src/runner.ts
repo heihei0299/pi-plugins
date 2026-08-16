@@ -31,6 +31,7 @@ import type { PanelSynthesis } from "./panel-contract.js";
 import type { PanelEvidenceArtifact } from "./panel-evidence.js";
 import type { PanelFailure } from "./panel-failure.js";
 import type { PanelPhaseBudgets, PanelPreset } from "./panel-planning.js";
+import { buildPiArgs } from "./pi-args.js";
 import { resolvePiInvocation } from "./pi-invocation.js";
 import { JsonLineDecoder } from "./protocol.js";
 import {
@@ -38,12 +39,8 @@ import {
 	parseAnyStructuredSubagentResult,
 	type SubagentResultFormat,
 } from "./result-contract.js";
-import {
-	formatResultFailure as formatBaseResultFailure,
-	getResultFinalOutput as getBaseResultFinalOutput,
-	getFinalOutput,
-	isResultError as isBaseResultError,
-} from "./runner-result.js";
+import { formatResultFailure, getResultFinalOutput, isResultError } from "./runner-outcome.js";
+import { getFinalOutput } from "./runner-result.js";
 import {
 	addUsageValue,
 	mergeUsageStats,
@@ -68,6 +65,13 @@ import type { WorkItemLedgerSnapshot } from "./work-item-ledger.js";
 
 export const KILL_GRACE_MS = 5000;
 
+export type { PiArgsOptions } from "./pi-args.js";
+export { buildPiArgs } from "./pi-args.js";
+export {
+	formatResultFailure,
+	getResultFinalOutput,
+	isResultError,
+} from "./runner-outcome.js";
 export type { UsageStats } from "./runner-usage.js";
 export type RecentActivityItem =
 	| { type: "text"; text: string }
@@ -152,31 +156,6 @@ export interface SubagentDetails {
 	metrics?: OrchestrationMetrics;
 	panel?: PanelDetails;
 	isError?: boolean;
-}
-
-export function getResultFinalOutput(result: SingleResult): string {
-	return getBaseResultFinalOutput(result);
-}
-
-export function isResultError(result: SingleResult): boolean {
-	return (
-		isBaseResultError(result) ||
-		result.resultContractInvalid === true ||
-		(result.outcome !== undefined &&
-			result.outcome.status !== "completed" &&
-			result.outcome.status !== "partial")
-	);
-}
-
-export function formatResultFailure(result: SingleResult): string {
-	const contractError = result.resultContractInvalid
-		? `Subagent returned an invalid ${result.resultFormat ?? "structured"} result contract`
-		: result.outcome && !["completed", "partial"].includes(result.outcome.status)
-			? `Subagent outcome ${result.outcome.status}${result.outcome.reasonCode ? ` (${result.outcome.reasonCode})` : ""}; recovery: ${result.outcome.recoveryActions.join(", ") || "none"}`
-			: undefined;
-	return contractError
-		? formatBaseResultFailure({ ...result, errorMessage: contractError })
-		: formatBaseResultFailure(result);
 }
 
 function boundMessageText(
@@ -357,46 +336,6 @@ async function writePromptToTempFile(
 		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
 	});
 	return { dir: tmpDir, filePath };
-}
-
-export interface PiArgsOptions {
-	model?: string;
-	thinkingLevel?: SubagentThinkingLevel;
-	tools?: string[];
-	disableExtensions?: boolean;
-	disableSkills?: boolean;
-	disablePromptTemplates?: boolean;
-	disableContextFiles?: boolean;
-	projectTrust?: boolean;
-	baseSystemPromptPath?: string;
-	appendSystemPromptPaths?: string[];
-	/** Existing single append prompt path retained for compatibility. */
-	systemPromptPath?: string;
-	task: string;
-}
-
-export function buildPiArgs(options: PiArgsOptions): string[] {
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (options.model) args.push("--model", options.model);
-	if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
-	if (options.disableExtensions) args.push("--no-extensions");
-	if (options.disableSkills) args.push("--no-skills");
-	if (options.disablePromptTemplates) args.push("--no-prompt-templates");
-	if (options.disableContextFiles) args.push("--no-context-files");
-	if (options.projectTrust !== undefined) {
-		args.push(options.projectTrust ? "--approve" : "--no-approve");
-	}
-	if (Array.isArray(options.tools)) {
-		if (options.tools.length > 0) args.push("--tools", options.tools.join(","));
-		else args.push("--no-tools");
-	}
-	if (options.baseSystemPromptPath) args.push("--system-prompt", options.baseSystemPromptPath);
-	for (const promptPath of options.appendSystemPromptPaths ?? []) {
-		args.push("--append-system-prompt", promptPath);
-	}
-	if (options.systemPromptPath) args.push("--append-system-prompt", options.systemPromptPath);
-	args.push(`Task: ${options.task}`);
-	return args;
 }
 
 function signalProcess(proc: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
@@ -857,16 +796,16 @@ export async function runSingleAgent(
 				onExceeded: stopForBudget,
 			});
 
-			timeout = setTimeout(() => {
-				stopForBudget({
-					reason: launchPolicy?.workTimeoutReason ?? "work_timeout",
-					limit: launchPolicy?.workTimeoutReportLimit ?? timeoutMs,
-				});
-			}, timeoutMs);
-			timeout.unref();
-
 			proc.once("spawn", () => {
 				currentResult.processStarted = true;
+				if (settled || budgetStop || wasAborted) return;
+				timeout = setTimeout(() => {
+					stopForBudget({
+						reason: launchPolicy?.workTimeoutReason ?? "work_timeout",
+						limit: launchPolicy?.workTimeoutReportLimit ?? timeoutMs,
+					});
+				}, timeoutMs);
+				timeout.unref();
 			});
 			proc.stdout?.on("data", (data) => decoder.push(data));
 			proc.stderr?.on("data", (data) => {

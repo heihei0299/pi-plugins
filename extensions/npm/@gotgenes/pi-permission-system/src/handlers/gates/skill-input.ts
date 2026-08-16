@@ -1,4 +1,5 @@
-import { formatSkillAskPrompt } from "#src/permission-prompts";
+import { renderLegacyMessage } from "#src/presentation/legacy-message";
+import { buildSkillAskPayload } from "#src/presentation/skill-ask-payload";
 import type { PermissionCheckResult } from "#src/types";
 import type { GateDescriptor } from "./descriptor";
 import { accessFactsFromValue } from "./helpers";
@@ -15,7 +16,8 @@ export function describeSkillInputGate(
   agentName: string | null,
   preCheck: PermissionCheckResult,
 ): GateDescriptor {
-  const message = formatSkillAskPrompt(skillName, agentName ?? undefined);
+  const payload = buildSkillAskPayload(skillName, agentName);
+  const message = renderLegacyMessage(payload);
   return {
     surface: "skill",
     input: { name: skillName },
@@ -29,6 +31,7 @@ export function describeSkillInputGate(
       source: "skill_input",
       agentName,
       message,
+      payload,
       skillName,
       accessIntent: accessFactsFromValue("skill", skillName),
     },

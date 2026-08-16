@@ -101,6 +101,12 @@ export type PermissionDecisionResolution =
 
 /** Payload emitted on `permissions:decision`. */
 export interface PermissionDecisionEvent {
+  /**
+   * Identifies the permission request this decision resolves, minted when the
+   * request was created. Distinct from the host's tool-call id: one tool call
+   * runs several gates and so raises several requests.
+   */
+  requestId: string;
   /** Permission surface: "bash", "read", "mcp", "skill", "external_directory", etc. */
   surface: string;
   /** The value that was evaluated (command, tool name, skill name, path). */

@@ -356,6 +356,19 @@ export interface OAuthConfig {
   skipIssuerMetadataValidation?: boolean;
 }
 
+/**
+ * Trusted executable invoked for every outbound HTTP request. The adapter
+ * writes a versioned JSON request envelope to stdin and expects a JSON object
+ * containing headers on stdout. This is intended for caller-bound signing
+ * schemes whose headers depend on the exact request body.
+ */
+export interface HttpRequestHeadersCommand {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  timeoutMs?: number;
+}
+
 // Server configuration
 export interface ServerEntry {
   command?: string;
@@ -367,6 +380,8 @@ export interface ServerEntry {
   // HTTP fields
   url?: string;
   headers?: Record<string, string>;
+  /** Add or replace HTTP headers by running a trusted command for each request. */
+  requestHeadersCommand?: HttpRequestHeadersCommand;
   /** 
    * Authentication type:
    * - 'oauth' - Use OAuth 2.1 (auto-discovers endpoints, supports dynamic client registration)
@@ -395,6 +410,13 @@ export interface ServerEntry {
   // Include/exclude specific MCP tools/resources by original or prefixed name
   includeTools?: string[];
   excludeTools?: string[];
+  /**
+   * Extra search keywords per tool, keyed by original name, prefixed name, or
+   * glob (same matching rules as includeTools/excludeTools). Keywords boost
+   * mcp({ search }) ranking only — they never appear in tool schemas,
+   * describe output, or the metadata cache.
+   */
+  searchKeywords?: Record<string, string[]>;
   // Require interactive approval before calling matching MCP tools/resources.
   approveTools?: boolean | string[];
   // Debug
@@ -473,6 +495,8 @@ export interface McpSettings {
   showStatusIcon?: boolean;
   /** Footer status verbosity: full details, compact connected/enabled count, or no footer status. Defaults to full. */
   mcpFooterStatus?: McpFooterStatus;
+  /** Show successful startup connection notifications. Defaults to true. */
+  notifyOnStartupConnect?: boolean;
   /** Discover detected host-specific MCP configs only when explicitly enabled. */
   hostConfigDiscovery?: HostConfigDiscovery;
   /** Agent Plugin package directories to load MCP servers from. */
@@ -480,8 +504,14 @@ export interface McpSettings {
   idleTimeout?: number; // minutes, default 10, 0 to disable
   requestTimeoutMs?: number; // milliseconds, overrides the SDK request timeout when > 0
   directTools?: boolean;
+  /** Show the advisory when 75 or more direct tools resolve. Defaults to true. */
+  warnOnLargeDirectTools?: boolean;
   /** Register the trusted MCP-only JavaScript scripting tool. Defaults to true; set false to hide it. */
   scriptMode?: boolean;
+  /** Render MCP tool results as compact self-rendered rows by default, or as the legacy boxed row. */
+  toolResultRendering?: "compact" | "boxed";
+  /** Number of result text lines to show before expansion. Supports 1, 2, or 3. Defaults to 1 in compact mode and 3 in boxed mode. */
+  collapsedResultLines?: 1 | 2 | 3;
   /** Default approval gate for matching tools/resources; per-server settings override it. */
   approveTools?: boolean | string[];
   disableProxyTool?: boolean;
@@ -635,18 +665,25 @@ export interface McpPanelResult {
 /**
  * Get server prefix based on tool prefix mode.
  */
+function sanitizeServerPrefix(serverName: string, preserveProviderValid = true): string {
+  const validCharacters = preserveProviderValid ? /^[A-Za-z0-9_-]$/ : /^[A-Za-z0-9]$/;
+  return Array.from(serverName, char =>
+    validCharacters.test(char) ? char : `_${char.codePointAt(0)!.toString(16)}_`,
+  ).join("");
+}
+
 export function getServerPrefix(
   serverName: string,
   mode: ToolPrefix
 ): string {
   if (mode === "none") return "";
   if (mode === "short") {
-    let short = serverName.replace(/-?mcp$/i, "").replace(/-/g, "_");
+    let short = sanitizeServerPrefix(serverName.replace(/-?mcp$/i, ""));
     if (!short) short = "mcp";
     return short;
   }
-  if (mode === "mcp") return `mcp__${serverName.replace(/-/g, "_")}`;
-  return serverName.replace(/-/g, "_");
+  if (mode === "mcp") return `mcp__${sanitizeServerPrefix(serverName)}`;
+  return sanitizeServerPrefix(serverName);
 }
 
 /**
@@ -700,11 +737,9 @@ export function resolveServerFromToolName(
   if (candidates.length === 0) return undefined;
   candidates.sort((a, b) => b.prefix.length - a.prefix.length);
   const best = candidates[0];
-  // Fail safe: two distinct server names can normalize to the same prefix
-  // (e.g. my-server and my_server both -> my_server under "server" mode).
-  // When that happens the owning server is ambiguous; return undefined so a
-  // downstream permission gate falls back to its existing wildcard path rather
-  // than enforcing a rule against the wrong server.
+  // Fail safe: short mode can intentionally map names such as foo and foo-mcp
+  // to the same prefix. Return undefined so a downstream permission gate uses
+  // its existing wildcard path rather than enforcing a rule against the wrong server.
   if (candidates.some((c) => c.prefix === best!.prefix && c.name !== best!.name)) {
     return undefined;
   }
@@ -722,22 +757,48 @@ export function formatPromptCommandName(
   serverName: string,
   prefix: ToolPrefix,
 ): string {
-  const serverPart = getServerPrefix(serverName, prefix) || serverName.replace(/-/g, "_") || "server";
+  const serverPart = getServerPrefix(serverName, prefix) || sanitizeServerPrefix(serverName) || "server";
   return `mcp__${serverPart}__${sanitizePromptName(promptName)}`;
 }
 
-function normalizeToolName(value: string): string {
-  return value.replace(/-/g, "_");
+function getLegacyServerPrefix(serverName: string, mode: ToolPrefix): string {
+  if (mode === "none") return "";
+  if (mode === "short") return sanitizeServerPrefix(serverName.replace(/-?mcp$/i, ""), false) || "mcp";
+  if (mode === "mcp") return `mcp__${sanitizeServerPrefix(serverName, false)}`;
+  return sanitizeServerPrefix(serverName, false);
 }
 
-export function getToolNameCandidates(toolName: string, serverName: string, prefix: ToolPrefix): Set<string> {
-  return new Set<string>([
-    normalizeToolName(toolName),
-    normalizeToolName(formatToolName(toolName, serverName, prefix)),
-    normalizeToolName(formatToolName(toolName, serverName, "server")),
-    normalizeToolName(formatToolName(toolName, serverName, "short")),
-    normalizeToolName(formatToolName(toolName, serverName, "mcp")),
+function formatLegacyToolName(toolName: string, serverName: string, prefix: ToolPrefix): string {
+  const serverPrefix = getLegacyServerPrefix(serverName, prefix);
+  const sanitizedToolName = toolName.replace(/[.-]/g, "_");
+  return serverPrefix ? `${serverPrefix}_${sanitizedToolName}` : sanitizedToolName;
+}
+
+export function getToolNameCandidates(toolName: string, serverName: string, prefix: ToolPrefix, includeLegacy = true): Set<string> {
+  const candidates = new Set<string>([
+    toolName,
+    formatToolName(toolName, serverName, prefix),
+    formatToolName(toolName, serverName, "server"),
+    formatToolName(toolName, serverName, "short"),
+    formatToolName(toolName, serverName, "mcp"),
   ]);
+  if (includeLegacy) {
+    const legacyToolName = toolName.replace(/-/g, "_");
+    candidates.add(legacyToolName);
+    candidates.add(formatToolName(legacyToolName, serverName, prefix));
+    candidates.add(formatToolName(legacyToolName, serverName, "server"));
+    candidates.add(formatToolName(legacyToolName, serverName, "short"));
+    candidates.add(formatToolName(legacyToolName, serverName, "mcp"));
+    candidates.add(formatLegacyToolName(toolName, serverName, prefix));
+    candidates.add(formatLegacyToolName(toolName, serverName, "server"));
+    candidates.add(formatLegacyToolName(toolName, serverName, "short"));
+    candidates.add(formatLegacyToolName(toolName, serverName, "mcp"));
+    candidates.add(formatToolName(toolName, serverName, prefix).replace(/-/g, "_"));
+    candidates.add(formatToolName(toolName, serverName, "server").replace(/-/g, "_"));
+    candidates.add(formatToolName(toolName, serverName, "short").replace(/-/g, "_"));
+    candidates.add(formatToolName(toolName, serverName, "mcp").replace(/-/g, "_"));
+  }
+  return candidates;
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -745,16 +806,34 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`^${escaped}$`);
 }
 
+export interface ToolSelectorCandidateIndex {
+  readonly allCurrentCandidates: ReadonlySet<string>;
+  readonly matchingCountByPattern: Map<string, number>;
+  readonly matcherByPattern: Map<string, RegExp>;
+  readonly additionalCurrentCandidatesByToolName?: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+export function createToolSelectorCandidateIndex(
+  allCurrentCandidates: Set<string>,
+  additionalCurrentCandidatesByToolName?: ReadonlyMap<string, ReadonlySet<string>>,
+): ToolSelectorCandidateIndex {
+  return {
+    allCurrentCandidates,
+    matchingCountByPattern: new Map<string, number>(),
+    matcherByPattern: new Map<string, RegExp>(),
+    ...(additionalCurrentCandidatesByToolName ? { additionalCurrentCandidatesByToolName } : {}),
+  };
+}
+
 export function matchesToolPattern(candidates: Set<string>, patterns?: unknown): boolean {
   if (!Array.isArray(patterns) || patterns.length === 0) return false;
 
   for (const pattern of patterns) {
     if (typeof pattern !== "string") continue;
-    const normalized = normalizeToolName(pattern);
-    if (!normalized.includes("*") && !normalized.includes("?") && candidates.has(normalized)) {
+    if (!pattern.includes("*") && !pattern.includes("?") && candidates.has(pattern)) {
       return true;
     }
-    if ((normalized.includes("*") || normalized.includes("?")) && [...candidates].some(candidate => globToRegExp(normalized).test(candidate))) {
+    if ((pattern.includes("*") || pattern.includes("?")) && [...candidates].some(candidate => globToRegExp(pattern).test(candidate))) {
       return true;
     }
   }
@@ -762,23 +841,92 @@ export function matchesToolPattern(candidates: Set<string>, patterns?: unknown):
   return false;
 }
 
+export type ToolSelectorCandidateContext = Set<string> | ToolSelectorCandidateIndex;
+
+function indexHasOtherCurrentMatch(
+  index: ToolSelectorCandidateIndex,
+  toolName: string,
+  currentCandidates: Set<string>,
+  pattern: string,
+): boolean {
+  const additionalCandidates = index.additionalCurrentCandidatesByToolName?.get(toolName);
+  const hasCandidate = (candidate: string): boolean =>
+    index.allCurrentCandidates.has(candidate) || additionalCandidates?.has(candidate) === true;
+  const isGlob = pattern.includes("*") || pattern.includes("?");
+  if (!isGlob) {
+    return hasCandidate(pattern) && !currentCandidates.has(pattern);
+  }
+
+  let matcher = index.matcherByPattern.get(pattern);
+  if (!matcher) {
+    matcher = globToRegExp(pattern);
+    index.matcherByPattern.set(pattern, matcher);
+  }
+  let matchingCount = index.matchingCountByPattern.get(pattern);
+  if (matchingCount === undefined) {
+    matchingCount = 0;
+    for (const candidate of index.allCurrentCandidates) {
+      if (matcher.test(candidate)) matchingCount++;
+    }
+    index.matchingCountByPattern.set(pattern, matchingCount);
+  }
+
+  let totalMatchingCount = matchingCount;
+  if (additionalCandidates) {
+    for (const candidate of additionalCandidates) {
+      if (!index.allCurrentCandidates.has(candidate) && matcher.test(candidate)) totalMatchingCount++;
+    }
+  }
+  if (totalMatchingCount === 0) return false;
+
+  let currentMatchingCount = 0;
+  for (const candidate of currentCandidates) {
+    if (hasCandidate(candidate) && matcher.test(candidate)) currentMatchingCount++;
+  }
+  return totalMatchingCount > currentMatchingCount;
+}
+
+function matchesToolSelector(
+  toolName: string,
+  serverName: string,
+  prefix: ToolPrefix,
+  patterns: unknown,
+  otherCurrentCandidates?: ToolSelectorCandidateContext,
+): boolean {
+  if (!Array.isArray(patterns) || patterns.length === 0) return false;
+  const currentCandidates = getToolNameCandidates(toolName, serverName, prefix, false);
+  if (matchesToolPattern(currentCandidates, patterns)) return true;
+  if (!otherCurrentCandidates) return matchesToolPattern(getToolNameCandidates(toolName, serverName, prefix), patterns);
+  const legacyCandidates = getToolNameCandidates(toolName, serverName, prefix);
+  for (const candidate of currentCandidates) legacyCandidates.delete(candidate);
+  return patterns.some(pattern => {
+    if (typeof pattern !== "string" || !matchesToolPattern(legacyCandidates, [pattern])) return false;
+    const hasCollision = otherCurrentCandidates instanceof Set
+      ? matchesToolPattern(otherCurrentCandidates, [pattern])
+      : indexHasOtherCurrentMatch(otherCurrentCandidates, toolName, currentCandidates, pattern);
+    return !hasCollision;
+  });
+}
+
 export function isToolIncluded(
   toolName: string,
   serverName: string,
   prefix: ToolPrefix,
-  includeTools?: unknown
+  includeTools?: unknown,
+  otherCurrentCandidates?: ToolSelectorCandidateContext,
 ): boolean {
   if (!Array.isArray(includeTools) || includeTools.length === 0) return true;
-  return matchesToolPattern(getToolNameCandidates(toolName, serverName, prefix), includeTools);
+  return matchesToolSelector(toolName, serverName, prefix, includeTools, otherCurrentCandidates);
 }
 
 export function isToolExcluded(
   toolName: string,
   serverName: string,
   prefix: ToolPrefix,
-  excludeTools?: unknown
+  excludeTools?: unknown,
+  otherCurrentCandidates?: ToolSelectorCandidateContext,
 ): boolean {
-  return matchesToolPattern(getToolNameCandidates(toolName, serverName, prefix), excludeTools);
+  return matchesToolSelector(toolName, serverName, prefix, excludeTools, otherCurrentCandidates);
 }
 
 export function isToolAllowed(
@@ -787,7 +935,8 @@ export function isToolAllowed(
   prefix: ToolPrefix,
   includeTools?: unknown,
   excludeTools?: unknown,
+  otherCurrentCandidates?: ToolSelectorCandidateContext,
 ): boolean {
-  return isToolIncluded(toolName, serverName, prefix, includeTools)
-    && !isToolExcluded(toolName, serverName, prefix, excludeTools);
+  return isToolIncluded(toolName, serverName, prefix, includeTools, otherCurrentCandidates)
+    && !isToolExcluded(toolName, serverName, prefix, excludeTools, otherCurrentCandidates);
 }

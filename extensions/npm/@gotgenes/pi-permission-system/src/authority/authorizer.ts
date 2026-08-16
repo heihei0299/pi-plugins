@@ -4,6 +4,7 @@ import type {
   PromptPreferences,
   requestPermissionDecision,
 } from "#src/authority/permission-prompt-component";
+import type { ServingLookup } from "#src/authority/serving-registry";
 import type { SubagentSessionRegistry } from "#src/authority/subagent-registry";
 import type { PermissionEventBus } from "#src/permission-events";
 import type { AuthorizerLog, PermissionQuery } from "#src/service";
@@ -58,6 +59,28 @@ export interface TerminalAuthorizer {
   ): Promise<PermissionPromptDecision>;
 }
 
+/**
+ * The node's live-authority selection: who decides this node's asks, and
+ * whether this node adjudicates them with its own chain.
+ *
+ * The chain role is the selection's product, not a discriminator a consumer
+ * re-derives: `selectAuthorizer` tests `hasUI` before `isSubagent`, so a
+ * subagent that has its own UI decides locally, and re-deriving the role from
+ * `detection.isSubagent(ctx)` alone would get that case wrong.
+ */
+export interface SelectedAuthority {
+  /** The terminal that decides this node's asks, or relays them upward. */
+  readonly terminal: TerminalAuthorizer;
+  /**
+   * False when the terminal relays the ask to a serving node
+   * (`ParentAuthorizer`): that node resolves the request against its own
+   * recorded authority and escalates it through *its* chain over the same
+   * child-fixed facts (#635), so resolving links here would adjudicate one ask
+   * twice.
+   */
+  readonly adjudicatesLocally: boolean;
+}
+
 /** Construction inputs for {@link selectAuthorizer}. */
 export interface AuthorizerSelectionDeps {
   /** Single owner of subagent detection; the ParentAuthorizer-selection predicate. */
@@ -72,12 +95,17 @@ export interface AuthorizerSelectionDeps {
   forwardingDir: string;
   /** In-process subagent session registry for forwarding target resolution. */
   registry?: SubagentSessionRegistry;
+  /** Which sessions are draining a forwarded-permission inbox. */
+  servingRegistry: ServingLookup;
+  /** The forwarding timeout, read live so a config edit applies to the next ask. */
+  getForwardingTimeoutMs: () => number;
   logger: DebugReviewLogger;
 }
 
 /**
- * Select the `Authorizer` for the current context: the single owner of the
- * three-way `hasUI` / `isSubagent` / deny dispatch.
+ * Select the live authority for the current context: the single owner of the
+ * three-way `hasUI` / `isSubagent` / deny dispatch, and of the chain role that
+ * dispatch implies.
  *
  * Evaluated once per session activation (`AuthorizerSelection.activate`),
  * replacing the re-derivation of the same predicates across
@@ -86,22 +114,30 @@ export interface AuthorizerSelectionDeps {
 export function selectAuthorizer(
   ctx: ExtensionContext,
   deps: AuthorizerSelectionDeps,
-): TerminalAuthorizer {
+): SelectedAuthority {
   if (ctx.hasUI) {
-    return new LocalUserAuthorizer({
-      ui: ctx.ui,
-      mode: ctx.mode,
-      events: deps.events,
-      getPromptPreferences: deps.getPromptPreferences,
-      requestPermissionDecision: deps.requestPermissionDecision,
-    });
+    return {
+      terminal: new LocalUserAuthorizer({
+        ui: ctx.ui,
+        mode: ctx.mode,
+        events: deps.events,
+        getPromptPreferences: deps.getPromptPreferences,
+        requestPermissionDecision: deps.requestPermissionDecision,
+      }),
+      adjudicatesLocally: true,
+    };
   }
   if (deps.detection.isSubagent(ctx)) {
-    return new ParentAuthorizer(ctx, {
-      forwardingDir: deps.forwardingDir,
-      registry: deps.registry,
-      logger: deps.logger,
-    });
+    return {
+      terminal: new ParentAuthorizer(ctx, {
+        forwardingDir: deps.forwardingDir,
+        registry: deps.registry,
+        serving: deps.servingRegistry,
+        getTimeoutMs: deps.getForwardingTimeoutMs,
+        logger: deps.logger,
+      }),
+      adjudicatesLocally: false,
+    };
   }
-  return new DenyingAuthorizer();
+  return { terminal: new DenyingAuthorizer(), adjudicatesLocally: true };
 }

@@ -613,6 +613,9 @@ A detached agent additionally needs a concrete isolation or specialization benef
 The bounded persisted completion outbox provides ordered at-least-once delivery across process restart without replaying the child turn. When state must be reduced to its storage bound, persistence drops roots without pending completions first and trims old history rather than discarding an outbox-owned root. A completion is acknowledged only after parent context assembly observes its exact `completionId`; an injection that returns synchronously but never reaches context remains pending for retry. If the process exits after context assembly but before acknowledgement is persisted, the same ID can be delivered again and consumers must deduplicate it. Auto-resume wake admission remains best-effort because Pi's custom-message API is fire-and-forget, but an unacknowledged terminal completion itself remains available for redelivery on the next start of the owning session. Transient terminal-persistence failures retry with bounded exponential backoff and keep the run pending; shutdown cancels retry waits and reports a final persistence failure instead of silently resolving unsaved work.
 
 The default `subprocess` transport preserves compatibility: each turn starts a fresh isolated `pi --mode json -p --no-session` child and receives sanitized, bounded history.
+Pi registers every Subagents tool and command during startup, but loads blocking execution, manager UI, inspection work, and the selected detached transport implementation only on first use.
+Session restoration, pending completion delivery, settings validation, and cleanup ownership remain eager.
+A failed first-use code load is reported normally and can be retried.
 Set `transport` to `in-process` to retain one public Pi SDK `AgentSession` per stateful `agentId`, avoiding repeated process startup while preserving native child history in memory.
 Set it to `rpc` to retain one `pi --mode rpc --no-session --no-extensions` process per active retained agent, preserving native child history with a separate process boundary.
 Set it to `auto` for deterministic preflight selection: read-only built-in tools use in-process, write-capable built-in tools use RPC, and extension/custom tools use subprocess.
@@ -1049,20 +1052,25 @@ Downgrading is safe: older extension versions ignore this separate state directo
 packages/pi-subagents/
 ├── src/
 │   ├── index.ts                  # Pi package entrypoint
-│   ├── subagents.ts              # Extension registration and blocking tool schema
-│   ├── automation.ts             # Explicit autonomous planning tool and lifecycle owner
+│   ├── subagents.ts              # Lightweight extension composition and blocking registration
+│   ├── cached-module-loader.ts   # Retryable first-use code-module cache
+│   ├── automation-registration.ts # Lightweight autonomous tool registration
+│   ├── automation.ts             # First-use autonomous planning execution
 │   ├── automation-contract.ts    # Strict request, proposal, and graph-patch contracts
 │   ├── automation-planner.ts     # Bounded read-only planner prompt and resource policy
 │   ├── workflow-plan-compiler.ts # Deterministic admission, routing, and workflow compilation
 │   ├── workflow-plan-patch.ts    # Generation-safe revisions and atomic plan persistence
 │   ├── workflow-planning-benchmark.ts # Frozen matched offline evaluation protocol
-│   ├── inspect.ts                # Side-effect-free metadata inspection tool
-│   ├── consult.ts                # Synchronous read-only consultation tool
+│   ├── inspect-registration.ts   # Lightweight inspection tool registration
+│   ├── inspect.ts                # First-use side-effect-free metadata inspection
+│   ├── consult-registration.ts   # Lightweight consultation tool registration
+│   ├── consult.ts                # First-use synchronous read-only consultation
 │   ├── consult-policy.ts         # Enforced read-only tool intersection
 │   ├── cwd-policy.ts             # Canonical target and saved-trust resolution
 │   ├── prompt-resources.ts       # Core-selected SYSTEM and APPEND_SYSTEM resources
 │   ├── safe-text.ts              # Shared byte/line/path sanitization
 │   ├── stateful.ts               # Detached lifecycle registration and dispatch
+│   ├── create-stateful-transport.ts # First-turn selected transport loader
 │   ├── rpc-transport.ts          # Persistent strict-JSONL Pi RPC child transport
 │   ├── rpc-timeout-finalization.ts # RPC abort-settle-summary recovery
 │   ├── rpc-transport-metadata.ts # RPC result policy and bounded metadata helpers

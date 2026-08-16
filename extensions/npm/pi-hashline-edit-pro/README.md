@@ -1,5 +1,7 @@
 # pi-hashline-edit-pro
 
+[![npm version](https://img.shields.io/npm/v/pi-hashline-edit-pro.svg)](https://www.npmjs.com/package/pi-hashline-edit-pro) [![npm downloads](https://img.shields.io/npm/dm/pi-hashline-edit-pro.svg)](https://www.npmjs.com/package/pi-hashline-edit-pro)
+
 Hash-anchored `read` and `replace` tools for [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent). Every line of a file gets a unique 3-character hash, and you edit by hash. No line numbers, no fuzzy matching, no edits landing on the wrong line.
 
 Fork of [pi-hashline-edit](https://github.com/RimuruW/pi-hashline-edit) by RimuruW, extended with 3-character hashes and collision resolution.
@@ -63,12 +65,12 @@ Lines up to 200KB are shown in full. Larger lines are replaced by a marker with 
 
 Edge cases:
 
-- Images (JPEG, PNG, GIF, WebP) come back as visual attachments.
-- Binary files and directories are rejected with a descriptive error.
+- Images (JPEG, PNG, GIF, WebP, BMP) come back as visual attachments. Other image formats (for example AVIF, HEIC/HEIF, TIFF, ICO, JPEG 2000, JPEG XL, PSD, APNG) are rejected as binary, since the built-in renderer cannot attach them.
+- Binary files and directories are rejected with a descriptive error. A magic-signature match is ignored when the sampled bytes contain no NUL bytes and decode as UTF-8, so a text file whose first bytes happen to match a binary or image signature (for example starting with `BM` or `8BPS`) is still read as text.
 - UTF-16 and UTF-32 text (detected via BOM) is rejected, since editing it would corrupt the file.
 - Empty files come back as a single empty-line hash (`HASH│`); use `replace` on that hash to insert content.
 - BOMs are stripped for display. Non-UTF-8 bytes are shown as `U+FFFD`; editing such a file rewrites it as UTF-8, with a warning.
-- Files over 238,328 lines are rejected with `[E_FILE_TOO_LARGE]`.
+- Files over 238,328 lines or 100MB are rejected with `[E_FILE_TOO_LARGE]`.
 
 ## The replace tool
 
@@ -114,7 +116,6 @@ Notes:
 
 Enabled by default. After a successful `write` that changes the file, the extension reads the file and appends an `--- Auto-read (hashline anchors) ---` block to the result, so you get fresh `HASH│content` anchors without a separate `read` call.
 
-- After `replace` and `undo_last_replace`, the result shows the post-edit diff. The `+HASH│` and ` HASH│` rows carry the current hashes, so follow-up edits can anchor on the diff directly. Call `read` when you want the full file's anchors.
 - After `replace` and `undo_last_replace`, the result shows the post-edit diff. The `+HASH│` and ` HASH│` rows carry the current hashes, so follow-up edits can anchor on the diff directly. The `-HASH│` rows show removed lines with their old hashes, so you can see exactly which anchors were deleted (those hashes are stale after the edit). Call `read` when you want the full file's anchors.
 - Auto-read keeps a 50KB display budget. Lines over 50KB are skipped with a marker instead of their content (use `read` for lines up to 200KB).
 - Toggle at runtime with `/toggle-auto-read`; the setting persists across sessions.
@@ -170,7 +171,7 @@ A no-op replace never changes the file, so anchors remain valid. On first run af
 | `[E_UNDO_STALE]` | `undo_last_replace` refused: the file was modified or deleted after the last replace. |
 | `[E_UNDO_UNAVAILABLE]` | Undo history could not be persisted to the hash store; the `replace` was refused and the file was left unchanged. |
 | `[E_RANGE_STALE]` | A line in the replaced range no longer matches what was last shown (the file changed on disk, or the line was never shown). The edit was refused; the current range is returned with fresh anchors. |
-| `[E_FILE_TOO_LARGE]` | The file exceeds the 238,328-line hashline limit. |
+| `[E_FILE_TOO_LARGE]` | The file exceeds the 238,328-line hashline limit or the 100MB size limit. |
 
 ## Troubleshooting
 

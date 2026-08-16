@@ -21,11 +21,24 @@ import type {
 	DelegationCwdPolicy,
 	SubagentSettings,
 } from "./agents/types.js";
-import { registerSubagentAutomation } from "./automation.js";
-import { registerSubagentConfigCommand, registerSubagentConfigLifecycle } from "./config-ui.js";
-import { registerSubagentConsult } from "./consult.js";
-import { executeSubagent } from "./execution.js";
-import { registerSubagentInspect } from "./inspect.js";
+import {
+	type AutomationRegistrationDependencies,
+	registerSubagentAutomation,
+} from "./automation-registration.js";
+import { cachedModuleLoader, throwIfAborted } from "./cached-module-loader.js";
+import {
+	type ConfigRegistrationDependencies,
+	registerSubagentConfigCommand,
+	registerSubagentConfigLifecycle,
+} from "./config-registration.js";
+import {
+	type ConsultRegistrationDependencies,
+	registerSubagentConsult,
+} from "./consult-registration.js";
+import {
+	type InspectRegistrationDependencies,
+	registerSubagentInspect,
+} from "./inspect-registration.js";
 import { MAX_BLOCKING_PARALLEL_CONCURRENCY } from "./limits.js";
 import { SubagentParams } from "./params.js";
 import { renderSubagentCall, renderSubagentResult } from "./render.js";
@@ -40,17 +53,34 @@ import {
 	resolveBlockingMaxParallelTasks,
 } from "./settings.js";
 import { registerStatefulSubagents } from "./stateful.js";
+import type { SubagentTransport } from "./transport.js";
 
-export default function (pi: ExtensionAPI) {
+type BlockingExecutionModule = Pick<typeof import("./execution.js"), "executeSubagent">;
+
+export interface SubagentsDependencies {
+	loadBlockingExecution?: () => Promise<BlockingExecutionModule>;
+	loadStatefulTransport?: () => Promise<SubagentTransport>;
+	automation?: AutomationRegistrationDependencies;
+	config?: ConfigRegistrationDependencies;
+	consult?: ConsultRegistrationDependencies;
+	inspect?: InspectRegistrationDependencies;
+}
+
+export default function (pi: ExtensionAPI, dependencies: SubagentsDependencies = {}) {
+	const loadBlockingExecution = cachedModuleLoader(
+		dependencies.loadBlockingExecution ?? (() => import("./execution.js")),
+	);
 	const configOwner = registerSubagentConfigLifecycle(pi);
 	const settings = readSubagentSettings();
 	let currentSettings: SubagentSettings | undefined = settings;
 	let currentCatalog = "";
 	const blockingEnabled = settings?.blocking?.enabled !== false;
 	const refreshBlockingCatalog = blockingEnabled
-		? registerBlockingSubagent(pi, () => currentSettings)
+		? registerBlockingSubagent(pi, () => currentSettings, loadBlockingExecution)
 		: () => undefined;
-	if (blockingEnabled) registerSubagentAutomation(pi, { getSettings: () => currentSettings });
+	if (blockingEnabled) {
+		registerSubagentAutomation(pi, { getSettings: () => currentSettings }, dependencies.automation);
+	}
 	let refreshStatefulCatalog: (catalog: string) => void = () => undefined;
 	let refreshConsultCatalog: (catalog: string) => void = () => undefined;
 
@@ -78,6 +108,7 @@ export default function (pi: ExtensionAPI) {
 		blockingEnabled,
 		settings: settings?.stateful,
 		getSettings: () => currentSettings,
+		loadTransport: dependencies.loadStatefulTransport,
 	});
 	refreshStatefulCatalog = statefulRuntime.setAgentCatalog;
 	const getBlockingEnabled = () => blockingEnabled;
@@ -88,18 +119,24 @@ export default function (pi: ExtensionAPI) {
 		currentSettings?.cwdPolicy?.consultation ?? DEFAULT_CONSULTATION_CWD_POLICY;
 	const getDelegationCwdPolicy = () =>
 		currentSettings?.cwdPolicy?.delegation ?? DEFAULT_DELEGATION_CWD_POLICY;
-	registerSubagentInspect(pi, {
-		...statefulRuntime,
-		getBlockingEnabled,
-		getMaxParallelTasks,
-		getConsultResourcePolicy,
-		getConsultationCwdPolicy,
-		getDelegationCwdPolicy,
-	});
+	registerSubagentInspect(
+		pi,
+		{
+			...statefulRuntime,
+			getBlockingEnabled,
+			getMaxParallelTasks,
+			getConsultResourcePolicy,
+			getConsultationCwdPolicy,
+			getDelegationCwdPolicy,
+		},
+		dependencies.inspect,
+	);
 	if (blockingEnabled) {
-		refreshConsultCatalog = registerSubagentConsult(pi, {
-			getSettings: () => currentSettings,
-		});
+		refreshConsultCatalog = registerSubagentConsult(
+			pi,
+			{ getSettings: () => currentSettings },
+			dependencies.consult,
+		);
 	}
 	registerSubagentConfigCommand(
 		pi,
@@ -155,12 +192,14 @@ export default function (pi: ExtensionAPI) {
 			},
 		},
 		configOwner,
+		dependencies.config,
 	);
 }
 
 function registerBlockingSubagent(
 	pi: ExtensionAPI,
 	getSettings: () => SubagentSettings | undefined,
+	loadExecution: () => Promise<BlockingExecutionModule>,
 ): (catalog: string) => void {
 	let catalog = "";
 	const activeControllers = new Set<AbortController>();
@@ -212,14 +251,28 @@ function registerBlockingSubagent(
 			const effectiveSignal = signal
 				? AbortSignal.any([signal, lifecycleController.signal])
 				: lifecycleController.signal;
-			const work = executeSubagent(
-				toolCallId,
-				params,
-				effectiveSignal,
-				onUpdate,
-				ctx,
-				getSettings(),
-			);
+			const work = (async () => {
+				throwIfAborted(effectiveSignal, "Blocking subagent execution was cancelled");
+				let executionModule: BlockingExecutionModule;
+				try {
+					executionModule = await loadExecution();
+				} catch (error) {
+					throwIfAborted(
+						effectiveSignal,
+						"Blocking subagent execution was cancelled while loading",
+					);
+					throw error;
+				}
+				throwIfAborted(effectiveSignal, "Blocking subagent execution was cancelled while loading");
+				return executionModule.executeSubagent(
+					toolCallId,
+					params,
+					effectiveSignal,
+					onUpdate,
+					ctx,
+					getSettings(),
+				);
+			})();
 			activeWork.add(work);
 			try {
 				return await work;
@@ -256,8 +309,8 @@ function appendAgentCatalog(baseDescription: string, catalog: string): string {
 }
 
 export { parsePositiveInteger } from "./execution/runtime-policy.js";
+export { buildPiArgs } from "./pi-args.js";
 export { formatTokens, formatUsageStats } from "./render.js";
-export { buildPiArgs } from "./runner.js";
 export {
 	DEFAULT_CONSULT_RESOURCE_POLICY,
 	DEFAULT_CONSULTATION_CWD_POLICY,

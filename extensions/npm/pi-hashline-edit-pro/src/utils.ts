@@ -9,6 +9,15 @@ export function normalizeFilePath(record: Record<string, unknown>): void {
   }
 }
 
+export function makePrepareArguments(): (args: unknown) => any {
+  return (args) => {
+    if (!isRec(args)) return args;
+    const record = { ...args };
+    normalizeFilePath(record);
+    return record;
+  };
+}
+
 export function splitLines(text: string): string[] {
   if (text.length === 0) return [""];
   const lines = text.split("\n");
@@ -16,9 +25,7 @@ export function splitLines(text: string): string[] {
 }
 
 export function visLines(text: string): string[] {
-  if (text.length === 0) return [];
-  const lines = text.split("\n");
-  return text.endsWith("\n") ? lines.slice(0, -1) : lines;
+  return text.length === 0 ? [] : splitLines(text);
 }
 
 

@@ -1,13 +1,7 @@
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { StringEnum, type Usage } from "@earendil-works/pi-ai";
-import {
-	CONFIG_DIR_NAME,
-	type ExtensionAPI,
-	type ExtensionContext,
-	type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { type Static, Type } from "typebox";
+import type { Usage } from "@earendil-works/pi-ai";
+import { CONFIG_DIR_NAME, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_AGENT_CATALOG_MAX_ITEMS } from "./agents/catalog.js";
 import { type AgentDiscoveryResult, discoverAgents } from "./agents/discovery.js";
 import {
@@ -16,11 +10,16 @@ import {
 	type ConsultResourcePolicy,
 	isThinkingLevel,
 	type SubagentSettings,
-	THINKING_LEVELS,
+	type THINKING_LEVELS,
 } from "./agents/types.js";
 import { resolveConsultTools } from "./consult-policy.js";
-import { renderConsultCall, renderConsultResult } from "./consult-render.js";
 import { resolveConsultResourceLaunchPolicy } from "./consult-resources.js";
+import type {
+	ConsultDetails,
+	ConsultProgress,
+	ConsultProgressActivity,
+	SubagentConsultParams,
+} from "./consult-tool.js";
 import {
 	assertConsultationTargetAllowed,
 	type ResolvedSubagentTarget,
@@ -50,33 +49,13 @@ import {
 } from "./settings/inspection.js";
 import { resolveSubagentThinkingLevel } from "./settings.js";
 
-const ConsultScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	default: "user",
-	description: "Agent definition scope. Project scopes require a trusted project.",
-});
-const ConsultThinkingSchema = StringEnum(THINKING_LEVELS);
-
-export const SubagentConsultParams = Type.Object(
-	{
-		agent: Type.String({ minLength: 1 }),
-		task: Type.String({ minLength: 1, maxLength: DEFAULT_MAX_CONTEXT_BYTES }),
-		agentScope: Type.Optional(ConsultScopeSchema),
-		confirmProjectAgents: Type.Optional(Type.Boolean({ default: true })),
-		cwd: Type.Optional(Type.String({ minLength: 1 })),
-		timeoutMs: Type.Optional(
-			Type.Number({
-				minimum: 1,
-				maximum: MAX_SUBAGENT_TIMEOUT_MS,
-				description:
-					"Work deadline selected for the consultation difficulty. On expiry, Pi aborts the work and makes one separately bounded summary attempt.",
-			}),
-		),
-		thinkingLevel: Type.Optional(ConsultThinkingSchema),
-	},
-	{ additionalProperties: false },
-);
-
-export type SubagentConsultParams = Static<typeof SubagentConsultParams>;
+export { registerSubagentConsult } from "./consult-registration.js";
+export type {
+	ConsultDetails,
+	ConsultProgress,
+	ConsultProgressActivity,
+} from "./consult-tool.js";
+export { SubagentConsultParams } from "./consult-tool.js";
 
 export interface ConsultChildRequest {
 	agent: AgentConfig;
@@ -99,68 +78,6 @@ export interface RegisterSubagentConsultOptions {
 	resolveResourceLaunchPolicy?: typeof resolveConsultResourceLaunchPolicy;
 }
 
-export interface ConsultProgressActivity {
-	type: "text" | "toolCall";
-	text?: string;
-	name?: "read" | "grep" | "find" | "ls";
-	args?: Record<string, string | number | boolean>;
-}
-
-export interface ConsultProgress {
-	phase: "starting" | "running";
-	recentActivity: ConsultProgressActivity[];
-	recentActivityTotal: number;
-	actualProvider?: string;
-	actualModel?: string;
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens: number;
-		turns: number;
-	};
-}
-
-export interface ConsultDetails {
-	agent: string;
-	agentSource: string;
-	agentScope: AgentScope;
-	cwd: string;
-	model?: string;
-	thinkingLevel?: string;
-	timeoutMs: number;
-	policy: {
-		requestedTools: string[] | null;
-		effectiveTools: string[];
-		cwdBoundary: "current-workspace" | "external";
-		targetTrust: {
-			kind: string;
-			projectTrusted: boolean;
-			sourcePath?: string;
-			warning?: string;
-		};
-		requestedResources: ConsultResourcePolicy;
-		effectiveResources: {
-			policy: ConsultResourcePolicy;
-			projectResources: boolean;
-			contextFiles: boolean;
-			skills: boolean;
-			promptTemplates: boolean;
-		};
-		resourceDowngradeReason?: string;
-		extensions: "disabled";
-		sessionPersistence: "disabled";
-		retainedAgent: false;
-	};
-	child?: Record<string, unknown>;
-	progress?: ConsultProgress;
-	cancelled?: boolean;
-	isError?: boolean;
-	truncated?: boolean;
-}
-
 const READ_ONLY_INSTRUCTION = [
 	"This is a read-only consultation.",
 	"Use only the tools made available by the executor to inspect and reason about existing content.",
@@ -170,88 +87,29 @@ const READ_ONLY_INSTRUCTION = [
 
 const MAX_UNKNOWN_AGENT_NAME_BYTES = 128;
 
-export function registerSubagentConsult(
-	pi: ExtensionAPI,
+export async function executeSubagentConsult(
+	params: SubagentConsultParams,
+	signal: AbortSignal,
+	onUpdate: ((partial: AgentToolResult<ConsultDetails>) => void) | undefined,
+	ctx: ExtensionContext,
 	options: RegisterSubagentConsultOptions,
-): (catalog: string) => void {
-	let generation = 0;
-	const active = new Set<AbortController>();
-	const activeWork = new Set<Promise<unknown>>();
-	const cancelActive = (reason: string) => {
-		generation++;
-		for (const controller of active) {
-			controller.abort(new DOMException(reason, "AbortError"));
-		}
-		active.clear();
-	};
-	const cancelAndWaitForWork = async (reason: string) => {
-		cancelActive(reason);
-		await Promise.allSettled([...activeWork]);
-	};
-	pi.on("session_start", () => cancelAndWaitForWork("Subagent consultation session replaced"));
-	pi.on("session_shutdown", () => cancelAndWaitForWork("Subagent consultation session shut down"));
-
-	const baseDescription = () =>
-		`Run one ephemeral subagent synchronously under enforced read-only tool and resource policies and return its answer. The child can use only the effective subset of Pi's built-in read, grep, find, and ls tools. Shell commands, file writes, extension tools, detached lifecycle operations, and persistent agent state are disabled. Working-directory target policy: ${options.getSettings()?.cwdPolicy?.consultation ?? DEFAULT_CONSULTATION_CWD_POLICY}; configured trusted-target resources: ${options.getSettings()?.consult?.resources ?? DEFAULT_CONSULT_RESOURCE_POLICY}; allowed targets without effective trust inherit no target/project resources. This is not a filesystem sandbox.`;
-	const definition: ToolDefinition<typeof SubagentConsultParams, ConsultDetails> = {
-		name: "subagent_consult",
-		label: "Consult Read-only Subagent",
-		description: baseDescription(),
-		promptSnippet: "Consult one constrained read-only subagent and wait for its answer",
-		promptGuidelines: [
-			"Use subagent_consult for bounded reconnaissance, planning, or review whose result is required in the current turn.",
-			"Set subagent_consult timeoutMs to the shortest realistic work deadline for the task difficulty; split oversized consultations instead of extending the deadline merely to compensate for broad scope.",
-			"Implementation-shaped tasks remain read-only and can return only analysis or instructions.",
-		],
-		parameters: SubagentConsultParams,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const operation = validateConsultParams(params);
-			assertSubagentDepthAllowed();
-			if (signal?.aborted) throw abortError("Subagent consultation was aborted before start");
-			const ownerGeneration = generation;
-			const ownedController = new AbortController();
-			active.add(ownedController);
-			const combined = combineAbortSignals(signal, ownedController.signal);
-			try {
-				return await executeConsult(
-					operation,
-					ctx,
-					combined.signal,
-					options,
-					(partial) => {
-						if (ownerGeneration !== generation || combined.signal.aborted) return;
-						onUpdate?.(partial);
-					},
-					() => ownerGeneration === generation,
-					(work) => {
-						activeWork.add(work);
-						void work.then(
-							() => activeWork.delete(work),
-							() => activeWork.delete(work),
-						);
-					},
-				);
-			} finally {
-				combined.dispose();
-				active.delete(ownedController);
-			}
+	isCurrent: () => boolean = () => true,
+): Promise<AgentToolResult<ConsultDetails>> {
+	const operation = validateConsultParams(params);
+	assertSubagentDepthAllowed();
+	if (signal.aborted) throw abortError("Subagent consultation was aborted before start");
+	return executeConsult(
+		operation,
+		ctx,
+		signal,
+		options,
+		(partial) => {
+			if (signal.aborted || !isCurrent()) return;
+			onUpdate?.(partial);
 		},
-		renderCall(args, theme) {
-			return renderConsultCall(args, theme);
-		},
-		renderResult(result, renderOptions, theme, context) {
-			return renderConsultResult(result, renderOptions, theme, context);
-		},
-	};
-	pi.registerTool<typeof SubagentConsultParams, ConsultDetails>(definition);
-	pi.on("tool_result", (event) => {
-		if (event.toolName !== "subagent_consult") return;
-		if ((event.details as ConsultDetails | undefined)?.isError) return { isError: true };
-	});
-	return (catalog: string) => {
-		definition.description = catalog ? `${baseDescription()}\n\n${catalog}` : baseDescription();
-		pi.registerTool<typeof SubagentConsultParams, ConsultDetails>(definition);
-	};
+		isCurrent,
+		() => undefined,
+	);
 }
 
 function formatAvailableConsultAgents(discovery: AgentDiscoveryResult): string {
@@ -697,31 +555,6 @@ function abortError(message: string): Error {
 	const error = new Error(message);
 	error.name = "AbortError";
 	return error;
-}
-
-function combineAbortSignals(
-	external: AbortSignal | undefined,
-	owned: AbortSignal,
-): { signal: AbortSignal; dispose(): void } {
-	const controller = new AbortController();
-	const signals = [external, owned].filter((value): value is AbortSignal => value !== undefined);
-	const abort = (signal: AbortSignal) => {
-		if (!controller.signal.aborted) controller.abort(signal.reason);
-	};
-	const listeners = signals.map((signal) => {
-		const listener = () => abort(signal);
-		if (signal.aborted) abort(signal);
-		else signal.addEventListener("abort", listener, { once: true });
-		return { signal, listener };
-	});
-	return {
-		signal: controller.signal,
-		dispose() {
-			for (const { signal, listener } of listeners) {
-				signal.removeEventListener("abort", listener);
-			}
-		},
-	};
 }
 
 function requiredString(value: unknown, name: string): string {

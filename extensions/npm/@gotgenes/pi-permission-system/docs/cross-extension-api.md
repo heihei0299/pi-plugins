@@ -336,15 +336,15 @@ pi.events.on("permissions:ui_prompt", (raw) => {
 
 ### Payload Fields
 
-| Field        | Type                             | Description                                                            |
-| ------------ | -------------------------------- | ---------------------------------------------------------------------- |
-| `requestId`  | `string`                         | Unique ID for the permission request being prompted                    |
-| `source`     | `PermissionUiPromptSource`       | Prompt origin: `"tool_call"`, `"skill_input"`, or `"skill_read"`       |
-| `surface`    | `string \| null`                 | Normalized display surface (e.g. `"bash"`, `"skill"`), when known      |
-| `value`      | `string \| null`                 | Normalized display value (command, path, skill name, etc.), when known |
-| `agentName`  | `string \| null`                 | Active/requesting agent name, when known                               |
-| `message`    | `string`                         | Message displayed in the permission prompt                             |
-| `forwarding` | `ForwardedPromptContext \| null` | Forwarding context, or `null` for a direct prompt                      |
+| Field        | Type                             | Description                                                             |
+| ------------ | -------------------------------- | ----------------------------------------------------------------------- |
+| `requestId`  | `string`                         | Id of the permission request being prompted, minted when it was created |
+| `source`     | `PermissionUiPromptSource`       | Prompt origin: `"tool_call"`, `"skill_input"`, or `"skill_read"`        |
+| `surface`    | `string \| null`                 | Normalized display surface (e.g. `"bash"`, `"skill"`), when known       |
+| `value`      | `string \| null`                 | Normalized display value (command, path, skill name, etc.), when known  |
+| `agentName`  | `string \| null`                 | Active/requesting agent name, when known                                |
+| `message`    | `string`                         | Message displayed in the permission prompt                              |
+| `forwarding` | `ForwardedPromptContext \| null` | Forwarding context, or `null` for a direct prompt                       |
 
 Forwarding is orthogonal to origin: a forwarded subagent prompt keeps its original `source` and is identified by a non-null `forwarding` field, not by a dedicated source value.
 
@@ -367,6 +367,10 @@ The stability guarantee is additive, so any can be reintroduced in a later minor
 Every permission gate resolution emits a `permissions:decision` event, regardless of outcome.
 This is useful for dashboards, telemetry, or audit overlays.
 
+The `requestId` is the same id the request's review-log entries carry, and the same one `permissions:ui_prompt` carried if the request reached a prompt — so a prompt and its outcome are joinable, as are two concurrent prompts for the same command.
+It identifies a permission *request*, not a tool call: one tool call runs several gates and so raises several requests, each with its own id.
+Use the review log's `toolCallId` to join back to the Pi transcript.
+
 ```typescript
 pi.events.on("permissions:decision", (raw) => {
   const event = raw as import("@gotgenes/pi-permission-system").PermissionDecisionEvent;
@@ -379,6 +383,7 @@ pi.events.on("permissions:decision", (raw) => {
 
 | Field            | Type                | Description                                                                               |
 | ---------------- | ------------------- | ----------------------------------------------------------------------------------------- |
+| `requestId`      | `string`            | Id of the permission request this decision resolves                                       |
 | `surface`        | `string`            | Permission surface (`"bash"`, `"read"`, `"mcp"`, `"skill"`, `"external_directory"`, etc.) |
 | `value`          | `string`            | Value evaluated (command, tool name, skill name, path)                                    |
 | `result`         | `"allow" \| "deny"` | Final outcome                                                                             |

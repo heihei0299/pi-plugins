@@ -13,6 +13,8 @@ import {
   type PermissionForwardingLocation,
 } from "#src/authority/permission-forwarding";
 import type { SubagentSessionRegistry } from "#src/authority/subagent-registry";
+import { buildForwardedAskPayload } from "#src/presentation/forwarded-ask-payload";
+import { renderLegacyMessage } from "#src/presentation/legacy-message";
 import { SessionApproval } from "#src/session-approval";
 import type { SessionApprovalRecorder } from "#src/session-approval-recorder";
 import type { DebugReviewLogger } from "#src/session-logger";
@@ -78,19 +80,6 @@ export interface ForwardedRequestServerDeps {
 
 // ── Module-private helpers ────────────────────────────────────────────────
 
-function formatForwardedPermissionPrompt(
-  request: ForwardedPermissionRequest,
-): string {
-  const agentName = request.requesterAgentName || "unknown";
-  const sessionId = request.requesterSessionId || "unknown";
-  return [
-    `Subagent '${agentName}' requested permission.`,
-    `Session ID: ${sessionId}`,
-    "",
-    request.message,
-  ].join("\n");
-}
-
 /**
  * Map a forwarded request onto the escalated ask's details, carrying the
  * forwarded provenance (requester agent/session + the child's original display
@@ -106,11 +95,13 @@ function formatForwardedPermissionPrompt(
 function buildForwardedAskDetails(
   request: ForwardedPermissionRequest,
 ): PromptPermissionDetails {
+  const payload = buildForwardedAskPayload(request);
   return {
     requestId: request.id,
     source: request.source ?? "tool_call",
     agentName: request.requesterAgentName || null,
-    message: formatForwardedPermissionPrompt(request),
+    message: renderLegacyMessage(payload),
+    payload,
     surface: request.surface ?? null,
     value: request.value ?? null,
     forwarding: {

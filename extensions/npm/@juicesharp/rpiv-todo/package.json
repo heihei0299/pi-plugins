@@ -1,6 +1,6 @@
 {
 	"name": "@juicesharp/rpiv-todo",
-	"version": "2.4.0",
+	"version": "2.6.0",
 	"description": "Pi extension. A todo list for the model, rendered as a live overlay that survives /reload and conversation compaction.",
 	"keywords": [
 		"pi-package",
@@ -47,6 +47,7 @@
 		"state/store.ts",
 		"state/task-graph.ts",
 		"tool/response-envelope.ts",
+		"tool/sanitize.ts",
 		"tool/types.ts",
 		"view/format.ts"
 	],
@@ -67,7 +68,7 @@
 		}
 	},
 	"dependencies": {
-		"@juicesharp/rpiv-config": "^2.4.0",
+		"@juicesharp/rpiv-config": "^2.6.0",
 		"typebox": "^1.1.24"
 	}
 }

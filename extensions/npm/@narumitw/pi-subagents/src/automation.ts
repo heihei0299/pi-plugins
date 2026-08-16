@@ -1,22 +1,11 @@
 import { createHash } from "node:crypto";
 import * as path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
-import {
-	type ExtensionAPI,
-	type ExtensionContext,
-	getAgentDir,
-	type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { type Static, Type } from "typebox";
+import { type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { getBuiltInAgent } from "./agents/built-ins.js";
 import { discoverAgents } from "./agents/discovery.js";
 import type { SubagentSettings } from "./agents/types.js";
-import {
-	AutomationRequestSchema,
-	parseAutomationRequest,
-	type WorkflowPlan,
-} from "./automation-contract.js";
+import { parseAutomationRequest, type WorkflowPlan } from "./automation-contract.js";
 import {
 	AUTOMATION_PLANNER_MAX_TIMEOUT_MS,
 	AUTOMATION_PLANNER_MAX_TOOL_CALLS,
@@ -26,13 +15,13 @@ import {
 	parseAutomationPlannerOutput,
 	resolveAutomationPlannerPolicy,
 } from "./automation-planner.js";
+import type { AutomationDetails, SubagentAutomationParams } from "./automation-tool.js";
 import {
 	assertDelegationTargetAllowed,
 	resolveSubagentTarget,
 	targetPolicyAudit,
 } from "./cwd-policy.js";
 import { executeSubagent } from "./execution.js";
-import { renderFallbackResult, safeLine, toolHeader } from "./render-common.js";
 import {
 	getResultFinalOutput,
 	isResultError,
@@ -53,41 +42,9 @@ import {
 import { AutomationPlanPersistence, createWorkflowPlanRecord } from "./workflow-plan-patch.js";
 import { createBlockingWorkLedger, resolveWorkflowTasks } from "./workflow-planning.js";
 
-export const SubagentAutomationParams = Type.Object(
-	{ request: AutomationRequestSchema },
-	{ additionalProperties: false },
-);
-export type SubagentAutomationParams = Static<typeof SubagentAutomationParams>;
-
-export interface AutomationDetails {
-	status:
-		| "planning"
-		| "planner-failed"
-		| "parent-owned"
-		| "needs-input"
-		| "compiler-rejected"
-		| "executed";
-	requestVersion: string;
-	planVersion?: string;
-	planId?: string;
-	workflowGeneration?: number;
-	revision?: number;
-	childCount: number;
-	reasonCodes: string[];
-	missingInputs?: string[];
-	planner?: {
-		agent: string;
-		tools: string[];
-		resources: "project-context" | "none";
-		timeoutMs: number;
-		maxTurns: number;
-		maxToolCalls: number;
-		failed?: boolean;
-	};
-	compiled?: CompiledWorkflowPlan;
-	execution?: SubagentDetails;
-	isError?: boolean;
-}
+export { registerSubagentAutomation } from "./automation-registration.js";
+export type { AutomationDetails } from "./automation-tool.js";
+export { SubagentAutomationParams } from "./automation-tool.js";
 
 export interface AutomationPlannerRequest {
 	prompt: string;
@@ -108,91 +65,6 @@ export interface AutomationExecutionOptions {
 		ctx: ExtensionContext,
 	) => ReturnType<typeof executeSubagent>;
 	persistCompiled?: (compiled: CompiledWorkflowPlan, ctx: ExtensionContext) => Promise<void>;
-}
-
-export function registerSubagentAutomation(
-	pi: ExtensionAPI,
-	options: AutomationExecutionOptions,
-): void {
-	let generation = 0;
-	const activeControllers = new Set<AbortController>();
-	const activeWork = new Set<Promise<unknown>>();
-	const cancelAndWait = async (reason: string) => {
-		generation++;
-		for (const controller of activeControllers) {
-			controller.abort(new DOMException(reason, "AbortError"));
-		}
-		await Promise.allSettled([...activeWork]);
-	};
-	pi.on("session_start", () => cancelAndWait("Autonomous workflow session replaced"));
-	pi.on("session_shutdown", () => cancelAndWait("Autonomous workflow session shut down"));
-	const description = () =>
-		[
-			"Explicitly opt in to one bounded read-only planning turn that compiles a high-level objective into the smallest justified existing workflow.",
-			"The deterministic compiler may return parent-owned work, request missing input, or reject without launching execution workers.",
-			"Mutating workflows require an authoritative integration path and an independent verifier, allow at most two concurrent mutating workers, and never allow workflow grandchildren.",
-			"The first version routes only built-in and user-scoped agents; use caller-authored workflow mode for project-local agents.",
-		].join(" ");
-	const definition: ToolDefinition<typeof SubagentAutomationParams, AutomationDetails> = {
-		name: "subagent_auto",
-		label: "Autonomous Subagent Workflow",
-		description: description(),
-		promptSnippet:
-			"Explicitly compile one high-level objective into a bounded capability-matched workflow",
-		promptGuidelines: [
-			"Use subagent_auto only when the caller explicitly opts into autonomous workflow planning.",
-			"Provide a complete authority ceiling and aggregate budget; parent-owned and insufficient-evidence results launch no execution workers.",
-			"Use caller-authored subagent workflow mode as the compatibility fallback when deterministic task control is required.",
-		],
-		parameters: SubagentAutomationParams,
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const ownerGeneration = generation;
-			const controller = new AbortController();
-			activeControllers.add(controller);
-			const combined = combineSignals(signal, controller.signal);
-			const work = executeAutomationRequest(
-				toolCallId,
-				params,
-				combined.signal,
-				onUpdate,
-				ctx,
-				options,
-				() => ownerGeneration === generation,
-			);
-			activeWork.add(work);
-			try {
-				return await work;
-			} finally {
-				combined.dispose();
-				activeControllers.delete(controller);
-				activeWork.delete(work);
-			}
-		},
-		renderCall(args, theme) {
-			const request = (args as { request?: { objective?: string; version?: string } }).request;
-			return new Text(
-				toolHeader(theme, "subagent_auto", request?.objective, [request?.version ?? "request"]),
-				0,
-				0,
-			);
-		},
-		renderResult(result, renderOptions, theme) {
-			const status = safeLine(result.details?.status, "completed", 128);
-			return renderFallbackResult(
-				result,
-				renderOptions,
-				theme,
-				result.details?.isError === true ||
-					status.endsWith("failed") ||
-					status.endsWith("rejected"),
-			);
-		},
-	};
-	pi.registerTool<typeof SubagentAutomationParams, AutomationDetails>(definition);
-	pi.on("tool_result", (event) => {
-		if (event.toolName !== "subagent_auto") return;
-		if ((event.details as AutomationDetails | undefined)?.isError) return { isError: true };
-	});
 }
 
 export async function executeAutomationRequest(
@@ -560,26 +432,4 @@ function abortError(message: string): Error {
 	const error = new Error(message);
 	error.name = "AbortError";
 	return error;
-}
-
-function combineSignals(
-	external: AbortSignal | undefined,
-	owned: AbortSignal,
-): { signal: AbortSignal; dispose(): void } {
-	const controller = new AbortController();
-	const signals = [external, owned].filter((value): value is AbortSignal => value !== undefined);
-	const listeners = signals.map((source) => {
-		const listener = () => {
-			if (!controller.signal.aborted) controller.abort(source.reason);
-		};
-		if (source.aborted) listener();
-		else source.addEventListener("abort", listener, { once: true });
-		return { source, listener };
-	});
-	return {
-		signal: controller.signal,
-		dispose() {
-			for (const { source, listener } of listeners) source.removeEventListener("abort", listener);
-		},
-	};
 }

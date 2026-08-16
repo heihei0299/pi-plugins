@@ -20,7 +20,10 @@ import {
 import { issueCapabilityGrant } from "./capability-grant.js";
 import { CompletionDeliveryBroker } from "./completion-delivery.js";
 import { buildContextSnapshot, type ContextMode, redactPrivateText } from "./context.js";
-import { createStatefulTransport } from "./create-stateful-transport.js";
+import {
+	type CreateStatefulTransportOptions,
+	createStatefulTransport,
+} from "./create-stateful-transport.js";
 import {
 	assertDelegationTargetAllowed,
 	resolveSubagentTarget,
@@ -133,6 +136,7 @@ export interface StatefulSubagentDependencies {
 	workspaceManager?: WorkspaceManager;
 	settings?: SubagentRuntimeSettings;
 	getSettings?: () => SubagentSettings | undefined;
+	loadTransport?: CreateStatefulTransportOptions["loadTransport"];
 }
 
 export interface StatefulSubagentRuntimeStatus {
@@ -319,6 +323,7 @@ export function registerStatefulSubagents(
 				getParentRuntime: () => ({ ...parentRuntime }),
 				getSettings: getCurrentSettings,
 				createInProcessSession: dependencies.createInProcessSession,
+				loadTransport: dependencies.loadTransport,
 			});
 			nextRegistry = new AgentRegistry(transport, {
 				maxAgents: nextLimits.maxAgents,

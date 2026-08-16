@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import stripJsonComments from "strip-json-comments";
-import { getAgentPath } from "./agent-dir.ts";
+import { getAgentPath, getConfigDirName } from "./agent-dir.ts";
 import { getAgentPluginSummaries, loadAgentPluginConfigs, type AgentPluginSummary } from "./agent-plugin-loader.ts";
 import { isServerDisabled, type HostConfigDiscovery, type McpConfig, type ServerEntry, type McpSettings, type ImportKind, type ServerProvenance } from "./types.ts";
 import { toStringRecord } from "./utils.ts";
@@ -15,7 +15,7 @@ const AGENTS_GLOBAL_CONFIG_PATHS = [
   join(homedir(), ".agents", "mcp", "mcp.json"),
 ] as const;
 const PROJECT_CONFIG_NAME = ".mcp.json";
-const PROJECT_PI_CONFIG_NAME = ".pi/mcp.json";
+const PROJECT_PI_CONFIG_NAME = "mcp.json";
 const REPOPROMPT_BINARY_CANDIDATES = [
   join(homedir(), "RepoPrompt", "repoprompt_cli"),
   "/Applications/Repo Prompt.app/Contents/MacOS/repoprompt-mcp",
@@ -177,7 +177,7 @@ export function getProjectConfigPath(cwd = process.cwd()): string {
 }
 
 export function getProjectPiConfigPath(cwd = process.cwd()): string {
-  return resolve(cwd, PROJECT_PI_CONFIG_NAME);
+  return resolve(cwd, getConfigDirName(), PROJECT_PI_CONFIG_NAME);
 }
 
 export function getConfigDiscoveryPaths(overridePath?: string, cwd = process.cwd()): ConfigDiscoveryPath[] {
@@ -471,7 +471,7 @@ function mergeConfigs(base: McpConfig, next: McpConfig): McpConfig {
 // different url, these MUST NOT be inherited from the lower-precedence entry —
 // otherwise the original endpoint's credentials would be shipped to the new
 // url. See the SECURITY note in mergeServerMaps.
-const URL_BOUND_AUTH_FIELDS = ["headers", "bearerToken", "bearerTokenEnv"] as const;
+const URL_BOUND_AUTH_FIELDS = ["headers", "bearerToken", "bearerTokenEnv", "requestHeadersCommand"] as const;
 
 function mergeServerMaps(
   base: Record<string, ServerEntry>,

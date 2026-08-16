@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/pi-magic-context",
-  "version": "0.36.1",
+  "version": "0.37.0",
   "type": "module",
   "description": "Pi and OMP coding agent extension for Magic Context — cross-session memory and context management",
   "main": "dist/index.js",
@@ -40,6 +40,7 @@
     "prepublishOnly": "bun run build"
   },
   "dependencies": {
+    "@cortexkit/subc-client": "0.4.1",
     "@huggingface/transformers": "^4.1.0",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
     "ai-tokenizer": "^1.0.6",

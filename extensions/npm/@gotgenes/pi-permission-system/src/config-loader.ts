@@ -221,6 +221,9 @@ export function mergeUnifiedConfigs(
 
   // Number scalars: override replaces base when defined
   for (const key of [
+    "forwardingTimeoutMs",
+    "promptMaxRows",
+    "promptFieldMaxWidth",
     "toolInputPreviewMaxLength",
     "toolTextSummaryMaxLength",
   ] as const) {

@@ -21,9 +21,11 @@ import { extractWithFirecrawl, isFirecrawlAvailable } from "./firecrawl.ts";
 import { extractWithBrightDataUnlocker, isBrightDataUnlockerAvailable } from "./brightdata-unlocker.ts";
 import { isVideoFile, extractVideo, extractVideoFrame, getLocalVideoDuration } from "./video-extract.ts";
 import { appendDeclaredWebLinks, discoverDeclaredWebLinks, type DeclaredWebLink } from "./declared-web-links.ts";
-import { fetchRemoteUrl, loadFetchContentDomainPolicy, loadSsrfConfig, validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
+import { fetchRemoteUrl, loadFetchContentDomainPolicy, loadSsrfConfig, validateRemoteUrl, type DomainPolicy, type Lookup, type SsrfConfig } from "./ssrf-protection.ts";
 import { formatSeconds, getWebSearchConfigPath } from "./utils.ts";
 import { isImageEnabled } from "./feature-config.ts";
+import { assertAuthFetchUrl, authFetchRedirectGuard, type AuthFetchProfile } from "./auth-fetch.ts";
+import { getBrowserCookiesForHosts, getLastBrowserCookieDiagnostic } from "./chrome-cookies.ts";
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const CONCURRENT_LIMIT = 3;
@@ -57,7 +59,8 @@ function isAbortError(err: unknown): boolean {
 }
 
 function isRedirectPolicyError(message: string): boolean {
-	return message.startsWith("Blocked internal ") ||
+	return message.startsWith("Authenticated fetch refused cross-origin redirect") ||
+		message.startsWith("Blocked internal ") ||
 		message.startsWith("Blocked hostname by fetch_content domain policy") ||
 		message.startsWith("Hostname not allowed by fetch_content domain policy") ||
 		message.startsWith("Too many redirects fetching ") ||
@@ -72,6 +75,56 @@ function imageGateError(): string | null {
 	} catch (err) {
 		return errorMessage(err);
 	}
+}
+
+async function resolveAuthCookieHeader(url: string | URL, profile: AuthFetchProfile): Promise<string> {
+	const parsed = assertAuthFetchUrl(profile, url.toString());
+	const result = await getBrowserCookiesForHosts({ hosts: [parsed.hostname], profile: profile.chromeProfile, requestUrl: parsed });
+	if (result?.cookieHeader) return result.cookieHeader;
+	if (!result) {
+		const diagnostic = getLastBrowserCookieDiagnostic();
+		throw new Error(`Authenticated fetch profile ${profile.name} could not read browser cookies${diagnostic ? `: ${diagnostic}` : ""}`);
+	}
+	throw new Error(`Authenticated fetch profile ${profile.name} could not build a cookie header`);
+}
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+async function fetchAuthenticatedRemoteUrl(
+	url: string,
+	init: RequestInit,
+	validationOptions: { ssrf: SsrfConfig; domainPolicy: DomainPolicy; lookup?: Lookup },
+	profile: AuthFetchProfile,
+): Promise<Response> {
+	let current = await validateRemoteUrl(url, {
+		allowRanges: validationOptions.ssrf.allowRanges,
+		trustEnvProxy: validationOptions.ssrf.trustEnvProxy,
+		domainPolicy: validationOptions.domainPolicy,
+		...(validationOptions.lookup ? { lookup: validationOptions.lookup } : {}),
+	});
+	let requestInit = init;
+	for (let redirects = 0; redirects <= 5; redirects++) {
+		const cookieHeader = await resolveAuthCookieHeader(current, profile);
+		const headers = { ...(requestInit.headers as Record<string, string>), cookie: cookieHeader };
+		const response = await fetch(current, { ...requestInit, headers, redirect: "manual" });
+		if (!REDIRECT_STATUSES.has(response.status)) return response;
+		const location = response.headers.get("location");
+		if (!location) return response;
+		if (redirects === 5) throw new Error(`Too many redirects fetching ${current.toString()}`);
+		const from = current;
+		current = await validateRemoteUrl(new URL(location, current), {
+			allowRanges: validationOptions.ssrf.allowRanges,
+			trustEnvProxy: validationOptions.ssrf.trustEnvProxy,
+			domainPolicy: validationOptions.domainPolicy,
+			...(validationOptions.lookup ? { lookup: validationOptions.lookup } : {}),
+		});
+		authFetchRedirectGuard(profile, from, current);
+		if (response.status === 303 || ((response.status === 301 || response.status === 302) && requestInit.method?.toUpperCase() === "POST")) {
+			const { body: _body, ...nextInit } = requestInit;
+			requestInit = { ...nextInit, method: "GET" };
+		}
+	}
+	throw new Error(`Too many redirects fetching ${current.toString()}`);
 }
 
 function loadFetchRouting(): FetchRouting {
@@ -171,6 +224,7 @@ export interface ExtractOptions {
 	model?: string;
 	mode?: "readable" | "raw" | "answer";
 	answerModel?: string;
+	authFetchProfile?: AuthFetchProfile;
 	/** Custom DNS resolver used for SSRF validation. Primarily a test seam. */
 	lookup?: Lookup;
 }
@@ -313,11 +367,17 @@ async function extractLocalFrames(
 	return { frames, error: frames.length === 0 && firstError ? firstError.error : null };
 }
 
-function safeVideoInfo(url: string): { info: ReturnType<typeof isVideoFile>; error?: string } {
+type LocalVideoInfoResult =
+	| { status: "video"; info: NonNullable<ReturnType<typeof isVideoFile>> }
+	| { status: "not-video" }
+	| { status: "invalid"; error: string };
+
+function safeVideoInfo(url: string): LocalVideoInfoResult {
 	try {
-		return { info: isVideoFile(url) };
+		const info = isVideoFile(url);
+		return info ? { status: "video", info } : { status: "not-video" };
 	} catch (err) {
-		return { info: null, error: errorMessage(err) };
+		return { status: "invalid", error: errorMessage(err) };
 	}
 }
 
@@ -346,6 +406,14 @@ export async function extractContent(
 				domainPolicy,
 				...(options?.lookup ? { lookup: options.lookup } : {}),
 			});
+		} catch (err) {
+			return { url, title: "", content: "", error: errorMessage(err) };
+		}
+	}
+
+	if (options?.authFetchProfile) {
+		try {
+			return await extractViaHttp(url, signal, options);
 		} catch (err) {
 			return { url, title: "", content: "", error: errorMessage(err) };
 		}
@@ -380,10 +448,10 @@ export async function extractContent(
 		}
 
 		const localVideo = safeVideoInfo(url);
-		if (localVideo.error) {
+		if (localVideo.status === "invalid") {
 			return { url, title: "", content: "", error: localVideo.error };
 		}
-		if (localVideo.info) {
+		if (localVideo.status === "video") {
 			const durationResult = await getLocalVideoDuration(localVideo.info.absolutePath);
 			if (typeof durationResult !== "number") {
 				return { url, title: "Frames", content: durationResult.error, error: durationResult.error };
@@ -463,10 +531,10 @@ export async function extractContent(
 		}
 
 		const localVideo = safeVideoInfo(url);
-		if (localVideo.error) {
+		if (localVideo.status === "invalid") {
 			return { url, title: "", content: "", error: localVideo.error };
 		}
-		if (localVideo.info) {
+		if (localVideo.status === "video") {
 			if (spec.type === "range") {
 				const timestamps = frameCount
 					? computeRangeTimestamps(spec.start, spec.end, frameCount)
@@ -495,10 +563,10 @@ export async function extractContent(
 	}
 
 	const localVideo = safeVideoInfo(url);
-	if (localVideo.error) {
+	if (localVideo.status === "invalid") {
 		return { url, title: "", content: "", error: localVideo.error };
 	}
-	if (localVideo.info) {
+	if (localVideo.status === "video") {
 		try {
 			const result = await extractVideo(localVideo.info, signal, options);
 			if (signal?.aborted) return abortedResult(url);
@@ -548,7 +616,7 @@ export async function extractContent(
 			url,
 			title: "",
 			content: "",
-			error: "Could not extract YouTube video content. Sign into Google in Chrome for automatic access, or set GEMINI_API_KEY.",
+			error: "Could not extract YouTube video content. Sign into Google in a supported Chromium browser for automatic access, or set GEMINI_API_KEY.",
 		};
 	}
 
@@ -914,29 +982,33 @@ async function extractViaHttp(
 	try {
 		const ssrf = loadSsrfConfig();
 		const domainPolicy = loadFetchContentDomainPolicy();
-		const response = await fetchRemoteUrl(
-			url,
-			{
-				signal: controller.signal,
-				headers: {
-					"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-					"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-					"Accept-Language": "en-US,en;q=0.9",
-					"Cache-Control": "no-cache",
-					"Sec-Fetch-Dest": "document",
-					"Sec-Fetch-Mode": "navigate",
-					"Sec-Fetch-Site": "none",
-					"Sec-Fetch-User": "?1",
-					"Upgrade-Insecure-Requests": "1",
+		const authProfile = options?.authFetchProfile;
+		const requestInit = {
+			signal: controller.signal,
+			headers: {
+				"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.9",
+				"Cache-Control": "no-cache",
+				"Sec-Fetch-Dest": "document",
+				"Sec-Fetch-Mode": "navigate",
+				"Sec-Fetch-Site": "none",
+				"Sec-Fetch-User": "?1",
+				"Upgrade-Insecure-Requests": "1",
+			},
+		};
+		const response = authProfile
+			? await fetchAuthenticatedRemoteUrl(url, requestInit, { ssrf, domainPolicy, ...(options?.lookup ? { lookup: options.lookup } : {}) }, authProfile)
+			: await fetchRemoteUrl(
+				url,
+				requestInit,
+				{
+					allowRanges: ssrf.allowRanges,
+					trustEnvProxy: ssrf.trustEnvProxy,
+					domainPolicy,
+					...(options?.lookup ? { lookup: options.lookup } : {}),
 				},
-			},
-			{
-				allowRanges: ssrf.allowRanges,
-				trustEnvProxy: ssrf.trustEnvProxy,
-				domainPolicy,
-				...(options?.lookup ? { lookup: options.lookup } : {}),
-			},
-		);
+			);
 
 		if (!response.ok && options?.mode !== "raw") {
 			activityMonitor.logComplete(activityId, response.status);

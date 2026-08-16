@@ -4,6 +4,8 @@ import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEna
 import type { QueryResultData } from "./storage.ts";
 
 type ProviderHeaders = Record<string, string | null>;
+type CompleteFunction = typeof complete;
+type SummaryModelRegistry = SummaryGenerationContext["modelRegistry"] & { complete?: CompleteFunction };
 
 const PREFERRED_SUMMARY_MODELS = [
 	{ provider: "anthropic", id: "claude-haiku-4-5" },
@@ -198,14 +200,14 @@ function parseModelSelector(value: string): { provider: string; id: string } {
 async function resolveSummaryModelCandidates(
 	ctx: SummaryGenerationContext,
 	modelOverride?: string,
-): Promise<{ candidates: Array<{ model: Model<Api>; apiKey: string; headers?: ProviderHeaders }>; errors: string[] }> {
+): Promise<{ candidates: Array<{ model: Model<Api>; apiKey?: string; headers?: ProviderHeaders }>; errors: string[] }> {
 	const enabledModelPatterns = loadEnabledModelPatterns(ctx);
 	const specs: Array<{ provider: string; id: string }> = [];
 	const normalizedOverride = typeof modelOverride === "string" ? modelOverride.trim() : "";
 	if (normalizedOverride.length > 0) specs.push(parseModelSelector(normalizedOverride));
 	specs.push(...PREFERRED_SUMMARY_MODELS);
 
-	const candidates: Array<{ model: Model<Api>; apiKey: string; headers?: ProviderHeaders }> = [];
+	const candidates: Array<{ model: Model<Api>; apiKey?: string; headers?: ProviderHeaders }> = [];
 	const errors: string[] = [];
 	const seen = new Set<string>();
 	for (const spec of specs) {
@@ -223,7 +225,7 @@ async function resolveSummaryModelCandidates(
 			continue;
 		}
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth.ok || !auth.apiKey) {
+		if (!auth.ok) {
 			errors.push(`No API key available for summary model ${value}`);
 			continue;
 		}
@@ -275,12 +277,16 @@ export async function generateSummaryDraft(
 	signal?: AbortSignal,
 	modelOverride?: string,
 	feedback?: string,
-	completeFn: typeof complete = complete,
+	completeFn?: CompleteFunction,
 	deadlineMs = SUMMARY_GENERATION_DEADLINE_MS,
 ): Promise<{ summary: string; meta: SummaryMeta }> {
 	if (!ctx || !ctx.modelRegistry) {
 		throw new Error("Summary generation context unavailable");
 	}
+
+	const registry = ctx.modelRegistry as SummaryModelRegistry;
+	const usesRegistryComplete = !completeFn && typeof registry.complete === "function";
+	completeFn ??= usesRegistryComplete ? registry.complete!.bind(registry) as CompleteFunction : complete;
 
 	const generationStartedAt = Date.now();
 	const deadlineController = new AbortController();
@@ -349,7 +355,7 @@ export async function generateSummaryDraft(
 				const response = await raceSummaryOperation(Promise.resolve(completeFn(
 					model,
 					{ messages: [userMessage] },
-					{ apiKey, headers, signal: completionSignal },
+					usesRegistryComplete ? { signal: completionSignal } : { apiKey, headers, signal: completionSignal },
 				)));
 				if (response.stopReason === "aborted") {
 					throw new Error("Aborted");

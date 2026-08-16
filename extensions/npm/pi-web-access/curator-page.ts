@@ -8,7 +8,7 @@ function safeInlineJSON(data: unknown): string {
 }
 
 function buildProviderButtons(
-	available: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; jina: boolean; serpdive: boolean; kagi: boolean; bocha: boolean; ollama: boolean; searxng: boolean; duckduckgo: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean },
+	available: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; firecrawl: boolean; jina: boolean; serpdive: boolean; kagi: boolean; bocha: boolean; ollama: boolean; searxng: boolean; duckduckgo: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean },
 	selected: string,
 	hasInitialQueries: boolean,
 ): string {
@@ -23,6 +23,7 @@ function buildProviderButtons(
 		{ value: "searchinfinity", label: "Searchinfinity", available: available.searchinfinity },
 		{ value: "querit", label: "Querit", available: available.querit },
 		{ value: "tavily", label: "Tavily", available: available.tavily },
+		{ value: "firecrawl", label: "Firecrawl", available: available.firecrawl },
 		{ value: "jina", label: "Jina", available: available.jina },
 		{ value: "serpdive", label: "SERPdive", available: available.serpdive },
 		{ value: "kagi", label: "Kagi", available: available.kagi },
@@ -54,7 +55,7 @@ export function generateCuratorPage(
 	queries: string[],
 	sessionToken: string,
 	timeout: number,
-	availableProviders: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; jina: boolean; serpdive: boolean; kagi: boolean; bocha: boolean; ollama: boolean; searxng: boolean; duckduckgo: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean },
+	availableProviders: { all: boolean; openai: boolean; brave: boolean; parallel: boolean; tinyfish: boolean; search1api: boolean; searchinfinity: boolean; querit: boolean; tavily: boolean; firecrawl: boolean; jina: boolean; serpdive: boolean; kagi: boolean; bocha: boolean; ollama: boolean; searxng: boolean; duckduckgo: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean; xai: boolean; brightdata: boolean; serpbase: boolean },
 	defaultProvider: string,
 	searchProvider: string,
 	summaryModels: Array<{ value: string; label: string }>,
@@ -1455,7 +1456,7 @@ const SCRIPT = `(function() {
   var token = DATA.sessionToken;
   var timeoutSec = DATA.timeout;
   var queries = Array.isArray(DATA.queries) ? DATA.queries : [];
-  var providers = ["all", "openai", "exa", "brave", "parallel", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "jina", "serpdive", "kagi", "bocha", "ollama", "searxng", "duckduckgo", "perplexity", "gemini", "anysearch", "xai", "brightdata", "serpbase"];
+  var providers = ["all", "openai", "exa", "brave", "parallel", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "firecrawl", "jina", "serpdive", "kagi", "bocha", "ollama", "searxng", "duckduckgo", "perplexity", "gemini", "anysearch", "xai", "brightdata", "serpbase"];
   var availProviders = DATA.availableProviders && typeof DATA.availableProviders === "object" ? DATA.availableProviders : {};
   var workflow = "summary-review";
   var initialDefaultProvider = typeof DATA.defaultProvider === "string" ? DATA.defaultProvider : "exa";
@@ -1667,6 +1668,7 @@ const SCRIPT = `(function() {
     if (provider === "searchinfinity") return "Searchinfinity";
     if (provider === "querit") return "Querit";
     if (provider === "tavily") return "Tavily";
+    if (provider === "firecrawl") return "Firecrawl";
     if (provider === "jina") return "Jina";
     if (provider === "serpdive") return "SERPdive";
     if (provider === "kagi") return "Kagi";

@@ -168,7 +168,7 @@ function registerSubagentPrimaryCommand(
 	});
 }
 
-async function showSubagentManager(
+export async function showSubagentManager(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	runtime: SubagentSettingsRuntime,
@@ -681,7 +681,7 @@ async function showSubagentManager(
 	});
 }
 
-async function showSubagentSettings(
+export async function showSubagentSettings(
 	ctx: ExtensionCommandContext,
 	runtime: SubagentSettingsRuntime,
 	owner: SubagentMenuOwner,

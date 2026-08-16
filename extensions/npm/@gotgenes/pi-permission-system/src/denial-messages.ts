@@ -76,9 +76,19 @@ export function formatDenyReason(ctx: DenialContext): string {
   return `${EXTENSION_TAG} ${buildDenyBody(ctx)}`;
 }
 
-/** Format the block reason when no interactive UI is available to prompt. */
-export function formatUnavailableReason(ctx: DenialContext): string {
-  return `${EXTENSION_TAG} ${buildUnavailableBody(ctx)}`;
+/**
+ * Format the block reason when no live authority could answer the ask.
+ *
+ * `denialReason` is optional because the plain no-UI case has nothing to add;
+ * an authority that abandoned for a specific reason (a forwarding target that
+ * is not serving, a request that could not be written) supplies one, and the
+ * model sees it (#719).
+ */
+export function formatUnavailableReason(
+  ctx: DenialContext,
+  denialReason?: string,
+): string {
+  return `${EXTENSION_TAG} ${buildUnavailableBody(ctx, denialReason)}`;
 }
 
 /** Format the block reason when the user denies at an interactive prompt. */
@@ -187,7 +197,14 @@ export function matchQualifier(
   return parts.length > 0 ? `(${parts.join(", ")})` : "";
 }
 
-function buildUnavailableBody(ctx: DenialContext): string {
+function buildUnavailableBody(
+  ctx: DenialContext,
+  denialReason?: string,
+): string {
+  return `${buildUnavailableSentence(ctx)}${reasonSuffix(denialReason)}`;
+}
+
+function buildUnavailableSentence(ctx: DenialContext): string {
   switch (ctx.kind) {
     case "tool": {
       const { check } = ctx;

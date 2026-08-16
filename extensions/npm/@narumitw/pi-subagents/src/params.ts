@@ -6,7 +6,7 @@ import { MAX_CONFIGURABLE_PARALLEL_TASKS, MAX_SUBAGENT_TIMEOUT_MS } from "./limi
 import { PANEL_PRESETS } from "./panel-planning.js";
 import { SUBAGENT_RESULT_FORMATS } from "./result-contract.js";
 import { MAX_SUBAGENT_TOOL_CALLS, MAX_SUBAGENT_TURNS } from "./turn-budget.js";
-import { VerifiedExecutionContractSchema } from "./verified-execution-contract.js";
+import { VerifiedExecutionContractSchema } from "./verified-execution-schema.js";
 
 const TimeoutMs = Type.Number({
 	description:

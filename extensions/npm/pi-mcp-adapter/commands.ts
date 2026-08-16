@@ -12,7 +12,6 @@ import {
   previewSharedServerEntry,
   previewStarterProjectConfig,
   writeDirectToolsConfig,
-  writeProjectServerDisabledOverride,
   writeSharedServerEntry,
   writeStarterProjectConfig,
 } from "./config.ts";
@@ -170,7 +169,7 @@ export async function reconnectServer(
     }
 
     const prefix = state.config.settings?.toolPrefix ?? "server";
-    const { metadata, failedTools } = buildToolMetadata(connection.tools, connection.resources, definition, name, prefix);
+    const { metadata, failedTools } = buildToolMetadata(connection.tools, connection.resources, definition, name, prefix, state.config.mcpServers, state.toolMetadata);
     state.toolMetadata.set(name, metadata);
     if (!connection.promptDiscoveryFailed) {
       state.promptMetadata?.set(name, reconstructPromptMetadata(name, connection.prompts ?? [], prefix, definition));
@@ -283,11 +282,20 @@ export async function authenticateServer(
           "info"
         );
       },
-      onAuthorizationInput: (_authorizationUrl, inputSignal) => ui.input(
-        `Complete ${serverName} OAuth`,
-        "Paste the full callback URL, or wait for automatic completion",
-        { signal: inputSignal },
-      ),
+      onAuthorizationInput: async (authorizationUrl, inputSignal) => {
+        const readyToPaste = await ui.confirm(
+          `Authorize ${serverName}`,
+          `Open this link in your browser:\n${terminalHyperlink(authorizationUrl, authorizationUrl)}\n\n` +
+          "After approving access, select Yes to paste the callback URL.",
+          { signal: inputSignal },
+        );
+        if (!readyToPaste || inputSignal.aborted) return undefined;
+        return ui.input(
+          `Complete ${serverName} OAuth`,
+          "Paste the full callback URL",
+          { signal: inputSignal },
+        );
+      },
       ...(signal ? { signal } : {}),
       ...(runtime ? { runtime } : {}),
     });

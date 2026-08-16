@@ -16,11 +16,14 @@ export type PermissionPromptDecision = {
    */
   autoApproved?: true;
   /**
-   * True when no live authority was reachable and the DenyingAuthorizer denied
-   * this ask (a no-UI, non-subagent session). Consumed by deriveResolution (the
-   * decision-event resolution), the gate (block reason), and PermissionPrompter
-   * (review-entry resolution) to emit "confirmation_unavailable" rather than a
-   * plain user denial.
+   * True when no human ever ruled on this ask: either no live authority was
+   * reachable at all (`DenyingAuthorizer`, a no-UI non-subagent session) or the
+   * forwarding path gave up before reaching one (`ParentAuthorizer` — target
+   * unresolvable, request undeliverable, target not serving, or no answer
+   * within the timeout). Consumed by deriveResolution (the decision-event
+   * resolution), the gate (block reason), and PermissionPrompter (review-entry
+   * resolution) to emit "confirmation_unavailable" rather than a plain user
+   * denial — a user who was never asked denied nothing (#719).
    */
   confirmationUnavailable?: true;
 };

@@ -9,8 +9,10 @@ import {
   type ServingPolicy,
 } from "./authority/forwarded-request-server";
 import { ForwardingManager } from "./authority/forwarding-manager";
+import { PERMISSION_FORWARDING_TIMEOUT_MS } from "./authority/permission-forwarding";
 import { requestPermissionDecision } from "./authority/permission-prompt-component";
 import { PermissionPrompter } from "./authority/permission-prompter";
+import { getServingSessionRegistry } from "./authority/serving-registry";
 import { SubagentDetection } from "./authority/subagent-detection";
 import { subscribeSubagentLifecycle } from "./authority/subagent-lifecycle-events";
 import { getSubagentSessionRegistry } from "./authority/subagent-registry";
@@ -36,6 +38,7 @@ import { PermissionManager } from "./permission-manager";
 import { PermissionResolver } from "./permission-resolver";
 import { PermissionSession } from "./permission-session";
 import { LocalPermissionsService } from "./permissions-service";
+import { resolveRenderBudget } from "./presentation/dialog-renderer";
 import { PermissionServiceLifecycle } from "./service-lifecycle";
 import { PermissionSessionLogger } from "./session-logger";
 import { SessionRules } from "./session-rules";
@@ -55,6 +58,9 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
   const hostFlavor = pathFlavorForPlatform(process.platform);
   const sessionRules = new SessionRules();
   const subagentRegistry = getSubagentSessionRegistry();
+  // Process-global, like subagentRegistry: an in-process child reads it from a
+  // separate jiti instance to learn whether its parent is draining its inbox.
+  const servingRegistry = getServingSessionRegistry();
   // Single owner of subagent detection, shared across every consumer instead of
   // threading the (subagentSessionsDir, platform, registry) triple into each.
   const subagentDetection = new SubagentDetection({
@@ -79,13 +85,16 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
   // eslint-disable-next-line prefer-const -- forward-declared let; `const` requires an initializer
   let session: PermissionSession;
 
-  // Constructed after the `configStore` forward declaration so the yolo reader
-  // can close over it; the closure runs per check(), after configStore is
-  // assigned below. yolo becomes a composition-stage ask→allow rewrite (#526).
+  // Declared after the `configStore` forward declaration so the reader can
+  // close over it; every call runs after configStore is assigned below. yolo is
+  // a composition-stage ask→allow rewrite (#526) that the gate runner extends
+  // to asks synthesized after resolution (#712), so both share this reader.
+  const isYoloEnabled = (): boolean => isYoloModeEnabled(configStore.current());
+
   const permissionManager = new PermissionManager({
     agentDir,
     flavor: hostFlavor,
-    isYoloEnabled: () => isYoloModeEnabled(configStore.current()),
+    isYoloEnabled,
   });
 
   const logger = new PermissionSessionLogger({
@@ -107,10 +116,15 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     events: pi.events,
     getPromptPreferences: () => ({
       doublePressToConfirm: configStore.current().doublePressToConfirm,
+      budget: resolveRenderBudget(configStore.current()),
     }),
     requestPermissionDecision,
     forwardingDir: paths.forwardingDir,
     registry: subagentRegistry,
+    servingRegistry,
+    getForwardingTimeoutMs: () =>
+      configStore.current().forwardingTimeoutMs ??
+      PERMISSION_FORWARDING_TIMEOUT_MS,
     logger,
     prompter,
     // The published service is the narrow, session-scoped PermissionQuery a
@@ -160,7 +174,12 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
 
   session = new PermissionSession(
     paths,
-    new ForwardingManager(subagentDetection, requestServer),
+    new ForwardingManager({
+      detection: subagentDetection,
+      forwarder: requestServer,
+      serving: servingRegistry,
+      logger,
+    }),
     permissionManager,
     sessionRules,
     configStore,
@@ -241,6 +260,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     sessionRules,
     authorizerSelection,
     reporter,
+    isYoloEnabled,
   );
   const toolCallGatePipeline = new ToolCallGatePipeline(
     resolver,

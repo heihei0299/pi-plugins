@@ -32,6 +32,31 @@ This keeps `ask` policies usable even when the original permission check happens
 
 For in-process child sessions, detection and forwarding use the event-driven registration described above.
 
+### When nobody answers
+
+A forwarded request is only useful if some session is draining the inbox it was written into.
+The polling session publishes the session id it polls, and an in-process child checks that its target is published before committing to a long wait.
+
+If the target is not draining its inbox, the child gives up after a two-second grace window rather than waiting out `forwardingTimeoutMs`, and the tool is blocked with:
+
+```text
+[pi-permission-system] Running bash command 'pwd' requires approval, but no
+interactive UI is available. Reason: Session 'abc123' is not serving forwarded
+permission requests.
+```
+
+The grace window exists so a request that arrives while the parent is switching sessions is not abandoned in the gap.
+A target that *is* draining its inbox is waited on for the full `forwardingTimeoutMs`, however long the human takes to decide.
+
+Every other way the forwarding path can give up — an unresolvable parent session, forwarding directories that cannot be created, a request that cannot be written, an unreadable response, and the timeout itself — is reported the same way: as approval being unavailable, with a reason naming the specific failure.
+None of them is reported as a user denial, because no user was ever asked.
+
+The two sides of the exchange are correlatable in the review log: the serving session writes `forwarded_permission.serving_started` with the id it polls, and the child writes `forwarded_permission.request_created` with the `targetSessionId` it forwarded to.
+When a forwarded request goes unanswered, comparing those two entries distinguishes a parent that was not polling from one polling a different session.
+
+This liveness signal is process-local, so it applies to in-process children only.
+A child running as a separate `pi` process (the `PI_SUBAGENT_PARENT_SESSION` path) cannot observe its parent's polling and still waits the full timeout.
+
 ---
 
 ## Coexistence with Other Subagent Extensions

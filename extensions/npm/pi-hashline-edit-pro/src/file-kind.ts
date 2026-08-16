@@ -3,9 +3,10 @@ import { fileTypeFromBuffer } from "file-type";
 import { SNIFF_BYTES, MAX_BYTES } from "./constants";
 
 const IMG_TYPES = new Set<string>([
+  "image/bmp",
+  "image/gif",
   "image/jpeg",
   "image/png",
-  "image/gif",
   "image/webp",
 ]);
 
@@ -39,11 +40,22 @@ function isTextType(mimeType: string): boolean {
   return mimeType.startsWith("text/") || TEXT_TYPES.has(mimeType);
 }
 
+function looksLikeText(sample: Uint8Array): boolean {
+  if (sample.includes(0)) return false;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(sample);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export type LFile =
   | { kind: "directory" }
   | { kind: "image"; mimeType: string }
   | { kind: "text"; text: string; hadUtf8DecodeErrors?: true }
-  | { kind: "binary"; description: string };
+  | { kind: "binary"; description: string }
+  | { kind: "too_large"; description: string };
 
 
 export interface LoadFileOptions {
@@ -67,8 +79,8 @@ export async function loadFileKindAndText(
   }
   if (pathStat.size > MAX_BYTES) {
     return {
-      kind: "binary",
-      description: `file exceeds ${MAX_BYTES} byte limit`
+      kind: "too_large",
+      description: `exceeds the ${MAX_BYTES / (1024 * 1024)}MB size limit`,
     };
   }
 
@@ -96,7 +108,8 @@ export async function loadFileKindAndText(
     const detectedMimeType = (await fileTypeFromBuffer(sample))?.mime;
     if (
       detectedMimeType !== undefined &&
-      !isTextType(detectedMimeType)
+      !isTextType(detectedMimeType) &&
+      !looksLikeText(sample)
     ) {
       if (IMG_TYPES.has(detectedMimeType)) {
         return { kind: "image", mimeType: detectedMimeType };

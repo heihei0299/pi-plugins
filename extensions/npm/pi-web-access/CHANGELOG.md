@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-15
+
+### Added
+- Added opt-in `authFetch` profiles for local browser-cookie `fetch_content` requests. Thanks Luka (`@lmilojevicc`) for issue #254.
+- Added Firecrawl as a `web_search` provider using the existing Firecrawl configuration. Thanks Andrés Sanabria (`@andy-spike`) for issue #246.
+- Added macOS Brave profile support for opt-in Gemini Web browser-cookie access. Thanks Rajyavardhan Singh (`@imrajyavardhan12`) for PR #248.
+
+### Changed
+- Made local-video detection use an explicit result state in extraction code.
+
+### Fixed
+- Preserve summary draft completion routing through the model registry. Thanks `@limwa` for PR #249.
+- Constrain numeric tool parameters to supported integer ranges. Thanks `@jaudiger` for issue #250 and PR #251.
+
 ## [0.22.0] - 2026-08-11
 
 ### Added

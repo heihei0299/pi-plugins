@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.26.0] - 2026-08-14
+
+### Added
+- Added per-server `requestHeadersCommand` support for deriving fail-closed HTTP headers from the exact outbound request on every Streamable HTTP or SSE call. Thanks @kgreen18 for PR #353.
+- Added `settings.warnOnLargeDirectTools` to suppress the advisory for 75 or more resolved direct tools. Thanks @Roshvan for issue #358.
+
+### Changed
+- Refined request-header command result handling types without changing runtime behavior.
+
+### Fixed
+- Matched adapter-owned config and state paths to the host agent directory when Pi is rebranded, including its environment override and config directory. Thanks @mindplay-dk for issue #356.
+- Avoided O(tools²) cross-server tool-name collision scans at startup by skipping collision candidates when selectors are absent and sharing one indexed candidate set when `includeTools` or `excludeTools` is configured. Thanks @mjlbach for PR #357 and @cataldoc for issue #354.
+
+## [2.25.0] - 2026-08-13
+
+### Added
+- Added `settings.notifyOnStartupConnect` to suppress successful MCP startup connection notices. Thanks @pierre-mgmt for issue #341.
+- Added compact self-rendered MCP proxy and direct-tool result rows by default, with `settings.toolResultRendering: "boxed"` for the legacy boxed row and `settings.collapsedResultLines` for 1-3 collapsed result lines. Thanks @pierre-mgmt for issue #349.
+
+### Changed
+- Removed unused TypeScript declarations found by stricter compiler checks.
+
+### Fixed
+- Kept `mcpScript` tool-call replies flowing when Pi runs as a Bun-compiled binary by starting worker execution without module-level top-level await. Thanks @AndreiKopylov for issue #340 and @thesobercoder for the verified fix.
+- Fixed direct-tool server prefixes to preserve provider-valid underscores and hyphens, including `codebase-memory-mcp`, while retaining safe escaping, collision handling, and exact proxy routing. Thanks @mightymatth for issue #342 and @JasonLandbridge for issue #343.
+
+## [2.24.0] - 2026-08-13
+
+### Added
+- Added per-server `searchKeywords` so `mcp({ search })` and `mcpScript` `tools.search` understand user-defined synonyms and aliases for tools. Keywords are keyed by tool name or glob and boost ranked and regex search only. They never appear in tool schemas, describe output, or the metadata cache. Thanks @Serisium for PR #336.
+
+### Fixed
+- Interpolated environment placeholders in stdio server arguments. Thanks @vjik for issue #333.
+- Kept remote `/mcp-auth` authorization links reachable before the callback input opens. Thanks @trevorleibert-mixpanel for PR #331.
+- Cached OAuth credentials in memory and refreshed them after OAuth-backed 401 responses. Thanks @daniel-sampliner for PR #335.
+- Sanitized MCP server-name prefixes for provider-safe tool names while preserving server resolution. Thanks @triple-dex for issue #334.
+- Validated persisted npx resolver cache entries before reuse, including malformed and prototype-sensitive persisted keys.
+
 ## [2.23.0] - 2026-08-11
 
 ### Added

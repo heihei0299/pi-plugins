@@ -3,6 +3,7 @@ import type {
   ForwardedAccessFacts,
   ForwardedSessionApproval,
 } from "#src/authority/permission-forwarding";
+import type { PromptPayload } from "#src/presentation/prompt-payload";
 import type { ReviewLogger } from "#src/session-logger";
 import type { TerminalAuthorizer } from "./authorizer";
 
@@ -27,6 +28,14 @@ export interface PromptPermissionDetails {
   source: PermissionReviewSource;
   agentName: string | null;
   message: string;
+  /**
+   * The complete structured description of this ask (ADR 0011 §2).
+   *
+   * Required: every ask carries one, and the type is what guarantees it rather
+   * than a convention each gate has to remember. `message` is a render over it
+   * for the duration of the transition, so the two cannot disagree.
+   */
+  payload: PromptPayload;
   toolCallId?: string;
   toolName?: string;
   skillName?: string;
@@ -94,9 +103,11 @@ export interface PermissionPrompterDeps {
  * `ParentAuthorizer`, `DenyingAuthorizer`) — this class no longer threads
  * `ExtensionContext` per call.
  *
- * Yolo-mode auto-approval happens upstream, at the composition stage
- * (`PermissionManager.check`'s `rewriteAsksToYolo`) — an `ask` never reaches
- * this class under yolo, so this class has no yolo-mode knowledge.
+ * Yolo-mode auto-approval happens upstream: at the composition stage
+ * (`PermissionManager.check`'s `rewriteAsksToYolo`) for a rule-driven ask, and
+ * at `GateRunner`'s auto-approve fast path (`resolveYoloGrant`) for an ask
+ * synthesized after resolution, which no rule rewrite can reach (#712) — an
+ * `ask` never reaches this class under yolo, so it has no yolo-mode knowledge.
  */
 export class PermissionPrompter implements PermissionPrompterApi {
   constructor(private readonly deps: PermissionPrompterDeps) {}

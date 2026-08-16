@@ -132,7 +132,7 @@ export async function extractYouTube(
 
 	const error = attemptErrors.length > 0
 		? ["Could not extract YouTube video content.", "", ...attemptErrors.map(message => `- ${message}`)].join("\n")
-		: "Could not extract YouTube video content. Sign into Google in Chrome for automatic access, or set GEMINI_API_KEY.";
+		: "Could not extract YouTube video content. Sign into Google in a supported Chromium browser for automatic access, or set GEMINI_API_KEY.";
 	activityMonitor.logError(activityId, error);
 	return { url, title: "", content: "", error };
 }
@@ -311,7 +311,7 @@ async function tryPerplexity(
 
 		const content =
 			`# Video Summary (via Perplexity)\n\n${answer}\n\n` +
-			`*Full video understanding requires Gemini access. Set GEMINI_API_KEY or sign into Google in Chrome.*`;
+			`*Full video understanding requires Gemini access. Set GEMINI_API_KEY or sign into Google in a supported Chromium browser.*`;
 
 		return {
 			url,

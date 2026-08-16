@@ -1,11 +1,11 @@
 // npx-resolver.ts - Resolve npx/npm exec binaries to avoid npm parent processes
-import { existsSync, readFileSync, realpathSync, readdirSync, statSync, writeFileSync, renameSync, mkdirSync, openSync, readSync, closeSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, readdirSync, statSync, writeFileSync, renameSync, mkdirSync, openSync, readSync, closeSync, unlinkSync } from "node:fs";
 import { join, dirname, extname, resolve, sep } from "node:path";
 import { getAgentPath } from "./agent-dir.ts";
 import { throwIfAborted } from "./abort.ts";
 import crossSpawn from "cross-spawn";
 
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const EXACT_PACKAGE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?$/;
 
@@ -53,7 +53,7 @@ export async function resolveNpxBinary(
   if (!parsed) return null;
 
   const packageSpec = parsePackageSpec(parsed.packageSpec);
-  const cacheKey = JSON.stringify([command, ...args]);
+  const cacheKey = JSON.stringify([command, parsed.packageSpec, parsed.binName ?? ""]);
   const cache = loadCache();
   const cached = cache?.entries?.[cacheKey];
 
@@ -434,41 +434,96 @@ function getNpxCachePath(): string {
   return getAgentPath("mcp-npx-cache.json");
 }
 
-function loadCache(): NpxCache | null {
-  const cachePath = getNpxCachePath();
+function readNpxCachePayload(cachePath: string): unknown | null {
   if (!existsSync(cachePath)) return null;
   try {
-    const raw = JSON.parse(readFileSync(cachePath, "utf-8"));
-    if (!raw || typeof raw !== "object") return null;
-    if (raw.version !== CACHE_VERSION) return null;
-    if (!raw.entries || typeof raw.entries !== "object") return null;
-    return raw as NpxCache;
+    return JSON.parse(readFileSync(cachePath, "utf-8")) as unknown;
   } catch {
     return null;
   }
 }
 
-function saveCacheEntry(key: string, entry: NpxCacheEntry): void {
-  const cachePath = getNpxCachePath();
-  const dir = dirname(cachePath);
-  mkdirSync(dir, { recursive: true });
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
 
-  let merged: NpxCache = { version: CACHE_VERSION, entries: {} };
-  try {
-    if (existsSync(cachePath)) {
-      const existing = JSON.parse(readFileSync(cachePath, "utf-8")) as NpxCache;
-      if (existing && existing.version === CACHE_VERSION && existing.entries) {
-        merged.entries = { ...existing.entries };
-      }
-    }
-  } catch {
-    // Ignore parse errors
+function createCacheEntries(): Record<string, NpxCacheEntry> {
+  return Object.create(null) as Record<string, NpxCacheEntry>;
+}
+
+function toNpxCacheEntry(value: unknown): NpxCacheEntry | null {
+  const raw = asRecord(value);
+  if (!raw) return null;
+  if (typeof raw.resolvedBin !== "string") return null;
+  if (typeof raw.resolvedAt !== "number" || !Number.isFinite(raw.resolvedAt)) return null;
+  if (typeof raw.isJs !== "boolean") return null;
+  if (raw.packageVersion !== undefined && typeof raw.packageVersion !== "string") return null;
+  return {
+    resolvedBin: raw.resolvedBin,
+    resolvedAt: raw.resolvedAt,
+    ...(raw.packageVersion !== undefined ? { packageVersion: raw.packageVersion } : {}),
+    isJs: raw.isJs,
+  };
+}
+
+function toNpxCache(value: unknown): NpxCache | null {
+  const raw = asRecord(value);
+  if (!raw || raw.version !== CACHE_VERSION) return null;
+  const rawEntries = asRecord(raw.entries);
+  if (!rawEntries) return null;
+
+  const entries = createCacheEntries();
+  for (const [key, rawEntry] of Object.entries(rawEntries)) {
+    const entry = toNpxCacheEntry(rawEntry);
+    if (entry) entries[key] = entry;
   }
+  return { version: CACHE_VERSION, entries };
+}
 
-  merged.entries[key] = entry;
-  const tmpPath = `${cachePath}.${process.pid}.tmp`;
-  writeFileSync(tmpPath, JSON.stringify(merged, null, 2), "utf-8");
-  renameSync(tmpPath, cachePath);
+function clearLegacyCache(): boolean {
+  const cachePath = getNpxCachePath();
+  const raw = asRecord(readNpxCachePayload(cachePath));
+  if (raw?.version !== 1) return false;
+  try {
+    unlinkSync(cachePath);
+  } catch {
+    try {
+      writeFileSync(cachePath, "", "utf-8");
+    } catch {
+      // Cache cleanup is best effort; resolution must still proceed.
+    }
+  }
+  return true;
+}
+
+clearLegacyCache();
+
+function loadCache(): NpxCache | null {
+  if (clearLegacyCache()) return null;
+
+  return toNpxCache(readNpxCachePayload(getNpxCachePath()));
+}
+
+function saveCacheEntry(key: string, entry: NpxCacheEntry): void {
+  try {
+    const cachePath = getNpxCachePath();
+    const dir = dirname(cachePath);
+    mkdirSync(dir, { recursive: true });
+
+    const existing = toNpxCache(readNpxCachePayload(cachePath));
+    const entries = createCacheEntries();
+    if (existing) Object.assign(entries, existing.entries);
+    const merged: NpxCache = { version: CACHE_VERSION, entries };
+
+    merged.entries[key] = entry;
+    const tmpPath = `${cachePath}.${process.pid}.tmp`;
+    writeFileSync(tmpPath, JSON.stringify(merged, null, 2), "utf-8");
+    renameSync(tmpPath, cachePath);
+  } catch {
+    // Cache writes are best effort; resolution must still proceed.
+  }
 }
 
 function safeRealpath(path: string): string {

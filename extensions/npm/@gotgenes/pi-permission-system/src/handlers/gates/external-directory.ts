@@ -1,11 +1,12 @@
 import { getToolInputPath } from "#src/access-intent/tool-input-path";
 import type { PathNormalizer } from "#src/path-normalizer";
 import type { ScopedPermissionResolver } from "#src/permission-resolver";
+import { renderLegacyMessage } from "#src/presentation/legacy-message";
+import { buildExternalDirectoryAskPayload } from "#src/presentation/path-ask-payload";
 import { SessionApproval } from "#src/session-approval";
 import { deriveApprovalPattern } from "#src/session-rules";
 import type { ToolAccessExtractorLookup } from "#src/tool-access-extractor-registry";
 import type { GateResult } from "./descriptor";
-import { formatExternalDirectoryAskPrompt } from "./external-directory-messages";
 import { resolveExternalDirectoryPolicy } from "./external-directory-policy";
 import { accessFactsFromPath } from "./helpers";
 import type { ToolCallContext } from "./types";
@@ -69,13 +70,6 @@ export function describeExternalDirectoryGate(
 
   // ── Build descriptor for permission check ───────────────────────────────
   const resolvedAlias = accessPath.resolvedAlias();
-  const extDirMessage = formatExternalDirectoryAskPrompt(
-    tcc.toolName,
-    externalDirectoryPath,
-    resolvedAlias,
-    tcc.cwd,
-    tcc.agentName ?? undefined,
-  );
 
   // The runner consumes this preCheck and skips its own resolve.
   const preCheck = resolveExternalDirectoryPolicy(
@@ -84,6 +78,16 @@ export function describeExternalDirectoryGate(
     tcc.agentName ?? undefined,
   );
   const pattern = deriveApprovalPattern(accessPath.value());
+
+  const payload = buildExternalDirectoryAskPayload({
+    toolName: tcc.toolName,
+    pathValue: externalDirectoryPath,
+    resolvedPath: resolvedAlias,
+    cwd: tcc.cwd,
+    agentName: tcc.agentName,
+    matchedPattern: preCheck.matchedPattern,
+  });
+  const extDirMessage = renderLegacyMessage(payload);
 
   return {
     surface: "external_directory",
@@ -102,6 +106,7 @@ export function describeExternalDirectoryGate(
       source: "tool_call",
       agentName: tcc.agentName,
       message: extDirMessage,
+      payload,
       toolCallId: tcc.toolCallId,
       toolName: tcc.toolName,
       path: externalDirectoryPath,
