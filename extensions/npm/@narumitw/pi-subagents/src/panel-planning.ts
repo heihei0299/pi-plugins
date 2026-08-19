@@ -1,9 +1,9 @@
 import type { AgentConfig } from "./agents/types.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, truncateUtf8 } from "./limits.js";
+import type { PanelPreset } from "./panel-presets.js";
 import { type WorkItemDefinition, WorkItemLedger } from "./work-item-ledger.js";
 
-export const PANEL_PRESETS = ["code-review", "research", "security-review", "custom"] as const;
-export type PanelPreset = (typeof PANEL_PRESETS)[number];
+export type { PanelPreset } from "./panel-presets.js";
 
 export interface PanelReviewerRequest {
 	id: string;

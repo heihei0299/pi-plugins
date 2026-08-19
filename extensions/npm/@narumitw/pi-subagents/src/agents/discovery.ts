@@ -179,6 +179,24 @@ function hasOwn(obj: object, key: PropertyKey): boolean {
 	return Object.hasOwn(obj, key);
 }
 
+function applyAgentOverride(
+	agent: AgentConfig,
+	override: NonNullable<SubagentSettings["agents"]>[string],
+): AgentConfig {
+	const nextAgent: AgentConfig = { ...agent };
+	if (hasOwn(override, "tools")) nextAgent.tools = override.tools;
+	if (hasOwn(override, "model")) {
+		nextAgent.model = override.model === null ? undefined : override.model;
+	}
+	if (hasOwn(override, "thinkingLevel")) {
+		nextAgent.thinkingLevel = override.thinkingLevel === null ? undefined : override.thinkingLevel;
+	}
+	if (hasOwn(override, "timeoutMs")) {
+		nextAgent.timeoutMs = override.timeoutMs === null ? undefined : override.timeoutMs;
+	}
+	return nextAgent;
+}
+
 export function discoverAgents(
 	cwd: string,
 	scope: AgentScope,
@@ -217,23 +235,21 @@ export function discoverAgents(
 
 	// Apply user-configured overrides (from /subagents → Agent tool settings) on top of
 	// the final resolved agent map, regardless of agent source.
-	for (const [name, override] of Object.entries(config?.agents ?? {})) {
+	const configuredAgents = config?.agents ?? {};
+	for (const [name, override] of Object.entries(configuredAgents)) {
 		const agent = agentMap.get(name);
 		if (!agent) continue;
-
-		const nextAgent: AgentConfig = { ...agent };
-		if (hasOwn(override, "tools")) nextAgent.tools = override.tools;
-		if (hasOwn(override, "model")) {
-			nextAgent.model = override.model === null ? undefined : override.model;
-		}
-		if (hasOwn(override, "thinkingLevel")) {
-			nextAgent.thinkingLevel =
-				override.thinkingLevel === null ? undefined : override.thinkingLevel;
-		}
-		if (hasOwn(override, "timeoutMs")) {
-			nextAgent.timeoutMs = override.timeoutMs === null ? undefined : override.timeoutMs;
-		}
-		agentMap.set(name, nextAgent);
+		agentMap.set(name, applyAgentOverride(agent, override));
+	}
+	const legacyScoutOverride = configuredAgents.scout;
+	const explorerAgent = agentMap.get("explorer");
+	if (
+		legacyScoutOverride &&
+		explorerAgent &&
+		!hasOwn(configuredAgents, "explorer") &&
+		!agentMap.has("scout")
+	) {
+		agentMap.set("explorer", applyAgentOverride(explorerAgent, legacyScoutOverride));
 	}
 
 	const omittedAgentDefinitions =

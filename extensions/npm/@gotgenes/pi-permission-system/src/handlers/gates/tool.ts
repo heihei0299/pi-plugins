@@ -5,8 +5,10 @@ import {
   classifyToolKind,
   type ShellInvocation,
 } from "#src/access-intent/tool-kind";
-import { suggestSessionPattern } from "#src/pattern-suggest";
-import { renderLegacyMessage } from "#src/presentation/legacy-message";
+import {
+  suggestPathSessionPattern,
+  suggestSessionPattern,
+} from "#src/pattern-suggest";
 import { buildToolAskPayload } from "#src/presentation/tool-ask-payload";
 import { SessionApproval } from "#src/session-approval";
 import type { ToolPreviewFormatter } from "#src/tool-preview-formatter";
@@ -20,17 +22,29 @@ import {
 import type { ToolCallContext } from "./types";
 
 /**
+ * A path-bearing tool call's resolved path, paired with the session scope
+ * approving it would grant.
+ *
+ * The pattern is derived by the pipeline's `PathNormalizer`, which owns the
+ * session's `PathFlavor`, rather than re-derived here from `path.value()` — so
+ * the gate carries the platform's separator semantics without holding them
+ * (#655).
+ */
+export interface ToolPathAccess {
+  readonly path: AccessPath;
+  readonly approvalPattern: string;
+}
+
+/**
  * Derive the value used for session-approval pattern suggestions.
  *
- * Bash → command string; MCP → qualified target;
- * path-bearing tools → the `AccessPath`'s lexical absolute form (`value()`),
- * so the suggested pattern matches the policy values a later call produces;
- * others (or a path-bearing tool with no path) → catch-all wildcard.
+ * Bash → command string; MCP → qualified target; everything else → catch-all
+ * wildcard. A path-bearing tool that resolved a path never reaches here — its
+ * suggestion comes from the already-derived {@link ToolPathAccess} pattern.
  */
 function deriveSuggestionValue(
   toolName: string,
   check: PermissionCheckResult,
-  accessPath?: AccessPath,
 ): string {
   switch (classifyToolKind(toolName)) {
     case "bash":
@@ -38,7 +52,7 @@ function deriveSuggestionValue(
     case "mcp":
       return check.target ?? "mcp";
     default:
-      return accessPath ? accessPath.value() : "*";
+      return "*";
   }
 }
 
@@ -52,7 +66,7 @@ export function describeToolGate(
   tcc: ToolCallContext,
   check: PermissionCheckResult,
   formatter: ToolPreviewFormatter,
-  accessPath?: AccessPath,
+  pathAccess?: ToolPathAccess,
   shell?: ShellInvocation | null,
 ): GateDescriptor {
   // A shell invocation (native `bash` or an aliased shell tool) is gated on the
@@ -68,10 +82,12 @@ export function describeToolGate(
   );
 
   // Compute session approval suggestion for the "for this session" option.
-  const suggestion = suggestSessionPattern(
-    gateSurface,
-    deriveSuggestionValue(gateSurface, check, accessPath),
-  );
+  const suggestion = pathAccess
+    ? suggestPathSessionPattern(gateSurface, pathAccess.approvalPattern)
+    : suggestSessionPattern(
+        gateSurface,
+        deriveSuggestionValue(gateSurface, check),
+      );
 
   const payload = buildToolAskPayload({
     check,
@@ -81,7 +97,6 @@ export function describeToolGate(
     input: tcc.input,
     formatter,
   });
-  const askMessage = renderLegacyMessage(payload);
 
   const decisionValue = deriveDecisionValue(
     gateSurface,
@@ -91,19 +106,14 @@ export function describeToolGate(
 
   // A path-bearing tool carries the AccessPath's alias set; every other surface
   // (bash command, MCP target, plain tool) carries its already-portable value.
-  const accessIntent = accessPath
-    ? accessFactsFromPath(gateSurface, accessPath)
+  const accessIntent = pathAccess
+    ? accessFactsFromPath(gateSurface, pathAccess.path)
     : accessFactsFromValue(gateSurface, decisionValue);
 
   return {
     surface: gateSurface,
     input: tcc.input,
-    denialContext: {
-      kind: "tool",
-      check,
-      agentName: tcc.agentName ?? undefined,
-      input: tcc.input,
-    },
+    payload,
     sessionApproval: SessionApproval.single(
       suggestion.surface,
       suggestion.pattern,
@@ -111,8 +121,6 @@ export function describeToolGate(
     promptDetails: {
       source: "tool_call",
       agentName: tcc.agentName,
-      message: askMessage,
-      payload,
       toolCallId: tcc.toolCallId,
       toolName: tcc.toolName,
       sessionLabel: suggestion.label,
@@ -123,7 +131,6 @@ export function describeToolGate(
       source: "tool_call",
       toolCallId: tcc.toolCallId,
       toolName: tcc.toolName,
-      message: askMessage,
       ...permissionLogContext,
     },
     decision: {

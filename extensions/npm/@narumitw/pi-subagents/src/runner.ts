@@ -389,6 +389,12 @@ export interface ChildLaunchPolicy {
 	projectTrust?: boolean;
 	baseSystemPrompt?: string;
 	appendSystemPromptPaths?: string[];
+	/** Package-owned explicit child extensions loaded even when unrelated extensions are disabled. */
+	extensionPaths?: string[];
+	/** Package-owned tools added to the child allowlist without changing delegated execution tools. */
+	additionalTools?: string[];
+	/** Ephemeral child-process environment consumed and cleared by a package-owned bridge. */
+	env?: NodeJS.ProcessEnv;
 	/** Internal timeout recovery control; omitted means enabled. */
 	finalizeOnTimeout?: boolean;
 	/** Internal hard deadline for the summary attempt. */
@@ -560,10 +566,14 @@ export async function runSingleAgent(
 
 		const effectiveTools =
 			launchPolicy && Object.hasOwn(launchPolicy, "tools") ? launchPolicy.tools : agent.tools;
+		const selectedTools =
+			effectiveTools === undefined
+				? undefined
+				: [...new Set([...effectiveTools, ...(launchPolicy?.additionalTools ?? [])])];
 		const args = buildPiArgs({
 			model: agent.model,
 			thinkingLevel,
-			tools: effectiveTools,
+			tools: selectedTools,
 			disableExtensions: launchPolicy?.disableExtensions,
 			disableSkills: launchPolicy?.disableSkills,
 			disablePromptTemplates: launchPolicy?.disablePromptTemplates,
@@ -571,6 +581,7 @@ export async function runSingleAgent(
 			projectTrust: launchPolicy?.projectTrust,
 			baseSystemPromptPath: baseSystemPromptPath ?? undefined,
 			appendSystemPromptPaths: launchPolicy?.appendSystemPromptPaths,
+			extensionPaths: launchPolicy?.extensionPaths,
 			systemPromptPath: tmpPromptPath ?? undefined,
 			task,
 		});
@@ -623,6 +634,7 @@ export async function runSingleAgent(
 					stdio: ["ignore", "pipe", "pipe"],
 					env: {
 						...process.env,
+						...launchPolicy?.env,
 						PI_SUBAGENT_DEPTH: String(
 							(Number.parseInt(process.env.PI_SUBAGENT_DEPTH ?? "0", 10) || 0) + 1,
 						),

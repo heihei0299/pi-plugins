@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import lockfile from "proper-lockfile";
 import type {
 	AgentConfig,
 	CompletionDelivery,
@@ -76,6 +76,8 @@ export {
 
 const SETTINGS_FILE = "pi-subagents.json";
 const LEGACY_SETTINGS_FILE = "pi-subagents-config.json";
+const require = createRequire(import.meta.url);
+
 const SETTINGS_LOCK_FS_ADAPTER = {
 	mkdir: fs.mkdir,
 	mkdirSync: fs.mkdirSync,
@@ -511,6 +513,7 @@ function writeSettingsObjectUnlocked(settings: object, replaceCanonical?: boolea
 }
 
 function withSettingsMutationLock<T>(mutate: () => T): T {
+	const lockfile = require("proper-lockfile") as typeof import("proper-lockfile");
 	const agentDir = getAgentDir();
 	fs.mkdirSync(agentDir, { recursive: true });
 	const configPath = path.join(agentDir, SETTINGS_FILE);

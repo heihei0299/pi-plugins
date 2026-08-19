@@ -9,12 +9,18 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents/discovery.js";
 import type { AgentConfig, SubagentThinkingLevel } from "./agents/types.js";
+import { formatPeerMessage } from "./child-peer-tools.js";
 import { redactPrivateText } from "./context.js";
 import { appendDelegationContract } from "./delegation-contract.js";
 import { resolveDefaultSubagentTimeoutMs } from "./execution/runtime-policy.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, DEFAULT_MAX_OUTPUT_BYTES, truncateUtf8 } from "./limits.js";
+import {
+	CHILD_PEER_TOOL_NAMES,
+	createInProcessPeerExtension,
+	type PeerTransportRuntime,
+} from "./peer-transport.js";
 import { resolvePiPromptResources } from "./prompt-resources.js";
-import type { AgentTurn, ManagedAgent, TurnOutcome } from "./registry.js";
+import type { AgentMailboxMessage, AgentTurn, ManagedAgent, TurnOutcome } from "./registry.js";
 import { appendResultInstruction } from "./result-contract.js";
 import { safeTerminalLine } from "./safe-text.js";
 import { readSubagentSettings } from "./settings.js";
@@ -79,6 +85,7 @@ export interface ChildSession {
 	readonly model?: string;
 	readonly thinkingLevel?: SubagentThinkingLevel;
 	prompt(text: string): Promise<void>;
+	steer?(text: string): Promise<void>;
 	subscribe(listener: (event: unknown) => void): () => void;
 	abort(): Promise<void>;
 	dispose(): void;
@@ -93,6 +100,7 @@ export interface ChildSessionCreateOptions {
 	modelRegistry: ModelRegistry;
 	parentRuntime: ParentRuntimeSnapshot;
 	tools?: string[];
+	peerRuntime?: PeerTransportRuntime;
 }
 
 export type ChildSessionFactory = (options: ChildSessionCreateOptions) => Promise<ChildSession>;
@@ -105,6 +113,7 @@ export interface InProcessTransportOptions {
 	defaultTimeoutMs?: number;
 	abortGraceMs?: number;
 	timeoutFinalizationMs?: number;
+	peerRuntime?: PeerTransportRuntime;
 }
 
 interface ChildSessionRecord {
@@ -362,6 +371,13 @@ export class InProcessTransport implements SubagentTransport {
 		}
 	}
 
+	async deliverMessage(agent: ManagedAgent, message: AgentMailboxMessage): Promise<boolean> {
+		const record = this.sessions.get(agent.id);
+		if (!record || record.disposed || !record.session.steer) return false;
+		await record.session.steer(formatPeerMessage(message));
+		return true;
+	}
+
 	async release(agent: ManagedAgent): Promise<void> {
 		await this.releaseById(agent.id);
 	}
@@ -384,6 +400,7 @@ export class InProcessTransport implements SubagentTransport {
 		const record = this.sessions.get(agentId);
 		if (!record) return;
 		this.sessions.delete(agentId);
+		this.options.peerRuntime?.revoke(agentId);
 		if (record.disposed) return;
 		record.disposed = true;
 		const failures: unknown[] = [];
@@ -423,6 +440,7 @@ export class InProcessTransport implements SubagentTransport {
 			modelRegistry: this.options.modelRegistry,
 			parentRuntime: this.options.getParentRuntime(),
 			tools,
+			peerRuntime: this.options.peerRuntime,
 		});
 		const record: ChildSessionRecord = {
 			session,
@@ -563,6 +581,9 @@ export async function createSdkChildSession(
 		agentDir,
 		options.agentConfig.systemPrompt,
 		projectTrusted,
+		options.peerRuntime
+			? createInProcessPeerExtension(options.peerRuntime, options.agent.id)
+			: undefined,
 	);
 	copyRegisteredProviders(
 		options.modelRegistry as unknown as RegisteredProviderRegistry,
@@ -577,18 +598,24 @@ export async function createSdkChildSession(
 	const model = resolved.model;
 	const sessionManager = SessionManager.inMemory(options.agent.cwd);
 	seedChildSessionManager(sessionManager, options, model);
+	const selectedTools =
+		options.tools === undefined
+			? undefined
+			: options.peerRuntime
+				? [...options.tools, ...CHILD_PEER_TOOL_NAMES]
+				: options.tools;
 	const created = await coreSupport.createAgentSessionFromServices({
 		services,
 		sessionManager,
 		model,
 		thinkingLevel: resolved.thinkingLevel,
-		tools: options.tools,
-		noTools: options.tools?.length === 0 ? "all" : undefined,
+		tools: selectedTools,
+		noTools: selectedTools?.length === 0 ? "all" : undefined,
 	});
 	const session = created.session;
-	if (options.tools !== undefined) {
+	if (selectedTools !== undefined) {
 		const active = session.getActiveToolNames();
-		const expected = [...options.tools].sort();
+		const expected = [...selectedTools].sort();
 		if (
 			active.length !== expected.length ||
 			[...active].sort().some((name, index) => name !== expected[index])
@@ -616,6 +643,7 @@ export async function createSdkChildSession(
 			return session.thinkingLevel;
 		},
 		prompt: (text) => session.prompt(text),
+		steer: (text) => session.steer(text),
 		subscribe: (listener) => session.subscribe((event) => listener(event)),
 		abort: () => session.abort(),
 		dispose: () => session.dispose(),
@@ -713,6 +741,7 @@ async function prepareInProcessServices(
 	agentDir: string,
 	agentSystemPrompt: string,
 	projectTrusted: boolean,
+	peerExtension?: import("@earendil-works/pi-coding-agent").ExtensionFactory,
 ): Promise<{ services: AgentSessionServices; support: CoreSessionSupport }> {
 	const promptResources = await resolvePiPromptResources(cwd, projectTrusted, agentDir);
 	const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
@@ -724,6 +753,7 @@ async function prepareInProcessServices(
 		settingsManager,
 		resourceLoaderOptions: {
 			noExtensions: true,
+			...(peerExtension ? { extensionFactories: [peerExtension] } : {}),
 			appendSystemPrompt: [
 				...promptResources.appendSystemPromptPaths,
 				...(agentSystemPrompt.trim() ? [agentSystemPrompt] : []),
@@ -787,8 +817,10 @@ export function buildCurrentTurnPrompt(agent: ManagedAgent, task: string): strin
 	const messages = agent.mailbox
 		.filter((message) => ids.has(message.id))
 		.slice(-20)
-		.map((message) => `From ${message.senderId}: ${redactPrivateText(message.content)}`)
-		.join("\n");
+		.map((message) =>
+			formatPeerMessage({ ...message, content: redactPrivateText(message.content) }),
+		)
+		.join("\n\n");
 	const base = messages
 		? `${redactPrivateText(task)}\n\nMailbox messages:\n${messages}`
 		: redactPrivateText(task);

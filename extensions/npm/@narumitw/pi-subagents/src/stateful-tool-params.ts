@@ -11,7 +11,10 @@ export const ManageParamsSchema = Type.Object(
 			description: "Interrupt active work or close an agent and release its resources.",
 		}),
 		agentId: Type.Optional(
-			Type.String({ minLength: 1, description: "Required for interrupt and close." }),
+			Type.String({
+				minLength: 1,
+				description: "Required agent ID or canonical task path for interrupt and close.",
+			}),
 		),
 		subtree: Type.Optional(
 			Type.Boolean({
@@ -28,7 +31,10 @@ export const MailboxParamsSchema = Type.Object(
 		action: StringEnum(MAILBOX_ACTIONS, {
 			description: "Use send for queue-only delivery or read to inspect unread mailbox messages.",
 		}),
-		agentId: Type.String({ minLength: 1, description: "Mailbox owner or message recipient." }),
+		agentId: Type.String({
+			minLength: 1,
+			description: "Mailbox owner or recipient agent ID or canonical task path.",
+		}),
 		message: Type.Optional(
 			Type.String({
 				minLength: 1,
@@ -36,7 +42,9 @@ export const MailboxParamsSchema = Type.Object(
 				description: "Message content required by send; sending does not start a turn.",
 			}),
 		),
-		senderId: Type.Optional(Type.String({ description: "Optional same-tree sender identity." })),
+		senderId: Type.Optional(
+			Type.String({ description: "Optional sender agent ID or canonical task path." }),
+		),
 		deduplicationKey: Type.Optional(
 			Type.String({ maxLength: 256, description: "Optional idempotency key for send." }),
 		),

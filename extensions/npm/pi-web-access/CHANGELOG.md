@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-18
+
+### Highlights
+- Added more provider choices, including Parallel Search MCP, Valyu, and Serper.
+- Made `fetch_content` recover useful article text from more Next.js and React Server Components pages.
+- Updated summary and query rewrite model defaults to newer fast models.
+- Made nested summary and rewrite model calls follow Pi's model registry routing.
+- Added more control over summary thinking levels and provider API base URLs.
+
+### Added
+- Added `summaryModel` thinking-level suffix support. Thanks to [@pkos98](https://github.com/pkos98) for issue #264.
+- Added explicit-only Parallel Search MCP support for keyless search and opt-in hosted fetch. Thanks to [@happytomatoe](https://github.com/happytomatoe) for #257.
+- Added explicit-only Valyu and Serper search providers. Thanks to [@mikhel01](https://github.com/mikhel01) for issues #259 and #260.
+- Added configurable API base URLs for Brave, keyed Exa, and Tavily requests, with credential stripping across redirect origins. Thanks to [@XWIlluDelu](https://github.com/XWIlluDelu) for #265.
+
+### Changed
+- Refreshed default summary and query rewrite model preferences. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #266.
+
+### Fixed
+- Route nested model calls through Pi's model registry. Thanks to [@rany2](https://github.com/rany2) for #263.
+- Recover useful Next.js RSC content when Readability only extracts a loading shell, and report full, partial, or failed background content fetches accurately (#272, #273).
+- Keep valid AnySearch results when the API omits or nulls result content. Thanks to [@mikhel01](https://github.com/mikhel01) for #258.
+
 ## [0.23.0] - 2026-08-15
 
 ### Added

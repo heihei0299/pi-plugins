@@ -22,9 +22,9 @@ import type {
 } from "@ff-labs/fff-node";
 import { Type } from "@sinclair/typebox";
 import { AuxFinderPool, routePathConstraint } from "./aux-finders";
+import { FilePickerFactory } from "./file-picker";
+import { isHomeDir, resolveDbPaths } from "./paths";
 import { buildQuery } from "./query";
-import { isHomeDir } from "./paths";
-import { loadSdk, SCAN_TIMEOUT_MS } from "./sdk";
 
 export { SCAN_TIMEOUT_MS } from "./sdk";
 
@@ -34,6 +34,8 @@ export { SCAN_TIMEOUT_MS } from "./sdk";
 
 const DEFAULT_GREP_LIMIT = 20;
 const DEFAULT_FIND_LIMIT = 30;
+const GREP_PAGE_SIZE_MAX = 50;
+const GREP_CONTEXT_MAX = 20;
 const GREP_MAX_LINE_LENGTH = 500;
 const MENTION_MAX_RESULTS = 20;
 
@@ -128,6 +130,13 @@ function truncateLine(line: string, max = GREP_MAX_LINE_LENGTH): string {
   return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max)}...`;
 }
 
+// Clamp caller-supplied context to a non-negative bounded integer so a large
+// value cannot multiply output size past the model window.
+function clampContext(context: number | undefined): number {
+  if (!context || context < 0) return 0;
+  return Math.min(Math.floor(context), GREP_CONTEXT_MAX);
+}
+
 const HOT_FRECENCY = 25;
 const WARM_FRECENCY = 20;
 
@@ -153,16 +162,7 @@ export function fffFileAnnotation(item: {
   return "";
 }
 
-// fff-core native definition classifier (byte-level scanner in Rust) is enabled
-// via GrepOptions.classifyDefinitions. Each GrepMatch carries isDefinition for
-// downstream consumers; pi-fff does NOT use it to re-sort.
-//
-// Ordering policy: NO CUSTOM SORTING. The engine already returns items in
-// frecency order (most-accessed files first). pi-fff only groups consecutive
-// matches into per-file blocks and preserves whatever order the engine
-// provided — inside a file we keep matches in source-line order because the
-// engine emits them that way.
-
+// DO NOT ATTEMPT TO RESORT OUTPUT HERE IT ONLY CONFUSES MODELS
 function formatGrepOutput(result: GrepResult): string {
   if (result.items.length === 0) return "No matches found";
 
@@ -170,7 +170,6 @@ function formatGrepOutput(result: GrepResult): string {
   // This preserves native frecency ordering across files without re-sorting.
   const lines: string[] = [];
   let currentFile = "";
-  let shown = 0;
 
   for (const match of result.items) {
     if (match.relativePath !== currentFile) {
@@ -185,7 +184,6 @@ function formatGrepOutput(result: GrepResult): string {
     });
 
     lines.push(` ${match.lineNumber}: ${truncateLine(match.lineContent)}`);
-    shown++;
 
     match.contextAfter?.forEach((line: string, i: number) => {
       const lineNum = match.lineNumber + 1 + i;
@@ -309,22 +307,17 @@ export default function fffExtension(pi: ExtensionAPI) {
 
   const toolNames = resolveToolNames(currentMode);
 
-  // DB path resolution: flag > env > undefined (use fff-node defaults)
-  const frecencyDbPath =
-    (pi.getFlag("fff-frecency-db") as string | undefined) ??
-    process.env.FFF_FRECENCY_DB ??
-    undefined;
-  const historyDbPath =
-    (pi.getFlag("fff-history-db") as string | undefined) ??
-    process.env.FFF_HISTORY_DB ??
-    undefined;
+  // DB path resolution: flag > env > existing fff.nvim db > pi-local data dir.
+  const resolvedDbPaths = resolveDbPaths({
+    frecency:
+      (pi.getFlag("fff-frecency-db") as string | undefined) ??
+      process.env.FFF_FRECENCY_DB,
+    history:
+      (pi.getFlag("fff-history-db") as string | undefined) ?? process.env.FFF_HISTORY_DB,
+  });
 
   // flag (boolean) > env ("1"/"true", or "0"/"false") > default.
-  function resolveBoolOpt(
-    flagName: string,
-    envName: string,
-    fallback = false,
-  ): boolean {
+  function resolveBoolOpt(flagName: string, envName: string, fallback = false): boolean {
     const flag = pi.getFlag(flagName);
     if (typeof flag === "boolean") return flag;
     if (typeof flag === "string") return flag === "true" || flag === "1";
@@ -375,10 +368,21 @@ export default function fffExtension(pi: ExtensionAPI) {
     );
   }
 
-  let auxPool = new AuxFinderPool({
+  const pickers = new FilePickerFactory({
+    frecencyDbPath: resolvedDbPaths.frecency,
+    historyDbPath: resolvedDbPaths.history,
+    onDbFailure: (error) =>
+      uiCtx?.ui.notify(
+        `(fff): Failed to open frecency/history database (${error}). Continuing without frecency persistence.`,
+        "error",
+      ),
+  });
+
+  const auxPool = new AuxFinderPool({
     enableFsRootScanning,
     enableHomeDirScanning,
     onHomeDirScan: warnHomeDirScan,
+    pickers,
   });
 
   // in case cwd changes we need to figure this out
@@ -395,22 +399,14 @@ export default function fffExtension(pi: ExtensionAPI) {
         finderCwd = null;
       }
 
-      const { FileFinder } = await loadSdk();
-      const result = FileFinder.create({
+      // if the dbs can't be opened the factory falls back to a db-less picker,
+      // e.g. when some other process corrupts the lock
+      mainFinder = await pickers.create({
         basePath: cwd,
-        frecencyDbPath,
-        historyDbPath,
-        aiMode: true,
         enableHomeDirScanning,
         enableFsRootScanning,
       });
-
-      if (!result.ok)
-        throw new Error(`Failed to create FFF file finder: ${result.error}`);
-
-      mainFinder = result.value;
       finderCwd = cwd;
-      await mainFinder.waitForScan(SCAN_TIMEOUT_MS);
       return mainFinder;
     })().finally(() => {
       finderPromise = null;
@@ -691,7 +687,9 @@ export default function fffExtension(pi: ExtensionAPI) {
       }),
     ),
     context: Type.Optional(
-      Type.Number({ description: "Context lines before+after each match" }),
+      Type.Number({
+        description: `Context lines before+after each match (0-${GREP_CONTEXT_MAX})`,
+      }),
     ),
     limit: Type.Optional(
       Type.Number({
@@ -724,6 +722,10 @@ export default function fffExtension(pi: ExtensionAPI) {
 
       const picker = aux ? aux.finder : await ensureFinder(activeCwd);
       const effectiveLimit = Math.max(1, params.limit ?? DEFAULT_GREP_LIMIT);
+      // pageSize caps TOTAL matches across all files; maxMatchesPerFile alone
+      // only caps per-file, so limit=5 could still return a full SDK page.
+      const pageSize = Math.min(effectiveLimit, GREP_PAGE_SIZE_MAX);
+      const context = clampContext(params.context);
       const query = aux
         ? aux.query
         : buildQuery(params.path, pattern, params.exclude, activeCwd);
@@ -771,10 +773,11 @@ export default function fffExtension(pi: ExtensionAPI) {
       const grepResult = picker.grep(query, {
         mode,
         smartCase,
-        maxMatchesPerFile: Math.min(effectiveLimit, 50),
+        maxMatchesPerFile: pageSize,
+        pageSize,
         cursor: (params.cursor ? getCursor(params.cursor) : null) ?? null,
-        beforeContext: params.context ?? 0,
-        afterContext: params.context ?? 0,
+        beforeContext: context,
+        afterContext: context,
         classifyDefinitions: true,
         timeBudgetMs: GREP_TIME_BUDGET_MS,
       });
@@ -803,7 +806,8 @@ export default function fffExtension(pi: ExtensionAPI) {
         const fuzzy = picker.grep(fuzzyQuery, {
           mode: "fuzzy",
           smartCase,
-          maxMatchesPerFile: Math.min(effectiveLimit, 50),
+          maxMatchesPerFile: pageSize,
+          pageSize,
           cursor: null,
           beforeContext: 0,
           afterContext: 0,
@@ -1015,7 +1019,11 @@ export default function fffExtension(pi: ExtensionAPI) {
       constraints: Type.Optional(
         Type.String({ description: "File filter, e.g. '*.{ts,tsx} !test/'" }),
       ),
-      context: Type.Optional(Type.Number({ description: "Context lines before+after" })),
+      context: Type.Optional(
+        Type.Number({
+          description: `Context lines before+after (0-${GREP_CONTEXT_MAX})`,
+        }),
+      ),
       limit: Type.Optional(
         Type.Number({
           description: `Max matches (default ${DEFAULT_GREP_LIMIT})`,
@@ -1044,15 +1052,18 @@ export default function fffExtension(pi: ExtensionAPI) {
 
         const f = await ensureFinder(activeCwd);
         const effectiveLimit = Math.max(1, params.limit ?? DEFAULT_GREP_LIMIT);
+        const pageSize = Math.min(effectiveLimit, GREP_PAGE_SIZE_MAX);
+        const context = clampContext(params.context);
 
         const grepResult = f.multiGrep({
           patterns: params.patterns,
           constraints: params.constraints,
-          maxMatchesPerFile: Math.min(effectiveLimit, 50),
+          maxMatchesPerFile: pageSize,
+          pageSize,
           smartCase: true,
           cursor: (params.cursor ? getCursor(params.cursor) : null) ?? null,
-          beforeContext: params.context ?? 0,
-          afterContext: params.context ?? 0,
+          beforeContext: context,
+          afterContext: context,
         });
 
         if (!grepResult.ok) throw new Error(grepResult.error);

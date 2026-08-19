@@ -3,7 +3,7 @@ import { type Static, Type } from "typebox";
 import { THINKING_LEVELS } from "./agents/types.js";
 import { DelegationContractSchema } from "./delegation-contract.js";
 import { MAX_CONFIGURABLE_PARALLEL_TASKS, MAX_SUBAGENT_TIMEOUT_MS } from "./limits.js";
-import { PANEL_PRESETS } from "./panel-planning.js";
+import { PANEL_PRESETS } from "./panel-presets.js";
 import { SUBAGENT_RESULT_FORMATS } from "./result-contract.js";
 import { MAX_SUBAGENT_TOOL_CALLS, MAX_SUBAGENT_TURNS } from "./turn-budget.js";
 import { VerifiedExecutionContractSchema } from "./verified-execution-schema.js";

@@ -19,10 +19,12 @@ import {
   sleep,
   writeJsonFileAtomic,
 } from "#src/authority/forwarding-io";
+import type { TargetServingLookup } from "#src/authority/forwarding-liveness";
 import type { PermissionPromptDecision } from "#src/authority/permission-dialog";
 import {
   type ForwardedAccessFacts,
   type ForwardedPermissionRequest,
+  type ForwardedPermissionResponse,
   type ForwardedPromptDisplay,
   type ForwardedSessionApproval,
   PERMISSION_FORWARDING_POLL_INTERVAL_MS,
@@ -32,10 +34,10 @@ import {
   resolvePermissionForwardingTarget,
   SUBAGENT_PARENT_SESSION_ENV_CANDIDATES,
 } from "#src/authority/permission-forwarding";
-import type { ServingLookup } from "#src/authority/serving-registry";
 import type { SubagentSessionRegistry } from "#src/authority/subagent-registry";
 import { createPermissionRequestId } from "#src/permission-request-id";
 import { buildUiPrompt } from "#src/permission-ui-prompt";
+import type { PromptPayload } from "#src/presentation/prompt-payload";
 import type { DebugReviewLogger } from "#src/session-logger";
 import { toRecord } from "#src/value-guards";
 import type { TerminalAuthorizer } from "./authorizer";
@@ -68,7 +70,7 @@ function getContextSystemPrompt(ctx: ForwarderContext): string | undefined {
 
 /**
  * The facts a forwarded request relays unchanged from the child's ask: the
- * prompt message, the optional display projection, and the optional
+ * prompt payload, the optional display projection, and the optional
  * session-approval suggestion.
  *
  * Bundled into one object so the two-hop private chain
@@ -82,7 +84,8 @@ interface ForwardedRequestFacts {
    * decision instead of a third being minted here.
    */
   requestId: string;
-  message: string;
+  /** The child's complete prompt payload, relayed for the serving node to render. */
+  payload: PromptPayload;
   display?: ForwardedPromptDisplay;
   sessionApproval?: ForwardedSessionApproval;
   /** The child-fixed access facts; the edge completes them into a `ForwardedAccessIntent`. */
@@ -94,8 +97,8 @@ export interface ParentAuthorizerDeps {
   forwardingDir: string;
   /** In-process subagent session registry for forwarding target resolution. */
   registry?: SubagentSessionRegistry;
-  /** Whether the resolved target is draining its inbox (in-process targets only). */
-  serving: ServingLookup;
+  /** Whether the resolved target is draining its inbox, on whichever channel can say. */
+  serving: TargetServingLookup;
   /** How long to wait for the target's answer, read live so config edits apply. */
   getTimeoutMs: () => number;
   logger: DebugReviewLogger;
@@ -108,6 +111,9 @@ export interface ParentAuthorizerDeps {
  * `confirmationUnavailable` is what keeps this out of the "User denied …"
  * message (#719): a user who was never asked denied nothing. `denialReason`
  * names which path gave up, and the gate renders it to the model.
+ *
+ * The provenance record reuses that same string rather than restating it, so
+ * what the model is told and what the log attributes cannot drift (#726).
  */
 function abandon(denialReason: string): PermissionPromptDecision {
   return {
@@ -115,6 +121,31 @@ function abandon(denialReason: string): PermissionPromptDecision {
     state: "denied",
     confirmationUnavailable: true,
     denialReason,
+    decidedBy: { kind: "unavailable", reason: denialReason },
+  };
+}
+
+/**
+ * Adopt the responder's answer, recording the hop it came through.
+ *
+ * The requester's own terminal entry has to answer two questions, and they are
+ * different: *which session* answered, and *what within it* decided. Nesting
+ * keeps both rather than flattening the responder's source into this node's
+ * record, where it would read as a local decision (#726).
+ *
+ * A responder that sent no usable source yields `decision: null` — the hop is
+ * still a fact, and an older parent is not an error.
+ */
+function relayDecision(
+  response: ForwardedPermissionResponse,
+): PermissionPromptDecision {
+  return {
+    ...response,
+    decidedBy: {
+      kind: "forwarded",
+      responderSessionId: response.responderSessionId,
+      decision: response.decidedBy ?? null,
+    },
   };
 }
 
@@ -150,7 +181,7 @@ function forwardableRequestId(requesterRequestId: string): string {
 export class ParentAuthorizer implements TerminalAuthorizer {
   private readonly forwardingDir: string;
   private readonly registry: SubagentSessionRegistry | undefined;
-  private readonly serving: ServingLookup;
+  private readonly serving: TargetServingLookup;
   private readonly getTimeoutMs: () => number;
   private readonly logger: DebugReviewLogger;
 
@@ -171,7 +202,7 @@ export class ParentAuthorizer implements TerminalAuthorizer {
     const uiPrompt = buildUiPrompt(details);
     return this.waitForForwardedApproval(this.ctx, {
       requestId: details.requestId,
-      message: details.message,
+      payload: details.payload,
       display: {
         source: uiPrompt.source,
         surface: uiPrompt.surface,
@@ -300,7 +331,7 @@ export class ParentAuthorizer implements TerminalAuthorizer {
       requesterSessionId,
       targetSessionId,
       requesterAgentName,
-      message: facts.message,
+      payload: facts.payload,
       ...(facts.display
         ? {
             source: facts.display.source,
@@ -333,6 +364,7 @@ export class ParentAuthorizer implements TerminalAuthorizer {
           this.logger,
           responsePath,
         );
+        const relayed = response ? relayDecision(response) : null;
         this.logger.review("forwarded_permission.response_received", {
           requestId,
           approved: response?.approved ?? null,
@@ -341,10 +373,11 @@ export class ParentAuthorizer implements TerminalAuthorizer {
           responderSessionId: response?.responderSessionId ?? null,
           targetSessionId,
           responsePath,
+          decidedBy: relayed?.decidedBy,
         });
         this.discardRequest(location, requestPath, responsePath);
         return (
-          response ??
+          relayed ??
           abandon("The parent session's permission response could not be read")
         );
       }
@@ -354,11 +387,17 @@ export class ParentAuthorizer implements TerminalAuthorizer {
         unservedSince !== null &&
         Date.now() - unservedSince >= PERMISSION_FORWARDING_SERVING_GRACE_MS
       ) {
+        const observation = this.serving.describe(target);
         this.logger.review("forwarded_permission.no_serving_session", {
           requestId,
           requesterSessionId: request.requesterSessionId,
           targetSessionId,
-          servingSessionIds: this.serving.servingIds(),
+          // Which channel answered, and what it saw: the difference between a
+          // parent that exited, one that was killed, and one polling under a
+          // different session id is the whole diagnosis of a stalled forward.
+          servingChannel: observation.channel,
+          servingState: observation.state,
+          servingSessionIds: observation.servingIds,
         });
         this.discardRequest(location, requestPath);
         return abandon(
@@ -388,21 +427,17 @@ export class ParentAuthorizer implements TerminalAuthorizer {
   /**
    * Track how long the target has looked unserved, or `null` while it looks fine.
    *
-   * Only an in-process target (`source: "registry"`) can be judged: a target in
-   * another process shares no serving registry with this one, so its absence
-   * from the registry says nothing (#719, follow-up in #721).
+   * Which channel can answer for this target is the judge's decision, not this
+   * one's: a target it cannot judge answers `null`, which resets the window
+   * exactly as "serving" does, so an unjudgeable target waits out the timeout.
    */
   private checkServingLiveness(
     target: PermissionForwardingTarget,
     unservedSince: number | null,
   ): number | null {
-    if (target.source !== "registry") {
-      return null;
-    }
-    if (this.serving.isServing(target.sessionId)) {
-      return null;
-    }
-    return unservedSince ?? Date.now();
+    return this.serving.isServing(target) === false
+      ? (unservedSince ?? Date.now())
+      : null;
   }
 
   /**

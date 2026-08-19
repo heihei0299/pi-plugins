@@ -1,10 +1,8 @@
 import { getToolInputPath } from "#src/access-intent/tool-input-path";
 import type { PathNormalizer } from "#src/path-normalizer";
 import type { ScopedPermissionResolver } from "#src/permission-resolver";
-import { renderLegacyMessage } from "#src/presentation/legacy-message";
 import { buildPathAskPayload } from "#src/presentation/path-ask-payload";
 import { SessionApproval } from "#src/session-approval";
-import { deriveApprovalPattern } from "#src/session-rules";
 import type { ToolAccessExtractorLookup } from "#src/tool-access-extractor-registry";
 import type { GateDescriptor, GateResult } from "./descriptor";
 import { accessFactsFromPath } from "./helpers";
@@ -47,7 +45,7 @@ export function describePathGate(
 
   // Derive the approval pattern from the lexical absolute form so it matches
   // the policy values a later call produces.
-  const pattern = deriveApprovalPattern(accessPath.value());
+  const pattern = normalizer.approvalPatternFor(accessPath);
 
   const payload = buildPathAskPayload({
     toolName: tcc.toolName,
@@ -59,18 +57,11 @@ export function describePathGate(
   const descriptor: GateDescriptor = {
     surface: "path",
     input: { path: filePath },
-    denialContext: {
-      kind: "path",
-      toolName: tcc.toolName,
-      pathValue: filePath,
-      agentName: tcc.agentName ?? undefined,
-    },
+    payload,
     sessionApproval: SessionApproval.single("path", pattern),
     promptDetails: {
       source: "tool_call",
       agentName: tcc.agentName,
-      message: renderLegacyMessage(payload),
-      payload,
       toolCallId: tcc.toolCallId,
       toolName: tcc.toolName,
       path: filePath,

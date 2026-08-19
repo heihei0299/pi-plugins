@@ -1,8 +1,9 @@
 import { classifyToolKind } from "./access-intent/tool-kind";
 
-// NOTE: the ask prompts are now payload builders under src/presentation/;
-// denial text lives in denial-messages.ts. This module retains only the
-// pre-check reasons, which are agent-facing rather than user-facing.
+// NOTE: the ask prompts are now payload builders under src/presentation/, and
+// denial text is a render over the payload (presentation/agent-renderer.ts).
+// This module retains only the pre-check reasons, refused before any payload
+// exists to render.
 
 export function formatMissingToolNameReason(): string {
   return "Tool call was blocked because no tool name was provided. Use a registered tool name from pi.getAllTools().";

@@ -46,15 +46,15 @@ function workflowEffects(current: DelegationWorkflow, next: DelegationWorkflow):
 	if (blockingEnabled(current) !== blockingEnabled(next)) {
 		effects.push(
 			blockingEnabled(next)
-				? "Add blocking `subagent`, explicit `subagent_auto`, and read-only `subagent_consult`"
-				: "Remove blocking `subagent`, explicit `subagent_auto`, and read-only `subagent_consult`",
+				? "Add blocking `subagent` and read-only `subagent_consult`"
+				: "Remove blocking `subagent` and read-only `subagent_consult`",
 		);
 	}
 	if (asyncEnabled(current) !== asyncEnabled(next)) {
 		effects.push(
 			asyncEnabled(next)
-				? "Add reusable async lifecycle tools"
-				: "Remove reusable async lifecycle tools",
+				? "Add async `subagent_spawn`, `subagent_send`, `subagent_manage`, and `subagent_mailbox`"
+				: "Remove async `subagent_spawn`, `subagent_send`, `subagent_manage`, and `subagent_mailbox`",
 		);
 	}
 	return effects;

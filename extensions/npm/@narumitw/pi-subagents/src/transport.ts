@@ -1,4 +1,4 @@
-import type { ManagedAgent, TurnOutcome } from "./registry.js";
+import type { AgentMailboxMessage, ManagedAgent, TurnOutcome } from "./registry.js";
 import type { TransportProgressCallback } from "./transport-types.js";
 
 export interface SubagentTransport {
@@ -9,6 +9,7 @@ export interface SubagentTransport {
 		signal: AbortSignal,
 		onProgress?: TransportProgressCallback,
 	): Promise<TurnOutcome>;
+	deliverMessage?(agent: ManagedAgent, message: AgentMailboxMessage): Promise<boolean>;
 	release?(agent: ManagedAgent): Promise<void>;
 	shutdown?(): Promise<void>;
 }

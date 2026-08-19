@@ -24,12 +24,14 @@ export function formatStatefulAgentLine(agent: ManagedAgent, now = Date.now()): 
 	const transport = agent.telemetry?.transport ? ` transport:${agent.telemetry.transport}` : "";
 	const phase = agent.telemetry?.phase ? ` phase:${agent.telemetry.phase}` : "";
 	const queued = agent.telemetry?.queuePosition ? ` queue:${agent.telemetry.queuePosition}` : "";
-	return `${indent}${sanitizeStatusLine(agent.id, 128)} ${sanitizeStatusLine(agent.agent, 128)} ${agent.state} ${elapsedSeconds}s${thinking}${timeoutText}${idleText}${turnsText}${toolsText}${transport}${phase}${queued} unread:${unread} [${actions}]${task}`;
+	return `${indent}${sanitizeStatusLine(agent.taskPath ?? agent.id, 256)} (${sanitizeStatusLine(agent.id, 128)}) ${sanitizeStatusLine(agent.agent, 128)} ${agent.state} ${elapsedSeconds}s${thinking}${timeoutText}${idleText}${turnsText}${toolsText}${transport}${phase}${queued} unread:${unread} [${actions}]${task}`;
 }
 
 export function summarizeStatefulAgent(agent: ManagedAgent) {
 	return {
 		id: agent.id,
+		taskName: agent.taskName,
+		taskPath: agent.taskPath,
 		agent: agent.agent,
 		parentId: agent.parentId,
 		rootId: agent.rootId,

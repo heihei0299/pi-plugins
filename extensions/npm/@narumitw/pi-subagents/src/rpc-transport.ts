@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { RpcSessionState } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents/discovery.js";
 import type { AgentConfig, SubagentSettings } from "./agents/types.js";
+import { formatPeerMessage } from "./child-peer-tools.js";
 import {
 	buildCurrentTurnPrompt,
 	type ParentRuntimeSnapshot,
@@ -16,10 +17,16 @@ import {
 	DEFAULT_MAX_STDERR_BYTES,
 	truncateUtf8,
 } from "./limits.js";
+import {
+	CHILD_PEER_TOOL_NAMES,
+	childPeerBridgePath,
+	type PeerTransportRuntime,
+	peerBridgeEnvironment,
+} from "./peer-transport.js";
 import { type PiInvocation, resolvePiInvocation } from "./pi-invocation.js";
 import { resolvePiPromptResources } from "./prompt-resources.js";
 import { JsonLineDecoder } from "./protocol.js";
-import type { ManagedAgent, TurnOutcome } from "./registry.js";
+import type { AgentMailboxMessage, ManagedAgent, TurnOutcome } from "./registry.js";
 import { finalizeTimedOutRpcTurn } from "./rpc-timeout-finalization.js";
 import {
 	boundedError,
@@ -197,6 +204,10 @@ export class RpcProtocolClient {
 		await this.request({ type: "prompt", message }, timeoutMs);
 	}
 
+	async steer(message: string, timeoutMs?: number): Promise<void> {
+		await this.request({ type: "steer", message }, timeoutMs);
+	}
+
 	async abort(): Promise<void> {
 		await this.request(
 			{ type: "abort" },
@@ -365,6 +376,7 @@ export interface RpcTransportOptions {
 	defaultTimeoutMs?: number;
 	abortGraceMs?: number;
 	timeoutFinalizationMs?: number;
+	peerRuntime?: PeerTransportRuntime;
 }
 
 interface RpcChildRecord {
@@ -694,6 +706,13 @@ export class RpcTransport implements SubagentTransport {
 		}
 	}
 
+	async deliverMessage(agent: ManagedAgent, message: AgentMailboxMessage): Promise<boolean> {
+		const child = this.children.get(agent.id);
+		if (!child) return false;
+		await child.client.steer(formatPeerMessage(message));
+		return true;
+	}
+
 	async release(agent: ManagedAgent): Promise<void> {
 		await this.releaseById(agent.id);
 	}
@@ -732,41 +751,48 @@ export class RpcTransport implements SubagentTransport {
 			cleanupRolePrompt(temporaryPrompt);
 			throw abortError("RPC subagent start aborted");
 		}
-		const client = this.createClient({
-			cwd: agent.cwd,
-			abortTimeoutMs: this.options.abortGraceMs ?? ABORT_GRACE_MS,
-			terminationGraceMs: this.options.abortGraceMs ?? ABORT_GRACE_MS,
-			args: buildRpcArgs(
-				agent,
-				agentConfig,
-				this.options.getParentRuntime(),
-				temporaryPrompt?.filePath,
-				resources.appendSystemPromptPaths,
-			),
-			env: {
-				PI_SUBAGENT_DEPTH: String(
-					(Number.parseInt(process.env.PI_SUBAGENT_DEPTH ?? "0", 10) || 0) + 1,
-				),
-				PI_SUBAGENT_RPC_PROTOCOL: PI_SUBAGENTS_RPC_PROTOCOL,
-			},
-		});
+		let client: RpcProtocolClient | undefined;
 		try {
+			const credentials = this.options.peerRuntime
+				? await this.options.peerRuntime.issueCredentials(
+						agent.id,
+						agent.currentTurnGeneration ?? agent.turnGeneration ?? 1,
+					)
+				: undefined;
+			if (signal.aborted) throw abortError("RPC subagent start aborted");
+			client = this.createClient({
+				cwd: agent.cwd,
+				abortTimeoutMs: this.options.abortGraceMs ?? ABORT_GRACE_MS,
+				terminationGraceMs: this.options.abortGraceMs ?? ABORT_GRACE_MS,
+				args: buildRpcArgs(
+					agent,
+					agentConfig,
+					this.options.getParentRuntime(),
+					temporaryPrompt?.filePath,
+					resources.appendSystemPromptPaths,
+					credentials !== undefined,
+				),
+				env: {
+					PI_SUBAGENT_DEPTH: String(
+						(Number.parseInt(process.env.PI_SUBAGENT_DEPTH ?? "0", 10) || 0) + 1,
+					),
+					PI_SUBAGENT_RPC_PROTOCOL: PI_SUBAGENTS_RPC_PROTOCOL,
+					...(credentials ? peerBridgeEnvironment(credentials) : {}),
+				},
+			});
 			const snapshot = await client.start(signal);
+			if (signal.aborted) throw abortError("RPC subagent start aborted");
 			const record: RpcChildRecord = {
 				client,
 				state: snapshot.state,
 				started: false,
 				temporaryPrompt,
 			};
-			if (signal.aborted) {
-				await client.stop();
-				cleanupRolePrompt(temporaryPrompt);
-				throw abortError("RPC subagent start aborted");
-			}
 			this.children.set(agent.id, record);
 			return record;
 		} catch (error) {
-			await client.stop().catch(() => undefined);
+			await client?.stop().catch(() => undefined);
+			this.options.peerRuntime?.revoke(agent.id);
 			cleanupRolePrompt(temporaryPrompt);
 			throw error;
 		}
@@ -776,6 +802,7 @@ export class RpcTransport implements SubagentTransport {
 		const child = this.children.get(agentId);
 		if (!child) return;
 		this.children.delete(agentId);
+		this.options.peerRuntime?.revoke(agentId);
 		try {
 			await child.client.abort().catch(() => undefined);
 			await child.client.stop();
@@ -799,8 +826,10 @@ export function buildRpcArgs(
 	parentRuntime: ParentRuntimeSnapshot,
 	rolePromptPath?: string,
 	appendSystemPromptPaths: readonly string[] = [],
+	peerBridge = false,
 ): string[] {
 	const args = ["--mode", "rpc", "--no-session", "--no-extensions"];
+	if (peerBridge) args.push("-e", childPeerBridgePath());
 	const model =
 		agentConfig.model ??
 		(parentRuntime.model ? `${parentRuntime.model.provider}/${parentRuntime.model.id}` : undefined);
@@ -816,7 +845,8 @@ export function buildRpcArgs(
 	if (agent.target?.trust.projectTrusted ?? false) args.push("--approve");
 	else args.push("--no-approve");
 	if (Array.isArray(agentConfig.tools)) {
-		if (agentConfig.tools.length > 0) args.push("--tools", agentConfig.tools.join(","));
+		const tools = [...agentConfig.tools, ...(peerBridge ? CHILD_PEER_TOOL_NAMES : [])];
+		if (tools.length > 0) args.push("--tools", [...new Set(tools)].join(","));
 		else args.push("--no-tools");
 	}
 	for (const promptPath of appendSystemPromptPaths) {

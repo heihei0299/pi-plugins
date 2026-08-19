@@ -1,12 +1,13 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text, truncateToWidth, type KeyId } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { StringEnum, complete, type Api, type ImageContent, type Model, type TextContent } from "@earendil-works/pi-ai/compat";
+import { StringEnum, type ImageContent, type TextContent } from "@earendil-works/pi-ai/compat";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import { normalizeFetchContentParams } from "./fetch-params.ts";
 import { resolveAuthFetchProfile, type AuthFetchProfile } from "./auth-fetch.ts";
 import { findContent, type FindMode } from "./content-find.ts";
 import { answerFromPage } from "./page-query.ts";
+import { rewriteSearchQuery } from "./query-rewrite.ts";
 import { clearCloneCache } from "./github-extract.ts";
 import { getConfiguredSearchRouting, normalizeSearchProviderSelection, RESOLVED_SEARCH_PROVIDERS, SEARCH_PROVIDERS, search, type AttributedSearchResponse, type SearchProvider, type SearchProviderSelection, type ResolvedSearchProvider } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
@@ -46,6 +47,7 @@ import { isBrowserCookieAccessAllowed } from "./gemini-web-config.ts";
 import { isBraveAvailable } from "./brave.ts";
 import { isOpenAISearchAvailable } from "./openai-search.ts";
 import { isParallelAvailable } from "./parallel.ts";
+import { isParallelMcpAvailable } from "./parallel-mcp.ts";
 import { isTinyFishAvailable } from "./tinyfish.ts";
 import { isSearch1APIAvailable } from "./search1api.ts";
 import { isSearchinfinityAvailable } from "./searchinfinity.ts";
@@ -63,8 +65,10 @@ import { isAnySearchAvailable } from "./anysearch.ts";
 import { isXaiSearchAvailable } from "./xai-search.ts";
 import { isBrightDataAvailable } from "./brightdata.ts";
 import { isSerpBaseAvailable } from "./serpbase.ts";
+import { isSerperAvailable } from "./serper.ts";
+import { isValyuAvailable } from "./valyu.ts";
 import { buildSearchErrorPlan, type SearchErrorDetails, type SearchErrorPlan } from "./render-search-error.ts";
-import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns } from "./summary-model-scope.ts";
+import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns, splitThinkingSuffix } from "./summary-model-scope.ts";
 import {
 	buildResearchArtifact,
 	withClaimAssessment,
@@ -117,7 +121,9 @@ interface WebSearchConfig {
 	kagiApiKey?: unknown;
 	ollamaApiKey?: unknown;
 	serpbaseApiKey?: unknown;
+	serperApiKey?: unknown;
 	tinyfishApiKey?: unknown;
+	valyuApiKey?: unknown;
 	xaiApiKey?: unknown;
 	provider?: unknown;
 	searchProvider?: unknown;
@@ -151,6 +157,7 @@ interface ProviderAvailability {
 	openai: boolean;
 	brave: boolean;
 	parallel: boolean;
+	"parallel-mcp": boolean;
 	tinyfish: boolean;
 	search1api: boolean;
 	searchinfinity: boolean;
@@ -171,6 +178,8 @@ interface ProviderAvailability {
 	xai: boolean;
 	brightdata: boolean;
 	serpbase: boolean;
+	serper: boolean;
+	valyu: boolean;
 }
 
 type WebSearchWorkflow = "none" | "summary-review" | "auto-summary";
@@ -221,8 +230,6 @@ type ToolNames = {
 	fetchContent: string;
 	getSearchContent: string;
 };
-
-type ProviderHeaders = Record<string, string | null>;
 
 const DEFAULT_TOOL_NAMES: ToolNames = {
 	webSearch: "web_search",
@@ -382,6 +389,7 @@ async function getProviderAvailability(ctx: ExtensionContext): Promise<ProviderA
 		openai: await isOpenAISearchAvailable(ctx),
 		brave: isBraveAvailable(),
 		parallel: isParallelAvailable(),
+		"parallel-mcp": isParallelMcpAvailable(),
 		tinyfish: isTinyFishAvailable(),
 		search1api: isSearch1APIAvailable(),
 		searchinfinity: isSearchinfinityAvailable(),
@@ -402,10 +410,12 @@ async function getProviderAvailability(ctx: ExtensionContext): Promise<ProviderA
 		xai: await isXaiSearchAvailable(ctx),
 		brightdata: isBrightDataAvailable(),
 		serpbase: isSerpBaseAvailable(),
+		serper: isSerperAvailable(),
+		valyu: isValyuAvailable(),
 	};
 	return {
-		// DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase are explicit-only, so they never make `all` eligible.
-		all: Object.entries(providers).some(([provider, available]) => provider !== "duckduckgo" && provider !== "anysearch" && provider !== "xai" && provider !== "brightdata" && provider !== "serpbase" && provider !== "gemini" && available) || geminiApiAvail,
+		// Parallel MCP, DuckDuckGo, AnySearch, xAI, Bright Data, SerpBase, Serper, and Valyu are explicit-only, so they never make `all` eligible.
+		all: Object.entries(providers).some(([provider, available]) => provider !== "parallel-mcp" && provider !== "duckduckgo" && provider !== "anysearch" && provider !== "xai" && provider !== "brightdata" && provider !== "serpbase" && provider !== "serper" && provider !== "valyu" && provider !== "gemini" && available) || geminiApiAvail,
 		...providers,
 	};
 }
@@ -974,10 +984,15 @@ export default function (pi: ExtensionAPI) {
 				} satisfies StoredSearchData & { type: "fetch"; urls: ExtractedContent[] };
 				pi.appendEntry("web-search-results", storeFetchedContentResult(fetchId, data));
 				const ok = fetched.filter(f => !f.error).length;
+				const availability = ok === fetched.length
+					? "Full page content now available."
+					: ok > 0
+						? "Partial page content now available."
+						: "No page content was fetched. Stored fetch diagnostics are available.";
 				pi.sendMessage(
 					{
 						customType: "web-search-content-ready",
-						content: `Content fetched for ${ok}/${fetched.length} URLs [${fetchId}]. Full page content now available.`,
+						content: `Content fetched for ${ok}/${fetched.length} URLs [${fetchId}]. ${availability}`,
 						display: true,
 					},
 					{ triggerTurn: true },
@@ -1088,47 +1103,6 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	async function resolveFirstAvailableModel(
-		ctx: SummaryGenerationContext,
-		candidates: Array<{ provider: string; id: string }>,
-	): Promise<{ model: Model<Api>; apiKey: string; headers?: ProviderHeaders }> {
-		const enabledModelPatterns = loadEnabledModelPatterns(ctx);
-		for (const { provider, id } of candidates) {
-			const model = findModelWithProviderRouting(ctx.modelRegistry, provider, id);
-			if (!model || !modelMatchesEnabledPatterns(model, enabledModelPatterns)) continue;
-			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			if (auth.ok && auth.apiKey) return { model, apiKey: auth.apiKey, headers: auth.headers };
-		}
-		throw new Error(`No enabled model available: ${candidates.map(c => `${c.provider}/${c.id}`).join(", ")}`);
-	}
-
-	async function rewriteSearchQuery(query: string, ctx: SummaryGenerationContext, signal: AbortSignal): Promise<string> {
-		const { model, apiKey, headers } = await resolveFirstAvailableModel(ctx, [
-			{ provider: "anthropic", id: "claude-haiku-4-5" },
-			{ provider: "google", id: "gemini-3.6-flash" },
-			{ provider: "openai", id: "gpt-4.1-mini" },
-		]);
-		const response = await complete(
-			model,
-			{
-				messages: [{
-					role: "user",
-					content: [{ type: "text", text: `Rewrite this web search query to get better, more specific results. Add relevant year qualifiers, precise technical terms, and specificity. Return ONLY the improved query text, nothing else.\n\nQuery: ${query}` }],
-					timestamp: Date.now(),
-				}],
-			},
-			{ apiKey, headers, signal },
-		);
-		if (response.stopReason === "aborted") throw new Error("Aborted");
-		const contentParts = Array.isArray(response.content) ? response.content : [];
-		const text = contentParts
-			.map(part => part.type === "text" ? part.text : "")
-			.join("")
-			.trim();
-		if (!text) throw new Error("Rewrite returned empty response");
-		return text;
-	}
-
 	async function generateSummaryForSelectedIndices(
 		selectedQueryIndices: number[],
 		resultsByIndex: Map<number, QueryResultData>,
@@ -1211,20 +1185,30 @@ export default function (pi: ExtensionAPI) {
 		const configuredSummaryModel = typeof config.summaryModel === "string" ? config.summaryModel.trim() : "";
 		const preferredDefaults = [
 			{ provider: "anthropic", id: "claude-haiku-4-5" },
-			{ provider: "openai-codex", id: "gpt-5.3-codex-spark" },
+			{ provider: "openai-codex", id: "gpt-5.6-luna" },
+			{ provider: "openai-codex", id: "gpt-5.6-terra" },
+			{ provider: "google", id: "gemini-3.6-flash" },
+			{ provider: "openai", id: "gpt-5-mini" },
+			{ provider: "deepseek", id: "deepseek-v4-flash" },
 		];
 
 		const resolveAvailableModelValue = (selector: string): string | null => {
-			const slashIndex = selector.indexOf("/");
-			if (slashIndex <= 0 || slashIndex >= selector.length - 1) return null;
+			const parsed = splitThinkingSuffix(selector);
+			const slashIndex = parsed.value.indexOf("/");
+			if (slashIndex <= 0 || slashIndex >= parsed.value.length - 1) return null;
 			const model = findModelWithProviderRouting(
 				summaryContext.modelRegistry,
-				selector.slice(0, slashIndex),
-				selector.slice(slashIndex + 1),
+				parsed.value.slice(0, slashIndex),
+				parsed.value.slice(slashIndex + 1),
 			);
 			if (!model) return null;
 			const value = `${model.provider}/${model.id}`;
-			return availableValues.has(value) ? value : null;
+			if (!availableValues.has(value)) return null;
+			if (selector !== value && !seen.has(selector)) {
+				seen.add(selector);
+				summaryModels.push({ value: selector, label: selector });
+			}
+			return selector;
 		};
 
 		let defaultSummaryModel: string | null = null;
@@ -1661,7 +1645,7 @@ export default function (pi: ExtensionAPI) {
 		name: toolNames.webSearch,
 		label: "Web Search",
 		description:
-			`Search the web using OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Bocha, Ollama, SearXNG, DuckDuckGo, Exa, Perplexity, Gemini, AnySearch, xAI, Bright Data, or SerpBase. Pass a provider array to search only those providers simultaneously, or use provider "all" to search every eligible provider except DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase. Returns an AI-synthesized answer with source citations. OpenAI search uses a Codex subscription or OpenAI API key; xAI search uses a SuperGrok/X Premium subscription or xAI API key. DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase are available only when explicitly selected. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. The configured provider is used when provider is omitted or set to auto; omit provider unless explicitly overriding it. Without a configured provider, auto-selects OpenAI when suitable and available, then Exa, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Bocha, Ollama, Perplexity, Gemini API, or Gemini Web. When SearXNG is configured, it is preferred first for local/private search.`,
+			`Search the web using OpenAI, Brave, Parallel, Parallel MCP, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Bocha, Ollama, SearXNG, DuckDuckGo, Exa, Perplexity, Gemini, AnySearch, Valyu, xAI, Bright Data, SerpBase, or Serper. Pass a provider array to search only those providers simultaneously, or use provider "all" to search every eligible provider except Parallel MCP, DuckDuckGo, AnySearch, Valyu, xAI, Bright Data, SerpBase, and Serper. Returns an AI-synthesized answer with source citations. OpenAI search uses a Codex subscription or OpenAI API key; xAI search uses a SuperGrok/X Premium subscription or xAI API key. Parallel MCP, DuckDuckGo, AnySearch, Valyu, xAI, Bright Data, SerpBase, and Serper are available only when explicitly selected. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. The configured provider is used when provider is omitted or set to auto; omit provider unless explicitly overriding it. Without a configured provider, auto-selects OpenAI when suitable and available, then Exa, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Bocha, Ollama, Perplexity, Gemini API, or Gemini Web. When SearXNG is configured, it is preferred first for local/private search.`,
 		promptSnippet:
 			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage. Omit provider unless explicitly overriding the configured default.",
 		parameters: Type.Object({
@@ -1673,7 +1657,7 @@ export default function (pi: ExtensionAPI) {
 				StringEnum(["day", "week", "month", "year"], { description: "Filter by recency" }),
 			),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
-			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; use all to search every eligible provider except DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase, omit this field to use the configured provider, or use auto when none is configured")),
+			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; use all to search every eligible provider except Parallel MCP, DuckDuckGo, AnySearch, xAI, Bright Data, SerpBase, Serper, and Valyu, omit this field to use the configured provider, or use auto when none is configured")),
 			workflow: Type.Optional(
 				StringEnum(["none", "summary-review", "auto-summary"], {
 					description: "Search workflow mode: none = no curator, summary-review = open curator with auto summary draft (default), auto-summary = generate summary without opening curator",
@@ -2241,7 +2225,7 @@ export default function (pi: ExtensionAPI) {
 			fetchContent: Type.Optional(Type.Boolean({ description: "Fetch up to 5 result pages for exact passage extraction." })),
 			recencyFilter: Type.Optional(StringEnum(["day", "week", "month", "year"], { description: "Filter by recency." })),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains; prefix with - to exclude." })),
-			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; all searches every eligible provider except DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase")),
+			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; all searches every eligible provider except DuckDuckGo, AnySearch, xAI, Bright Data, SerpBase, Serper, and Valyu")),
 		}),
 		async execute(_callId, params, signal, _onUpdate, ctx) {
 			const claim = typeof params.claim === "string" ? params.claim.trim() : "";

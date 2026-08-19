@@ -1,9 +1,10 @@
-import { describeBashCommandContext } from "#src/denial-messages";
-import { fitLinesToWidth } from "#src/presentation/line-fitting";
 import {
-  allEvidence,
-  type PromptPayload,
-} from "#src/presentation/prompt-payload";
+  describeBashCommandContext,
+  flaggedElements,
+  valueLabel,
+} from "#src/presentation/fact-vocabulary";
+import { fitLinesToWidth } from "#src/presentation/line-fitting";
+import type { PromptPayload } from "#src/presentation/prompt-payload";
 
 /**
  * Render a {@link PromptPayload} for a human deciding an ask (ADR 0011 §5).
@@ -31,7 +32,7 @@ export function renderPromptDialog(
   );
   const blocks = layout(
     [...core, ...evidence],
-    flaggedTexts(payload),
+    flaggedElements(payload),
     paint,
   ).map((block) => fitLinesToWidth(block, budget.width));
   const fitted = fitToRows(
@@ -121,21 +122,6 @@ export function completeViewBudget(width: number): DialogBudget {
 }
 
 const plainText: HighlightPaint = (text) => text;
-
-/**
- * What the ask is flagging.
- *
- * The decision-relevant value for every shape but one: a bash ask that escaped
- * the working directory flags the paths it referenced, not the command that
- * referenced them — the command is the context, and the paths are what the
- * operator is ruling on.
- */
-function flaggedTexts(payload: PromptPayload): string[] {
-  if (payload.kind === "bash_external_directory") {
-    return allEvidence(payload, "external path").map((entry) => entry.text);
-  }
-  return payload.request.value === "" ? [] : [payload.request.value];
-}
 
 /** One rendered fact. */
 interface Fact {
@@ -242,9 +228,7 @@ function coreFacts(payload: PromptPayload): Fact[] {
   if (request.executedUnit !== null) {
     facts.push({ label: "runs", text: request.executedUnit });
   }
-  const context = describeBashCommandContext(
-    request.commandContext ?? undefined,
-  );
+  const context = describeBashCommandContext(request.commandContext);
   if (context !== undefined) {
     facts.push({ label: "context", text: context });
   }
@@ -291,46 +275,6 @@ function toolText(payload: PromptPayload): string {
   return invokedToolName === null
     ? String(toolName)
     : `${String(toolName)} (invoked as ${invokedToolName})`;
-}
-
-/** What the decision-relevant value is called, per ask shape. */
-function valueLabel(payload: PromptPayload): string {
-  switch (payload.kind) {
-    case "bash":
-    case "bash_external_directory":
-      return "command";
-    case "mcp":
-      return "target";
-    case "tool":
-      return "tool";
-    case "path":
-    case "external_directory":
-      return "path";
-    case "skill":
-    case "skill_read":
-      return "skill";
-    case "forwarded":
-      return forwardedValueLabel(payload.request.surface);
-  }
-}
-
-/**
- * A forwarded request carries the child's *display* projection — its tool name
- * as the surface — rather than the child's own payload, so the label is
- * inferred from it and falls back to a neutral one.
- *
- * Dissolves when the payload replaces `message` on the wire (#745): the
- * serving node will then hold the child's real `kind`.
- */
-function forwardedValueLabel(surface: string): string {
-  switch (surface) {
-    case "bash":
-      return "command";
-    case "skill":
-      return "skill";
-    default:
-      return "value";
-  }
 }
 
 /**

@@ -1,14 +1,15 @@
 import type { AskEscalator } from "#src/authority/authorizer-selection";
 import type { PermissionPromptDecision } from "#src/authority/permission-dialog";
 import type { DecisionReporter } from "#src/decision-reporter";
-import {
-  formatDenyReason,
-  formatUnavailableReason,
-  formatUserDeniedReason,
-} from "#src/denial-messages";
 import { applyPermissionGate } from "#src/permission-gate";
 import { createPermissionRequestId } from "#src/permission-request-id";
 import type { ScopedPermissionResolver } from "#src/permission-resolver";
+import {
+  renderPolicyDenial,
+  renderUnavailableDenial,
+  renderUserDenial,
+} from "#src/presentation/agent-renderer";
+import { renderReviewLogFacts } from "#src/presentation/review-log-renderer";
 import type { SessionApprovalRecorder } from "#src/session-approval-recorder";
 import type { PermissionCheckResult } from "#src/types";
 import type {
@@ -65,6 +66,7 @@ export class GateRunner {
         this.reporter.writeReviewLog(gate.log.event, {
           ...gate.log.details,
           requestId,
+          decidedBy: gate.decidedBy,
         });
       }
       if (gate.decision) {
@@ -111,8 +113,21 @@ export class GateRunner {
     }
 
     // The fields every review-log write for this gate shares, whatever the
-    // resolution — built once so a field added here reaches all of them.
-    const logContext = { ...descriptor.logContext, agentName, requestId };
+    // resolution — built once so a field added here reaches all of them. The
+    // payload's request facts are stamped here rather than by each gate, for
+    // the same reason `requestId` is: a gate cannot forget what it never
+    // supplies (ADR 0011 §6).
+    const logContext = {
+      ...descriptor.logContext,
+      ...renderReviewLogFacts(descriptor.payload),
+      agentName,
+      requestId,
+    };
+
+    // Each resolution below states its own decider. The provenance is built
+    // at the branch that decides rather than merged into `logContext`: that
+    // context holds what every resolution of this gate shares, and who decided
+    // is by definition not shared (#726).
 
     // 2. Session-hit fast path
     if (check.source === "session") {
@@ -120,6 +135,11 @@ export class GateRunner {
         ...logContext,
         resolution: "session_approved",
         sessionApprovalPattern: check.matchedPattern,
+        decidedBy: {
+          kind: "session_approval",
+          surface: descriptor.surface,
+          pattern: check.matchedPattern ?? null,
+        },
       });
       this.emitDecision(
         requestId,
@@ -143,6 +163,9 @@ export class GateRunner {
       this.reporter.writeReviewLog("permission_request.auto_approved", {
         ...logContext,
         resolution: "auto_approved",
+        // The pattern that raised the ask, sentinel included: "yolo allowed
+        // it" alone does not say why it was asked in the first place.
+        decidedBy: { kind: "yolo", pattern: check.matchedPattern ?? null },
       });
       this.emitDecision(
         requestId,
@@ -160,16 +183,16 @@ export class GateRunner {
     // 3. Apply the deny/ask/allow gate — always escalate on ask; the selected
     // Authorizer answers (the DenyingAuthorizer by denying with a marker).
 
-    // Construct messages from the centralized formatter.
+    // The agent-facing renders of this ask. The rule reason is the operator's
+    // deny-with-reason text, which lives on the resolved check rather than the
+    // payload: no human render wants it, because a deny never prompts.
+    const { payload } = descriptor;
     const messages = {
-      denyReason: formatDenyReason(descriptor.denialContext),
+      denyReason: renderPolicyDenial(payload, check.reason ?? null),
       unavailableReason: (decision: PermissionPromptDecision) =>
-        formatUnavailableReason(
-          descriptor.denialContext,
-          decision.denialReason,
-        ),
+        renderUnavailableDenial(payload, decision.denialReason ?? null),
       userDeniedReason: (decision: PermissionPromptDecision) =>
-        formatUserDeniedReason(descriptor.denialContext, decision.denialReason),
+        renderUserDenial(payload, decision.denialReason ?? null),
     };
 
     let autoApproved = false;
@@ -180,6 +203,7 @@ export class GateRunner {
       promptForApproval: async () => {
         const decision = await this.prompter.escalate({
           requestId,
+          payload,
           ...descriptor.promptDetails,
           ...(descriptor.sessionApproval
             ? { sessionApproval: descriptor.sessionApproval.toForwardedData() }
@@ -192,6 +216,12 @@ export class GateRunner {
       writeLog: (event, details) =>
         this.reporter.writeReviewLog(event, details),
       logContext,
+      decidedByRule: {
+        kind: "rule",
+        surface: descriptor.surface,
+        pattern: check.matchedPattern ?? null,
+        origin: check.origin,
+      },
       messages,
     });
 

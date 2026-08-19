@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CompletionDelivery } from "./agents/types.js";
+import { SUBAGENT_COMPLETION_MESSAGE_TYPE } from "./completion-render.js";
 import { redactPrivateText } from "./context.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, MAX_TOOL_MESSAGE_BYTES, truncateUtf8 } from "./limits.js";
 import type { AgentTurnCompletion, ManagedAgent } from "./registry.js";
@@ -16,7 +17,10 @@ interface CompletionMetadata {
 	runId: string;
 	generation: number;
 	agentId: string;
+	taskPath?: string;
+	recipientPath?: string;
 	agent: string;
+	task: string;
 	state: string;
 	transport?: string;
 	structuredResult?: ManagedAgent["structuredResult"];
@@ -25,7 +29,7 @@ interface CompletionMetadata {
 }
 
 interface CompletionMessage {
-	customType: "pi-subagent-completion";
+	customType: typeof SUBAGENT_COMPLETION_MESSAGE_TYPE;
 	content: string;
 	display: true;
 	details:
@@ -107,7 +111,11 @@ export class CompletionDeliveryBroker {
 			if (triggerTurn) this.wakeInFlight = true;
 			this.awaitingParentAck.push(...batch);
 			try {
-				this.pi.sendMessage(message, { deliverAs: "steer", triggerTurn });
+				// Pi treats explicit false as immediate insertion instead of queued steering while streaming.
+				this.pi.sendMessage(message, {
+					deliverAs: "steer",
+					...(triggerTurn ? { triggerTurn: true } : {}),
+				});
 			} catch (primaryError) {
 				this.removeAwaiting(batch);
 				if (triggerTurn) this.wakeInFlight = false;
@@ -202,7 +210,8 @@ function completionIdsFromContext(messages: readonly unknown[]): Set<string> {
 	for (const message of messages) {
 		if (!message || typeof message !== "object" || Array.isArray(message)) continue;
 		const record = message as Record<string, unknown>;
-		if (record.role !== "custom" || record.customType !== "pi-subagent-completion") continue;
+		if (record.role !== "custom" || record.customType !== SUBAGENT_COMPLETION_MESSAGE_TYPE)
+			continue;
 		const details = record.details;
 		if (!details || typeof details !== "object" || Array.isArray(details)) continue;
 		const metadata = details as Record<string, unknown>;
@@ -236,7 +245,7 @@ function buildCompletionMessage(completions: AgentTurnCompletion[]): CompletionM
 	if (completions.length === 1) {
 		const completion = completions[0];
 		return {
-			customType: "pi-subagent-completion",
+			customType: SUBAGENT_COMPLETION_MESSAGE_TYPE,
 			content: buildDetachedCompletionMessage(completion),
 			display: true,
 			details: completionMetadata(completion),
@@ -256,7 +265,7 @@ function buildCompletionMessage(completions: AgentTurnCompletion[]): CompletionM
 		DEFAULT_MAX_CONTEXT_BYTES,
 	).text;
 	return {
-		customType: "pi-subagent-completion",
+		customType: SUBAGENT_COMPLETION_MESSAGE_TYPE,
 		content,
 		display: true,
 		details: {
@@ -273,7 +282,10 @@ function completionMetadata(completion: AgentTurnCompletion): CompletionMetadata
 		runId: completion.runId,
 		generation: completion.generation,
 		agentId: completion.agent.id,
+		...(completion.agent.taskPath ? { taskPath: completion.agent.taskPath } : {}),
+		...(completion.recipientPath ? { recipientPath: completion.recipientPath } : {}),
 		agent: completion.agent.agent,
+		task: sanitizeCompletionLine(completion.task, 256) || "(unknown task)",
 		state: completion.agent.state,
 		...(completion.agent.telemetry?.transport
 			? { transport: completion.agent.telemetry.transport }
@@ -306,6 +318,8 @@ export function buildDetachedCompletionMessage(completion: AgentTurnCompletion):
 			`Run ID: ${completion.runId}`,
 			`Generation: ${completion.generation}`,
 			`Agent ID: ${completion.agent.id}`,
+			...(completion.agent.taskPath ? [`Agent Path: ${completion.agent.taskPath}`] : []),
+			...(completion.recipientPath ? [`Recipient Path: ${completion.recipientPath}`] : []),
 			`Agent: ${agentName}`,
 			`Task: ${task}`,
 			`State: ${completion.agent.state}`,

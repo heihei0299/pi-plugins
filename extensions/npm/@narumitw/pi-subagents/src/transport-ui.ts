@@ -148,12 +148,6 @@ export function responsivenessSetupScreen(runtime: TransportUiRuntime) {
 				description: "Choose separately whether an idle root resumes for synthesis",
 				to: "settings" as const,
 			},
-			{
-				id: "thinking",
-				label: "Thinking profiles",
-				description: "Preview explicit Fast, Balanced, or Deep per-agent defaults",
-				to: "execution-profiles" as const,
-			},
 			{ id: "back", label: "Back", action: "back" as const },
 		],
 		hint: "back" as const,

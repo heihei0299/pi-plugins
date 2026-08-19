@@ -1,10 +1,8 @@
 import { getToolInputPath } from "#src/access-intent/tool-input-path";
 import type { PathNormalizer } from "#src/path-normalizer";
 import type { ScopedPermissionResolver } from "#src/permission-resolver";
-import { renderLegacyMessage } from "#src/presentation/legacy-message";
 import { buildExternalDirectoryAskPayload } from "#src/presentation/path-ask-payload";
 import { SessionApproval } from "#src/session-approval";
-import { deriveApprovalPattern } from "#src/session-rules";
 import type { ToolAccessExtractorLookup } from "#src/tool-access-extractor-registry";
 import type { GateResult } from "./descriptor";
 import { resolveExternalDirectoryPolicy } from "./external-directory-policy";
@@ -46,6 +44,8 @@ export function describeExternalDirectoryGate(
   if (normalizer.isInfrastructureRead(tcc.toolName, accessPath, infraDirs)) {
     return {
       action: "allow",
+      // Containment allowed this, not a rule the operator wrote.
+      decidedBy: { kind: "infrastructure_read" },
       log: {
         event: "permission_request.infrastructure_auto_allowed",
         details: {
@@ -77,7 +77,7 @@ export function describeExternalDirectoryGate(
     resolver,
     tcc.agentName ?? undefined,
   );
-  const pattern = deriveApprovalPattern(accessPath.value());
+  const pattern = normalizer.approvalPatternFor(accessPath);
 
   const payload = buildExternalDirectoryAskPayload({
     toolName: tcc.toolName,
@@ -87,26 +87,16 @@ export function describeExternalDirectoryGate(
     agentName: tcc.agentName,
     matchedPattern: preCheck.matchedPattern,
   });
-  const extDirMessage = renderLegacyMessage(payload);
 
   return {
     surface: "external_directory",
     input: {},
     preCheck,
-    denialContext: {
-      kind: "external_directory",
-      toolName: tcc.toolName,
-      pathValue: externalDirectoryPath,
-      resolvedPath: resolvedAlias,
-      cwd: tcc.cwd,
-      agentName: tcc.agentName ?? undefined,
-    },
+    payload,
     sessionApproval: SessionApproval.single("external_directory", pattern),
     promptDetails: {
       source: "tool_call",
       agentName: tcc.agentName,
-      message: extDirMessage,
-      payload,
       toolCallId: tcc.toolCallId,
       toolName: tcc.toolName,
       path: externalDirectoryPath,
@@ -118,7 +108,6 @@ export function describeExternalDirectoryGate(
       toolName: tcc.toolName,
       agentName: tcc.agentName,
       path: externalDirectoryPath,
-      message: extDirMessage,
     },
     decision: {
       surface: "external_directory",

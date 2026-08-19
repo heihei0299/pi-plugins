@@ -8,6 +8,8 @@
  * removed or renamed without a semver-major version bump.
  */
 
+import type { PromptRequestFacts } from "#src/presentation/prompt-payload";
+
 /** Minimal event bus interface required by the emit helpers. */
 export interface PermissionEventBus {
   emit(channel: string, data: unknown): void;
@@ -79,8 +81,19 @@ export interface PermissionUiPromptEvent {
   value: string | null;
   /** Agent name (when known). */
   agentName: string | null;
-  /** Message displayed to the user. */
-  message: string;
+  /**
+   * The ask's invariant core (ADR 0011 §3), verbatim from the prompt payload.
+   *
+   * Nested rather than flattened so the event and the payload share one shape:
+   * a fact added to `PromptRequestFacts` reaches the bus without a second
+   * hand-maintained declaration. Carries no evidence and no annotations — the
+   * bus is the narrowest renderer (ADR 0011 §6), observable by any loaded
+   * extension without the operator having named it.
+   *
+   * `request.surface` is the *gate* surface the rule fired on; the top-level
+   * `surface` is the display projection. Both are here on purpose.
+   */
+  request: PromptRequestFacts;
   /** Forwarding context, or null for a direct prompt. */
   forwarding: ForwardedPromptContext | null;
 }
@@ -97,7 +110,9 @@ export type PermissionDecisionResolution =
   | "user_approved_for_session"
   | "user_denied"
   | "auto_approved"
-  | "confirmation_unavailable";
+  | "confirmation_unavailable"
+  /** The gate threw, or an escalation failed, and the request was blocked. */
+  | "gate_error";
 
 /** Payload emitted on `permissions:decision`. */
 export interface PermissionDecisionEvent {
@@ -121,6 +136,16 @@ export interface PermissionDecisionEvent {
   agentName: string | null;
   /** Matched pattern from the winning rule (when available). */
   matchedPattern: string | null;
+  /**
+   * Forwarding context for a decision this session made while serving another
+   * session's forwarded request; absent on an ordinary local decision.
+   *
+   * The same `ForwardedPromptContext` the request's `permissions:ui_prompt`
+   * carried, so a consumer that never saw the prompt can still tell a served
+   * ask from a local one. Requester identity beyond it — the requester's cwd
+   * and principal — stays off the bus.
+   */
+  forwarding?: ForwardedPromptContext | null;
 }
 
 // ── Emit helpers ───────────────────────────────────────────────────────────

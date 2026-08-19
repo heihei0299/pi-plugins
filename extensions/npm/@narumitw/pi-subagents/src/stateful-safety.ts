@@ -3,53 +3,8 @@ import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents/discovery.js";
 import type { AgentScope, SubagentSettings } from "./agents/types.js";
-import type { AgentRegistry, ManagedAgent } from "./registry.js";
 import { safeTerminalLine } from "./safe-text.js";
 import { readSubagentSettings } from "./settings.js";
-
-export function assertNoSharedWriteConflict(
-	registry: AgentRegistry,
-	agentName: string,
-	cwd: string,
-	scope: AgentScope,
-	settings?: SubagentSettings,
-): void {
-	const agents = discoverAgents(cwd, scope, settings ?? readSubagentSettings()).agents;
-	const requested = agents.find((agent) => agent.name === agentName);
-	if (!isWriteCapable(requested?.tools)) return;
-	for (const active of registry.list()) {
-		if (
-			!isSameCwd(active.cwd, cwd) ||
-			(active.state !== "running" && active.state !== "starting")
-		) {
-			continue;
-		}
-		const activeConfig = agents.find((agent) => agent.name === active.agent);
-		if (isWriteCapable(activeConfig?.tools)) {
-			throw new Error(
-				`Write-capable subagent ${active.id} is already active in shared workspace ${cwd}. ` +
-					"Prefer one subagent_spawn covering combined asynchronous work. Use the blocking subagent parallel mode only when concurrent synchronous outputs justify making the main agent unavailable. Otherwise let the active agent finish or close it; set allowConcurrentWrites only when overlapping writes are knowingly safe, or use workspaceMode worktree when repository isolation is needed.",
-			);
-		}
-	}
-}
-
-export function assertFollowUpWriteAllowed(
-	registry: AgentRegistry,
-	agent: ManagedAgent,
-	allowConcurrentWrites: boolean,
-	isolatedWorkspace: boolean,
-	settings?: SubagentSettings,
-): void {
-	if (allowConcurrentWrites || isolatedWorkspace) return;
-	assertNoSharedWriteConflict(
-		registry,
-		agent.agent,
-		agent.cwd,
-		agent.agentScope ?? "user",
-		settings,
-	);
-}
 
 export function isWriteCapable(tools: string[] | undefined): boolean {
 	if (!tools) return true;

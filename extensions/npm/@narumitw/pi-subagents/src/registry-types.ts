@@ -36,6 +36,8 @@ export interface AgentTurn {
 
 export interface PersistedAgentCompletion {
 	completionId: string;
+	recipientId?: string;
+	recipientPath?: string;
 	runId: string;
 	generation: number;
 	task: string;
@@ -52,10 +54,13 @@ export interface AgentMailboxMessage {
 	createdAt: number;
 	readAt?: number;
 	deduplicationKey?: string;
+	completionId?: string;
 }
 
 export interface ManagedAgent {
 	id: string;
+	taskName?: string;
+	taskPath?: string;
 	agent: string;
 	parentId?: string;
 	rootId: string;
@@ -108,6 +113,8 @@ export interface ManagedAgent {
 
 export interface AgentRunInspectionSummary {
 	id: string;
+	taskName?: string;
+	taskPath?: string;
 	agent: string;
 	state: AgentLifecycleState;
 	createdAt: number;

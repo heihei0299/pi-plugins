@@ -13,6 +13,7 @@ import type { ManagedAgent } from "./registry.js";
 import { parseAnyStructuredSubagentResult, SUBAGENT_RESULT_FORMATS } from "./result-contract.js";
 import { isSemanticSnapshot } from "./semantic-snapshot.js";
 import { resolveStatefulLimits } from "./stateful-limits.js";
+import { validateTaskName, validateTaskPath } from "./task-path.js";
 import { copyTurnTerminationReport, type TurnTerminationReport } from "./timeout-checkpoint.js";
 import { MAX_SUBAGENT_TOOL_CALLS, MAX_SUBAGENT_TURNS } from "./turn-budget.js";
 
@@ -239,6 +240,8 @@ function isStoredState(value: unknown): value is StoredState {
 		const record = agent as Partial<ManagedAgent>;
 		return (
 			typeof record.id === "string" &&
+			(record.taskName === undefined || isValidTaskName(record.taskName)) &&
+			(record.taskPath === undefined || isValidTaskPath(record.taskPath)) &&
 			typeof record.agent === "string" &&
 			typeof record.cwd === "string" &&
 			typeof record.createdAt === "number" &&
@@ -289,6 +292,24 @@ function isStoredState(value: unknown): value is StoredState {
 				(Array.isArray(record.mailbox) && record.mailbox.every(isMailboxMessage)))
 		);
 	});
+}
+
+function isValidTaskName(value: unknown): value is string {
+	if (typeof value !== "string") return false;
+	try {
+		return validateTaskName(value) === value;
+	} catch {
+		return false;
+	}
+}
+
+function isValidTaskPath(value: unknown): value is string {
+	if (typeof value !== "string") return false;
+	try {
+		return validateTaskPath(value) === value;
+	} catch {
+		return false;
+	}
 }
 
 function isSemanticCompatibility(value: unknown): boolean {
@@ -434,6 +455,9 @@ function isPersistedCompletion(
 		typeof completion.completionId === "string" &&
 		completion.completionId.length > 0 &&
 		completion.completionId.length <= 256 &&
+		(completion.recipientId === undefined ||
+			(typeof completion.recipientId === "string" && completion.recipientId.length > 0)) &&
+		(completion.recipientPath === undefined || isValidTaskPath(completion.recipientPath)) &&
 		typeof completion.runId === "string" &&
 		completion.runId.length > 0 &&
 		completion.runId.length <= 256 &&
@@ -483,6 +507,7 @@ function isMailboxMessage(value: unknown): boolean {
 		Number.isFinite(message.createdAt) &&
 		(message.readAt === undefined ||
 			(typeof message.readAt === "number" && Number.isFinite(message.readAt))) &&
-		(message.deduplicationKey === undefined || typeof message.deduplicationKey === "string")
+		(message.deduplicationKey === undefined || typeof message.deduplicationKey === "string") &&
+		(message.completionId === undefined || typeof message.completionId === "string")
 	);
 }

@@ -7,6 +7,7 @@ export const MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH = 256;
 
 export interface CanonicalSpawnRequest {
 	agent: string;
+	taskName?: string;
 	task: string;
 	cwd: string;
 	agentScope: AgentScope;
@@ -29,6 +30,7 @@ export function hashSpawnRequest(request: CanonicalSpawnRequest): string {
 		.update(
 			JSON.stringify({
 				agent: request.agent,
+				...(request.taskName === undefined ? {} : { taskName: request.taskName }),
 				task: request.task,
 				cwd: request.cwd,
 				agentScope: request.agentScope,

@@ -1,5 +1,4 @@
 import type { PathNormalizer } from "#src/path-normalizer";
-import { renderLegacyMessage } from "#src/presentation/legacy-message";
 import { buildSkillPathAskPayload } from "#src/presentation/skill-ask-payload";
 import type { SkillPromptEntry } from "#src/skill-prompt-sanitizer";
 import { findSkillPathMatch } from "#src/skill-prompt-sanitizer";
@@ -44,22 +43,14 @@ export function describeSkillReadGate(
   }
 
   const payload = buildSkillPathAskPayload(matchedSkill, path, tcc.agentName);
-  const skillReadMessage = renderLegacyMessage(payload);
 
   return {
     surface: "skill",
     input: { name: matchedSkill.name },
-    denialContext: {
-      kind: "skill_read",
-      skillName: matchedSkill.name,
-      readPath: path,
-      agentName: tcc.agentName ?? undefined,
-    },
+    payload,
     promptDetails: {
       source: "skill_read",
       agentName: tcc.agentName,
-      message: skillReadMessage,
-      payload,
       toolCallId: tcc.toolCallId,
       toolName: tcc.toolName,
       skillName: matchedSkill.name,
@@ -72,7 +63,6 @@ export function describeSkillReadGate(
       skillName: matchedSkill.name,
       agentName: tcc.agentName,
       path,
-      message: skillReadMessage,
     },
     decision: {
       surface: "skill",

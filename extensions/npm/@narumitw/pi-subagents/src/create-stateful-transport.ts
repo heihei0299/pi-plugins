@@ -2,7 +2,8 @@ import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { SubagentSettings, SubagentTransportKind } from "./agents/types.js";
 import { cachedModuleLoader, throwIfAborted } from "./cached-module-loader.js";
 import type { ChildSessionFactory, ParentRuntimeSnapshot } from "./in-process-transport.js";
-import type { ManagedAgent, TurnOutcome } from "./registry.js";
+import type { PeerTransportRuntime } from "./peer-transport.js";
+import type { AgentMailboxMessage, ManagedAgent, TurnOutcome } from "./registry.js";
 import type { SubagentTransport } from "./transport.js";
 import type { TransportProgressCallback } from "./transport-types.js";
 
@@ -12,6 +13,7 @@ export interface CreateStatefulTransportOptions {
 	getParentRuntime(): ParentRuntimeSnapshot;
 	getSettings(): SubagentSettings | undefined;
 	createInProcessSession?: ChildSessionFactory;
+	peerRuntime?: PeerTransportRuntime;
 	loadTransport?: () => Promise<SubagentTransport>;
 }
 
@@ -58,6 +60,12 @@ class LazyStatefulTransport implements SubagentTransport {
 		return transport.runTurn(agent, task, signal, onProgress);
 	}
 
+	async deliverMessage(agent: ManagedAgent, message: AgentMailboxMessage): Promise<boolean> {
+		const transport = this.loaded;
+		if (!transport?.deliverMessage || this.closed) return false;
+		return transport.deliverMessage(agent, message);
+	}
+
 	async release(agent: ManagedAgent): Promise<void> {
 		const transport =
 			this.loaded ?? (this.loading ? await this.loading.catch(() => undefined) : undefined);
@@ -100,7 +108,10 @@ async function loadStatefulTransport(
 ): Promise<SubagentTransport> {
 	const subprocess = async () => {
 		const { SubprocessTransport } = await import("./subprocess-transport.js");
-		return new SubprocessTransport({ getSettings: options.getSettings });
+		return new SubprocessTransport({
+			getSettings: options.getSettings,
+			peerRuntime: options.peerRuntime,
+		});
 	};
 	const inProcess = async () => {
 		const [{ discoverAgents }, { InProcessTransport }] = await Promise.all([
@@ -109,6 +120,7 @@ async function loadStatefulTransport(
 		]);
 		return new InProcessTransport({
 			modelRegistry: options.modelRegistry,
+			peerRuntime: options.peerRuntime,
 			getParentRuntime: options.getParentRuntime,
 			createSession: options.createInProcessSession,
 			discoverAgent: (agent) =>
@@ -122,6 +134,7 @@ async function loadStatefulTransport(
 		return new RpcTransport({
 			getSettings: options.getSettings,
 			getParentRuntime: options.getParentRuntime,
+			peerRuntime: options.peerRuntime,
 		});
 	};
 	switch (options.kind) {

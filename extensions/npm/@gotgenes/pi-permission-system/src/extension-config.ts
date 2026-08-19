@@ -26,10 +26,8 @@ export interface PermissionSystemExtensionConfig {
   promptMaxRows?: number;
   /** Max characters of any one field shown in a permission prompt. Defaults to 400. */
   promptFieldMaxWidth?: number;
-  /** Max length of the inline-JSON input preview shown in permission prompts. Defaults to 200. */
-  toolInputPreviewMaxLength?: number;
-  /** Max length of inline pattern/path summaries (grep/find/ls) in permission prompts. Defaults to 80. */
-  toolTextSummaryMaxLength?: number;
+  /** Max characters of any one value written to the permission review log. Defaults to 1000. */
+  reviewLogFieldMaxWidth?: number;
   /** Non-bash tools that carry shell semantics, keyed by tool name. */
   shellTools?: ShellToolsConfig;
   /** Ordered names of registered live-authority chain links to consult before the terminal authorizer. */
@@ -86,12 +84,13 @@ export function normalizePermissionSystemConfig(
   if (raw.promptFieldMaxWidth !== undefined) {
     result.promptFieldMaxWidth = raw.promptFieldMaxWidth;
   }
-  if (raw.toolInputPreviewMaxLength !== undefined) {
-    result.toolInputPreviewMaxLength = raw.toolInputPreviewMaxLength;
+  if (raw.reviewLogFieldMaxWidth !== undefined) {
+    result.reviewLogFieldMaxWidth = raw.reviewLogFieldMaxWidth;
   }
-  if (raw.toolTextSummaryMaxLength !== undefined) {
-    result.toolTextSummaryMaxLength = raw.toolTextSummaryMaxLength;
-  }
+  // `toolInputPreviewMaxLength` / `toolTextSummaryMaxLength` are deliberately
+  // absent: the schema and the merge still accept them so the deprecation
+  // detector can see an operator's setting, but no runtime consumer may read
+  // one (ADR 0011 §5, #745).
   if (raw.shellTools !== undefined) {
     result.shellTools = raw.shellTools;
   }

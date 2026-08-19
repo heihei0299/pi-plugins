@@ -80,8 +80,8 @@ export class SkillInputGatePipeline {
  * Format the deny warning shown in the UI when a skill is blocked.
  *
  * Intentionally untagged (no `[pi-permission-system]` prefix) — this is a
- * UI notify distinct from the gate deny reasons the runner routes through
- * `formatDenyReason`.
+ * UI notify distinct from the agent-facing deny reasons the runner routes
+ * through `renderPolicyDenial`.
  */
 export function formatSkillDenyNotice(
   skillName: string,

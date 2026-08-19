@@ -110,15 +110,30 @@ export function structuredResultInstruction(format: SubagentResultFormat | undef
 		].join(" ");
 	}
 	if (format === "structured-v2") {
+		const minimumResult = JSON.stringify({
+			version: "pi-subagents:result:v2",
+			status: "completed",
+			summary: "Concise outcome",
+			claims: [],
+			artifacts: [],
+			changes: [],
+			verification: [],
+			limitations: [],
+			unresolvedDependencies: [],
+		});
 		return [
 			"Return the final answer as one JSON object and no surrounding prose.",
-			'Use exactly version "pi-subagents:result:v2".',
-			"Required fields are status, summary, claims, artifacts, changes, verification, limitations, and unresolvedDependencies.",
+			"Minimum valid result:",
+			minimumResult,
+			"Keep every top-level field shown, including empty arrays.",
 			`status must be one of ${SUBAGENT_OUTCOME_STATUSES.join(", ")}.`,
-			"Each claim must include claim, classification (observed, inferred, or unverified), and an evidence string array.",
-			"Each artifact must include id and kind; each change must include path and summary; each verification item must include status (passed, failed, or not-run) and summary.",
+			'Claim item shape: {"claim":"Observed fact","classification":"observed","evidence":["path:line"]}.',
+			'Artifact item shape: {"id":"artifact-id","kind":"file","version":"optional","location":"optional","digest":"optional"}.',
+			'Change item shape: {"path":"path/to/file","summary":"What changed"}.',
+			'Verification item shape: {"status":"passed","summary":"What was checked","command":"optional","evidence":["optional"]}.',
+			"Claim classification must be observed, inferred, or unverified; verification status must be passed, failed, or not-run.",
 			"Use optional reasonCode for non-completed outcomes and optional provenance for taskId, inputArtifacts, and repositoryGeneration; executor-owned generation and plan identity are stamped after parsing.",
-		].join(" ");
+		].join("\n");
 	}
 	return "";
 }

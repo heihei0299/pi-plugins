@@ -28,7 +28,9 @@ export const SubagentInspectParams = Type.Object(
 	{
 		action: StringEnum(INSPECT_ACTIONS),
 		agent: Type.Optional(Type.String({ minLength: 1 })),
-		agentId: Type.Optional(Type.String({ minLength: 1 })),
+		agentId: Type.Optional(
+			Type.String({ minLength: 1, description: "Retained agent ID or canonical task path." }),
+		),
 		workflowId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
 		agentScope: Type.Optional(AgentScopeSchema),
 		limit: Type.Optional(LimitSchema),

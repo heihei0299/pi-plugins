@@ -1,9 +1,16 @@
-import type { ExternalPathDisclosure } from "#src/denial-messages";
 import type {
   PromptEvidence,
   PromptPayload,
 } from "#src/presentation/prompt-payload";
 import { localRequester } from "#src/presentation/prompt-payload";
+
+/** A displayed external path paired with its resolved target, when distinct. */
+export interface ExternalPathDisclosure {
+  /** The path as displayed (typed for tools, lexical-absolute for bash). */
+  path: string;
+  /** The canonical symlink-resolved target; present only when it differs. */
+  resolvedPath?: string;
+}
 
 /** The facts a path-shaped gate holds when it raises an ask. */
 interface PathAskFacts {

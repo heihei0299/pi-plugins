@@ -1,5 +1,11 @@
 import { discoverAgents } from "./agents/discovery.js";
 import type { AgentConfig, SubagentSettings, SubagentThinkingLevel } from "./agents/types.js";
+import {
+	CHILD_PEER_TOOL_NAMES,
+	childPeerBridgePath,
+	type PeerTransportRuntime,
+	peerBridgeEnvironment,
+} from "./peer-transport.js";
 import { resolvePiPromptResources } from "./prompt-resources.js";
 import type { ManagedAgent, TurnOutcome } from "./registry.js";
 import { getResultFinalOutput, runSingleAgent, type SubagentDetails } from "./runner.js";
@@ -17,6 +23,7 @@ export function resolveStatefulSubprocessThinkingLevel(
 
 export interface SubprocessTransportOptions {
 	getSettings?: () => SubagentSettings | undefined;
+	peerRuntime?: PeerTransportRuntime;
 }
 
 export class SubprocessTransport implements SubagentTransport {
@@ -54,35 +61,49 @@ export class SubprocessTransport implements SubagentTransport {
 			projectAgentsDir: discovery.projectAgentsDir,
 			results,
 		});
-		const single = await runSingleAgent(
-			record.cwd,
-			discovery.agents,
-			record.agent,
-			boundedTask.text,
-			undefined,
-			undefined,
-			signal,
-			resolveStatefulSubprocessThinkingLevel(discovery.agents, record),
-			record.currentTimeoutMs ?? record.timeoutMs ?? resolveStatefulTurnTimeout(agent),
-			undefined,
-			makeDetails,
-			undefined,
-			{
-				projectTrust,
-				...(record.executionPlan ? { tools: record.executionPlan.effectiveTools } : {}),
-				appendSystemPromptPaths: promptResources?.appendSystemPromptPaths,
-				timeoutResultFormat: record.resultFormat,
-				turnLimits: {
-					idleTimeoutMs: record.currentIdleTimeoutMs ?? record.idleTimeoutMs,
-					maxTurns: record.currentMaxTurns ?? record.maxTurns,
-					maxToolCalls: record.currentMaxToolCalls ?? record.maxToolCalls,
+		const credentials = this.options.peerRuntime
+			? await this.options.peerRuntime.issueCredentials(
+					record.id,
+					record.currentTurnGeneration ?? record.turnGeneration ?? 1,
+				)
+			: undefined;
+		let single: Awaited<ReturnType<typeof runSingleAgent>>;
+		try {
+			single = await runSingleAgent(
+				record.cwd,
+				discovery.agents,
+				record.agent,
+				boundedTask.text,
+				undefined,
+				undefined,
+				signal,
+				resolveStatefulSubprocessThinkingLevel(discovery.agents, record),
+				record.currentTimeoutMs ?? record.timeoutMs ?? resolveStatefulTurnTimeout(agent),
+				undefined,
+				makeDetails,
+				undefined,
+				{
+					projectTrust,
+					...(record.executionPlan ? { tools: record.executionPlan.effectiveTools } : {}),
+					appendSystemPromptPaths: promptResources?.appendSystemPromptPaths,
+					extensionPaths: credentials ? [childPeerBridgePath()] : undefined,
+					additionalTools: credentials ? [...CHILD_PEER_TOOL_NAMES] : undefined,
+					env: credentials ? peerBridgeEnvironment(credentials) : undefined,
+					timeoutResultFormat: record.resultFormat,
+					turnLimits: {
+						idleTimeoutMs: record.currentIdleTimeoutMs ?? record.idleTimeoutMs,
+						maxTurns: record.currentMaxTurns ?? record.maxTurns,
+						maxToolCalls: record.currentMaxToolCalls ?? record.maxToolCalls,
+					},
+					resultFormat: record.resultFormat,
+					contract: record.contract,
+					executionPlan: record.executionPlan,
+					displayTask: task,
 				},
-				resultFormat: record.resultFormat,
-				contract: record.contract,
-				executionPlan: record.executionPlan,
-				displayTask: task,
-			},
-		);
+			);
+		} finally {
+			this.options.peerRuntime?.revoke(record.id);
+		}
 		const settledAt = Date.now();
 		const telemetry: TransportTelemetry = {
 			...starting,

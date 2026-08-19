@@ -1,6 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { cachedModuleLoader } from "./cached-module-loader.js";
-import { showSubagentHelp, showSubagentStatus } from "./config-status.js";
 import type { SubagentMenuOwner, SubagentSettingsRuntime } from "./config-ui.js";
 
 const SUBCOMMANDS = [
@@ -14,8 +13,14 @@ type ConfigUiModule = Pick<
 	"showSubagentManager" | "showSubagentSettings"
 >;
 
+type ConfigStatusModule = Pick<
+	typeof import("./config-status.js"),
+	"showSubagentHelp" | "showSubagentStatus"
+>;
+
 export interface ConfigRegistrationDependencies {
 	loadConfigUi?: () => Promise<ConfigUiModule>;
+	loadConfigStatus?: () => Promise<ConfigStatusModule>;
 }
 
 export function registerSubagentConfigLifecycle(pi: ExtensionAPI): SubagentMenuOwner {
@@ -41,6 +46,9 @@ export function registerSubagentConfigCommand(
 	const loadConfigUi = cachedModuleLoader(
 		dependencies.loadConfigUi ?? (() => import("./config-ui.js")),
 	);
+	const loadConfigStatus = cachedModuleLoader<ConfigStatusModule>(
+		dependencies.loadConfigStatus ?? (() => import("./config-status.js")),
+	);
 	pi.registerCommand("subagents", {
 		description: "Manage current-session subagents and user settings",
 		getArgumentCompletions(prefix: string) {
@@ -50,16 +58,33 @@ export function registerSubagentConfigCommand(
 		},
 		async handler(args, ctx) {
 			const subcommand = args.trim().toLowerCase();
+			const runStatusCommand = async (show: (status: ConfigStatusModule) => void) => {
+				const generation = owner.generation;
+				const controller = owner.controller;
+				const isCurrent = () =>
+					generation === owner.generation &&
+					controller === owner.controller &&
+					!controller.signal.aborted;
+				let status: ConfigStatusModule;
+				try {
+					status = await loadConfigStatus();
+				} catch (error) {
+					if (!isCurrent()) return;
+					throw error;
+				}
+				if (!isCurrent()) return;
+				show(status);
+			};
 			if (!subcommand && ctx.mode !== "tui") {
-				showSubagentStatus(ctx, runtime);
+				await runStatusCommand((status) => status.showSubagentStatus(ctx, runtime));
 				return;
 			}
 			if (subcommand === "status") {
-				showSubagentStatus(ctx, runtime);
+				await runStatusCommand((status) => status.showSubagentStatus(ctx, runtime));
 				return;
 			}
 			if (subcommand === "help") {
-				showSubagentHelp(ctx, runtime);
+				await runStatusCommand((status) => status.showSubagentHelp(ctx, runtime));
 				return;
 			}
 			if (!subcommand || subcommand === "settings") {

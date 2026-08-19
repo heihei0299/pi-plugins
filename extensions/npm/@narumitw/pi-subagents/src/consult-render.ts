@@ -6,7 +6,6 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import type { ConsultDetails, SubagentConsultParams } from "./consult.js";
-import { formatUsageStats } from "./render.js";
 import {
 	COLLAPSED_ANSWER_LINES,
 	COLLAPSED_LIST_LIMIT,
@@ -25,6 +24,7 @@ import {
 	textResult,
 	toolHeader,
 } from "./render-common.js";
+import { formatUsageStats } from "./usage-format.js";
 
 export function renderConsultCall(args: Partial<SubagentConsultParams>, theme: Theme) {
 	const scope = args.agentScope ?? "user";

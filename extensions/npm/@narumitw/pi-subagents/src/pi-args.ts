@@ -11,6 +11,7 @@ export interface PiArgsOptions {
 	projectTrust?: boolean;
 	baseSystemPromptPath?: string;
 	appendSystemPromptPaths?: string[];
+	extensionPaths?: string[];
 	/** Existing single append prompt path retained for compatibility. */
 	systemPromptPath?: string;
 	task: string;
@@ -21,6 +22,7 @@ export function buildPiArgs(options: PiArgsOptions): string[] {
 	if (options.model) args.push("--model", options.model);
 	if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
 	if (options.disableExtensions) args.push("--no-extensions");
+	for (const extensionPath of options.extensionPaths ?? []) args.push("-e", extensionPath);
 	if (options.disableSkills) args.push("--no-skills");
 	if (options.disablePromptTemplates) args.push("--no-prompt-templates");
 	if (options.disableContextFiles) args.push("--no-context-files");

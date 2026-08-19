@@ -1,5 +1,3 @@
-import { dirname, sep } from "node:path";
-
 import type { Ruleset } from "./rule";
 import type { SessionApproval } from "./session-approval";
 import type { SessionApprovalRecorder } from "./session-approval-recorder";
@@ -47,33 +45,4 @@ export class SessionRules implements SessionApprovalRecorder {
   clear(): void {
     this.rules = [];
   }
-}
-
-/**
- * Derive the wildcard glob pattern to approve from a normalized path.
- *
- * Returns `<parent-dir>/*` so that `evaluate()` / `wildcardMatch()` matches
- * all paths under the approved directory — identical semantics to the former
- * `SessionApprovalCache` prefix matching, using the unified wildcard engine.
- *
- * For paths that already end with a separator (directories), the separator
- * is treated as the directory boundary and `*` is appended directly.
- *
- * The path is expected to be the canonical (cwd-resolved, absolute) form used
- * for policy matching, so the derived pattern matches the same policy values a
- * later tool call produces. Callers that hold a working directory resolve the
- * path to that form first; the function itself stays free of cwd state.
- */
-export function deriveApprovalPattern(normalizedPath: string): string {
-  // If the path already ends with a separator, it's a directory — glob its contents.
-  if (normalizedPath.endsWith(sep)) {
-    return `${normalizedPath}*`;
-  }
-  const dir = dirname(normalizedPath);
-  if (dir === normalizedPath) {
-    // Root path — dirname('/') === '/'
-    return `${dir}*`;
-  }
-  const prefix = dir.endsWith(sep) ? dir : `${dir}${sep}`;
-  return `${prefix}*`;
 }

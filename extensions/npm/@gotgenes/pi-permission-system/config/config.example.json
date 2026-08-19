@@ -11,8 +11,7 @@
   "promptMaxRows": 24,
   "promptFieldMaxWidth": 400,
 
-  "toolInputPreviewMaxLength": 400,
-  "toolTextSummaryMaxLength": 120,
+  "reviewLogFieldMaxWidth": 1000,
 
   "piInfrastructureReadPaths": [],
 

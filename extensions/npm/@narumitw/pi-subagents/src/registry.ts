@@ -10,6 +10,7 @@ import {
 	isCapabilityGrantActive,
 	revokeCapabilityGrant,
 } from "./capability-grant.js";
+import { resolveCompletionRecipient } from "./completion-routing.js";
 import type { TargetPolicyAudit } from "./cwd-policy.js";
 import type { DelegationContract } from "./delegation-contract.js";
 import {
@@ -40,8 +41,17 @@ import {
 	parseAnyStructuredSubagentResult,
 	type SubagentResultFormat,
 } from "./result-contract.js";
+import { safeTerminalLine } from "./safe-text.js";
 import type { SemanticCompatibility, SemanticSnapshot } from "./semantic-snapshot.js";
 import { resolveStatefulLimits } from "./stateful-limits.js";
+import {
+	deriveTaskName,
+	joinTaskPath,
+	ROOT_TASK_PATH,
+	resolveTaskPath,
+	validateTaskName,
+	validateTaskPath,
+} from "./task-path.js";
 import { copyTurnTerminationReport } from "./timeout-checkpoint.js";
 import { type AgentTurnRunner, normalizeTransport, type SubagentTransport } from "./transport.js";
 import type { TransportTelemetry } from "./transport-types.js";
@@ -181,6 +191,7 @@ export class AgentRegistry {
 				{ maxAgents: this.maxAgents, maxDepth: this.maxDepth },
 			).map((record) => [record.id, record]),
 		);
+		const restorable: Array<{ record: ManagedAgent; rootId: string; depth: number }> = [];
 		for (const record of candidates.values()) {
 			if (record.parentId && !candidates.has(record.parentId)) continue;
 			if (record.parentId === record.id) continue;
@@ -198,12 +209,31 @@ export class AgentRegistry {
 				parentId = candidates.get(parentId)?.parentId;
 			}
 			const depth = seen.size - 1;
-			if (cyclic || depth > this.maxDepth) continue;
+			if (!cyclic && depth <= this.maxDepth) restorable.push({ record, rootId, depth });
+		}
+		restorable.sort(
+			(left, right) =>
+				left.depth - right.depth ||
+				left.record.createdAt - right.record.createdAt ||
+				left.record.id.localeCompare(right.record.id),
+		);
+		const reservedPaths = new Set(
+			[...this.agents.values()].flatMap((agent) =>
+				agent.state !== "closed" && agent.taskPath ? [agent.taskPath] : [],
+			),
+		);
+		for (const { record, rootId, depth } of restorable) {
+			const parentPath = record.parentId
+				? this.agents.get(record.parentId)?.taskPath
+				: ROOT_TASK_PATH;
+			if (!parentPath) continue;
+			const identity = this.reserveRestoredIdentity(record, parentPath, reservedPaths);
 			for (const completion of record.pendingCompletions ?? []) {
 				this.lastCompletionAt = Math.max(this.lastCompletionAt, completion.createdAt);
 			}
 			this.agents.set(record.id, {
 				...record,
+				...identity,
 				state:
 					record.state === "running" || record.state === "starting" ? "interrupted" : record.state,
 				rootId,
@@ -233,14 +263,26 @@ export class AgentRegistry {
 			});
 		}
 		for (const agent of this.agents.values()) {
-			if (!agent.parentId) continue;
-			const parent = this.agents.get(agent.parentId);
-			if (parent && !parent.children.includes(agent.id)) parent.children.push(agent.id);
+			if (agent.parentId) {
+				const parent = this.agents.get(agent.parentId);
+				if (parent && !parent.children.includes(agent.id)) parent.children.push(agent.id);
+			}
+			for (const completion of agent.pendingCompletions ?? []) {
+				if (!completion.recipientId || !completion.recipientPath) {
+					Object.assign(completion, this.completionRecipient(agent));
+				}
+				this.enqueueCompletionMessage(
+					agent,
+					completion,
+					completion.output || completion.error || "(no output)",
+				);
+			}
 		}
 	}
 
 	async spawn(input: {
 		agent: string;
+		taskName?: string;
 		task: string;
 		cwd: string;
 		agentScope?: "user" | "project" | "both";
@@ -296,8 +338,15 @@ export class AgentRegistry {
 		if (depth > this.maxDepth) throw new Error(`Subagent depth limit reached (${this.maxDepth})`);
 		const now = this.now();
 		const id = `sa_${randomUUID()}`;
+		const taskName = input.taskName ? validateTaskName(input.taskName) : deriveTaskName(id);
+		const taskPath = joinTaskPath(parent?.taskPath ?? ROOT_TASK_PATH, taskName);
+		if (this.findByTaskPath(taskPath)) {
+			throw new Error(`Canonical subagent task path is already retained: ${taskPath}`);
+		}
 		const record: ManagedAgent = {
 			id,
+			taskName,
+			taskPath,
 			agent: input.agent,
 			parentId: parent?.id,
 			rootId: parent?.rootId ?? id,
@@ -389,9 +438,7 @@ export class AgentRegistry {
 		) {
 			throw new Error(`Agent ${id} cannot accept follow-up while ${agent.state}`);
 		}
-		const unread = agent.mailbox.filter((message) => !message.readAt);
-		const readAt = this.now();
-		for (const message of unread) message.readAt = readAt;
+		const unread = agent.mailbox.filter((message) => !message.readAt).slice(-20);
 		agent.currentMailboxMessageIds = unread.map((message) => message.id);
 		this.startTurn(agent, boundedTask, options);
 		return this.copy(agent);
@@ -427,18 +474,13 @@ export class AgentRegistry {
 		if (deduplicationKey && deduplicationKey.length > 256) {
 			throw new Error("Subagent mailbox deduplication keys cannot exceed 256 characters");
 		}
-		const recipient = this.require(recipientId);
+		const sender = senderId === "root" ? undefined : this.require(senderId);
+		if (sender?.state === "closed")
+			throw new Error(`Closed agent ${sender.id} cannot send messages`);
+		const recipient = this.require(recipientId, sender?.id);
 		if (recipient.state === "closed")
 			throw new Error(`Cannot message closed agent ${recipient.id}`);
-		if (senderId !== "root") {
-			const sender = this.require(senderId);
-			if (sender.state === "closed")
-				throw new Error(`Closed agent ${sender.id} cannot send messages`);
-			if (sender.rootId !== recipient.rootId) {
-				throw new Error("Subagent mailbox messages cannot cross agent trees");
-			}
-		}
-		const message = this.enqueueMessage(recipient, content, senderId, deduplicationKey);
+		const message = this.enqueueMessage(recipient, content, sender?.id ?? "root", deduplicationKey);
 		await this.changed();
 		return { ...message };
 	}
@@ -461,6 +503,58 @@ export class AgentRegistry {
 		return unread.map((message) => ({ ...message }));
 	}
 
+	async acknowledgeVisibleMessages(
+		id: string,
+		messageIds: readonly string[],
+		completionIds: readonly string[] = [],
+		visibleAt = this.now(),
+	): Promise<void> {
+		const agent = this.require(id);
+		const visibleMessageIds = new Set(messageIds);
+		const visibleCompletionIds = new Set(completionIds);
+		const changedMessages: AgentMailboxMessage[] = [];
+		const removedCompletions: Array<{
+			owner: ManagedAgent;
+			completion: NonNullable<ManagedAgent["pendingCompletions"]>[number];
+		}> = [];
+		for (const message of agent.mailbox) {
+			if (message.readAt === undefined && visibleMessageIds.has(message.id)) {
+				message.readAt = visibleAt;
+				changedMessages.push(message);
+			}
+			if (message.completionId && visibleMessageIds.has(message.id)) {
+				visibleCompletionIds.add(message.completionId);
+			}
+		}
+		for (const owner of this.agents.values()) {
+			for (const completion of owner.pendingCompletions ?? []) {
+				if (!visibleCompletionIds.has(completion.completionId)) continue;
+				if (completion.recipientId !== agent.id && completion.recipientPath !== agent.taskPath) {
+					continue;
+				}
+				removedCompletions.push({ owner, completion });
+			}
+		}
+		if (changedMessages.length === 0 && removedCompletions.length === 0) return;
+		for (const { owner, completion } of removedCompletions) {
+			owner.pendingCompletions = (owner.pendingCompletions ?? []).filter(
+				(candidate) => candidate.completionId !== completion.completionId,
+			);
+		}
+		agent.updatedAt = Math.max(agent.updatedAt, visibleAt);
+		try {
+			await this.changed(true);
+		} catch (error) {
+			for (const message of changedMessages) message.readAt = undefined;
+			for (const { owner, completion } of removedCompletions) {
+				owner.pendingCompletions = [...(owner.pendingCompletions ?? []), completion].sort(
+					(left, right) => left.createdAt - right.createdAt || left.generation - right.generation,
+				);
+			}
+			throw error;
+		}
+	}
+
 	async wait(
 		id: string,
 		timeoutMs = 30_000,
@@ -471,7 +565,8 @@ export class AgentRegistry {
 		}
 		if (signal?.aborted) throw waitAbortError();
 		const agent = this.require(id);
-		const running = this.running.get(id);
+		const agentId = agent.id;
+		const running = this.running.get(agentId);
 		if (!running) return { timedOut: false, agent: this.copy(agent) };
 		let timer: NodeJS.Timeout | undefined;
 		let onAbort: (() => void) | undefined;
@@ -487,7 +582,7 @@ export class AgentRegistry {
 		if (onAbort) signal?.removeEventListener("abort", onAbort);
 		if (result === "aborted") throw waitAbortError();
 		return result === "timeout"
-			? { timedOut: true, agent: this.copy(this.require(id)) }
+			? { timedOut: true, agent: this.copy(this.require(agentId)) }
 			: { timedOut: false, agent: this.copy(result) };
 	}
 
@@ -504,6 +599,7 @@ export class AgentRegistry {
 
 	async interrupt(id: string): Promise<ManagedAgent> {
 		const agent = this.require(id);
+		const agentId = agent.id;
 		if (agent.state !== "running" && agent.state !== "starting")
 			throw new Error(`Agent ${id} is not running`);
 		if (agent.capabilityGrant?.state === "active") {
@@ -517,11 +613,13 @@ export class AgentRegistry {
 			agent.executionPlan = rotateExecutionPlanGeneration(agent.executionPlan);
 		}
 		if (agent.state === "starting") {
-			const index = this.queue.findIndex((entry) => entry.agent.id === id);
+			const index = this.queue.findIndex((entry) => entry.agent.id === agentId);
 			if (index >= 0) {
 				const [entry] = this.queue.splice(index, 1);
+				const recipient = this.completionRecipient(agent);
 				const persistedCompletion = {
 					completionId: `completion:${agent.id}:${randomUUID()}`,
+					...recipient,
 					runId: agent.currentRunId ?? `run:${agent.id}:${randomUUID()}`,
 					generation: agent.currentTurnGeneration ?? agent.turnGeneration ?? 1,
 					task: truncateUtf8(entry.task, 256).text,
@@ -531,6 +629,7 @@ export class AgentRegistry {
 				};
 				agent.state = "interrupted";
 				agent.pendingCompletions = [...(agent.pendingCompletions ?? []), persistedCompletion];
+				this.enqueueCompletionMessage(agent, persistedCompletion, persistedCompletion.error);
 				clearCurrentTurn(agent);
 				agent.updatedAt = this.now();
 				const persisted = await this.persistTerminalState().then(
@@ -542,14 +641,14 @@ export class AgentRegistry {
 					agent: this.copy(agent),
 				};
 				entry.resolve(agent);
-				this.running.delete(id);
+				this.running.delete(agentId);
 				if (persisted) await this.notifyTurnComplete(completion);
 				return this.copy(agent);
 			}
 		}
-		this.controllers.get(id)?.abort();
-		await this.running.get(id);
-		return this.copy(this.require(id));
+		this.controllers.get(agentId)?.abort();
+		await this.running.get(agentId);
+		return this.copy(this.require(agentId));
 	}
 
 	async closeTree(id: string): Promise<ManagedAgent[]> {
@@ -574,6 +673,7 @@ export class AgentRegistry {
 
 	async close(id: string): Promise<ManagedAgent> {
 		const agent = this.require(id);
+		const agentId = agent.id;
 		if (agent.state === "closed") throw new Error(`Agent ${id} is already closed`);
 		if (agent.children.some((childId) => this.agents.get(childId)?.state !== "closed")) {
 			throw new Error(`Agent ${id} has active descendants; close the subtree instead`);
@@ -587,20 +687,20 @@ export class AgentRegistry {
 			}
 		}
 		if (agent.state === "starting") {
-			const index = this.queue.findIndex((entry) => entry.agent.id === id);
+			const index = this.queue.findIndex((entry) => entry.agent.id === agentId);
 			if (index >= 0) {
 				const [entry] = this.queue.splice(index, 1);
 				entry.resolve(agent);
-				this.running.delete(id);
+				this.running.delete(agentId);
 			}
 		}
-		this.controllers.get(id)?.abort();
-		await this.running.get(id)?.catch(() => undefined);
+		this.controllers.get(agentId)?.abort();
+		await this.running.get(agentId)?.catch(() => undefined);
 		agent.state = "closed";
 		agent.updatedAt = this.now();
 		if (agent.parentId) {
 			const parent = this.agents.get(agent.parentId);
-			if (parent) parent.children = parent.children.filter((childId) => childId !== id);
+			if (parent) parent.children = parent.children.filter((childId) => childId !== agentId);
 		}
 		clearCurrentTurn(agent);
 		let releaseError: unknown;
@@ -697,7 +797,7 @@ export class AgentRegistry {
 	}
 
 	getInspection(id: string): AgentRunInspectionDetail | undefined {
-		const agent = this.agents.get(id);
+		const agent = this.findReference(id);
 		if (!agent) return undefined;
 		return {
 			...this.inspectSummary(agent),
@@ -755,8 +855,12 @@ export class AgentRegistry {
 			.map((agent) => this.copy(agent));
 	}
 
-	get(id: string): ManagedAgent | undefined {
-		const agent = this.agents.get(id);
+	get(reference: string): ManagedAgent | undefined {
+		return this.resolveAgent(reference);
+	}
+
+	resolveAgent(reference: string, senderId = "root"): ManagedAgent | undefined {
+		const agent = this.findReference(reference, senderId);
 		return agent ? this.copy(agent) : undefined;
 	}
 
@@ -892,8 +996,10 @@ export class AgentRegistry {
 			agent.state = "failed";
 			agent.error = "Capability grant expired or no longer matches the accepted plan";
 			agent.outcome = classifyStructuredOutcome("failed", "capability-grant-invalid");
+			const recipient = this.completionRecipient(agent);
 			const persistedCompletion = {
 				completionId: `completion:${agent.id}:${randomUUID()}`,
+				...recipient,
 				runId: agent.currentRunId ?? `run:${agent.id}:${randomUUID()}`,
 				generation: agent.currentTurnGeneration ?? agent.turnGeneration ?? 1,
 				task: truncateUtf8(task, 256).text,
@@ -902,6 +1008,7 @@ export class AgentRegistry {
 				createdAt: this.completionCreatedAt(),
 			};
 			agent.pendingCompletions = [...(agent.pendingCompletions ?? []), persistedCompletion];
+			this.enqueueCompletionMessage(agent, persistedCompletion, persistedCompletion.error ?? "");
 			clearCurrentTurn(agent);
 			agent.updatedAt = this.now();
 			void this.persistTerminalState()
@@ -930,6 +1037,7 @@ export class AgentRegistry {
 		let completionContent = "";
 		let completionOutput = "";
 		let completionError: string | undefined;
+		const visibleMailboxMessageIds = [...(agent.currentMailboxMessageIds ?? [])];
 		void this.transport
 			.runTurn(this.copy(agent), task, controller.signal, (progress) => {
 				agent.telemetry = {
@@ -942,6 +1050,14 @@ export class AgentRegistry {
 				};
 			})
 			.then(async (outcome) => {
+				if (visibleMailboxMessageIds.length > 0) {
+					await this.acknowledgeVisibleMessages(
+						agent.id,
+						visibleMailboxMessageIds,
+						[],
+						this.now(),
+					).catch(() => undefined);
+				}
 				const output = truncateUtf8(outcome.output, this.maxTurnOutputBytes).text;
 				const error = outcome.error
 					? truncateUtf8(outcome.error, this.maxTurnOutputBytes).text
@@ -1068,8 +1184,10 @@ export class AgentRegistry {
 				return agent;
 			})
 			.finally(async () => {
+				const recipient = this.completionRecipient(agent);
 				const persistedCompletion = {
 					completionId: completionKey,
+					...recipient,
 					runId,
 					generation: turnGeneration,
 					task: truncateUtf8(task, 256).text,
@@ -1078,12 +1196,7 @@ export class AgentRegistry {
 					createdAt: this.completionCreatedAt(),
 				};
 				agent.pendingCompletions = [...(agent.pendingCompletions ?? []), persistedCompletion];
-				if (agent.parentId) {
-					const parent = this.agents.get(agent.parentId);
-					if (parent && parent.state !== "closed") {
-						this.enqueueMessage(parent, completionContent, agent.id, completionKey);
-					}
-				}
+				this.enqueueCompletionMessage(agent, persistedCompletion, completionContent);
 				clearCurrentTurn(agent);
 				agent.updatedAt = this.now();
 				const persisted = await this.persistTerminalState().then(
@@ -1113,11 +1226,38 @@ export class AgentRegistry {
 		}
 	}
 
+	private completionRecipient(
+		agent: ManagedAgent,
+	): Pick<
+		NonNullable<ManagedAgent["pendingCompletions"]>[number],
+		"recipientId" | "recipientPath"
+	> {
+		return resolveCompletionRecipient(agent, (id) => this.agents.get(id));
+	}
+
+	private enqueueCompletionMessage(
+		agent: ManagedAgent,
+		completion: NonNullable<ManagedAgent["pendingCompletions"]>[number],
+		content: string,
+	): void {
+		if (!completion.recipientId || completion.recipientId === "root") return;
+		const recipient = this.agents.get(completion.recipientId);
+		if (!recipient || recipient.state === "closed") return;
+		this.enqueueMessage(
+			recipient,
+			content || "(no output)",
+			agent.id,
+			completion.completionId,
+			completion.completionId,
+		);
+	}
+
 	private enqueueMessage(
 		recipient: ManagedAgent,
 		content: string,
 		senderId: string,
 		deduplicationKey?: string,
+		completionId?: string,
 	): AgentMailboxMessage {
 		if (deduplicationKey) {
 			const existing = recipient.mailbox.find(
@@ -1133,6 +1273,7 @@ export class AgentRegistry {
 			content: bounded.text,
 			createdAt: this.now(),
 			deduplicationKey,
+			completionId,
 		};
 		recipient.mailbox.push(message);
 		recipient.mailbox = recipient.mailbox.slice(-this.maxMailboxMessages);
@@ -1154,10 +1295,66 @@ export class AgentRegistry {
 		return result;
 	}
 
-	private require(id: string): ManagedAgent {
-		const agent = this.agents.get(id);
-		if (!agent) throw new Error(`Unknown subagent: ${id}`);
+	private require(reference: string, senderId = "root"): ManagedAgent {
+		const agent = this.findReference(reference, senderId);
+		if (!agent) throw new Error(`Unknown subagent: ${safeTerminalLine(reference, 256)}`);
 		return agent;
+	}
+
+	private findReference(reference: string, senderId = "root"): ManagedAgent | undefined {
+		const direct = this.agents.get(reference);
+		if (direct) return direct;
+		const sender =
+			senderId === "root"
+				? undefined
+				: (this.agents.get(senderId) ?? this.findByTaskPath(senderId));
+		if (senderId !== "root" && !sender) return undefined;
+		let taskPath: string;
+		try {
+			taskPath = resolveTaskPath(sender?.taskPath ?? ROOT_TASK_PATH, reference);
+		} catch {
+			return undefined;
+		}
+		return this.findByTaskPath(taskPath);
+	}
+
+	private findByTaskPath(taskPath: string): ManagedAgent | undefined {
+		return [...this.agents.values()].find(
+			(agent) => agent.state !== "closed" && agent.taskPath === taskPath,
+		);
+	}
+
+	private reserveRestoredIdentity(
+		record: ManagedAgent,
+		parentPath: string,
+		reservedPaths: Set<string>,
+	): Pick<ManagedAgent, "taskName" | "taskPath"> {
+		let taskName: string | undefined;
+		try {
+			taskName = record.taskName ? validateTaskName(record.taskName) : undefined;
+		} catch {
+			taskName = undefined;
+		}
+		if (!taskName && record.taskPath) {
+			try {
+				const storedPath = validateTaskPath(record.taskPath);
+				const storedName = storedPath.slice(storedPath.lastIndexOf("/") + 1);
+				taskName = validateTaskName(storedName);
+			} catch {
+				taskName = undefined;
+			}
+		}
+		taskName ??= deriveTaskName(record.id);
+		let taskPath = joinTaskPath(parentPath, taskName);
+		if (reservedPaths.has(taskPath)) {
+			taskName = deriveTaskName(record.id);
+			taskPath = joinTaskPath(parentPath, taskName);
+		}
+		if (reservedPaths.has(taskPath)) {
+			throw new Error(`Cannot restore duplicate canonical subagent task path: ${taskPath}`);
+		}
+		reservedPaths.add(taskPath);
+		return { taskName, taskPath };
 	}
 
 	private retainedCount(): number {
@@ -1272,6 +1469,8 @@ export class AgentRegistry {
 		}
 		return {
 			id: agent.id,
+			taskName: agent.taskName,
+			taskPath: agent.taskPath,
 			agent: agent.agent,
 			state: agent.state,
 			createdAt: agent.createdAt,

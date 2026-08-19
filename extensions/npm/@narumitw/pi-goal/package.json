@@ -1,7 +1,7 @@
 {
 	"name": "@narumitw/pi-goal",
-	"version": "0.51.0",
-	"description": "Pi extension for autonomous /goal completion with opt-in experimental ordered queues.",
+	"version": "0.52.1",
+	"description": "Pi extension for autonomous single-objective /goal completion.",
 	"type": "module",
 	"license": "MIT",
 	"private": false,
@@ -10,7 +10,6 @@
 		"pi-extension",
 		"pi",
 		"goal",
-		"queue",
 		"automation"
 	],
 	"files": [
@@ -39,15 +38,15 @@
 		"typebox": "*"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "2.5.7",
-		"@earendil-works/pi-ai": "0.84.1",
-		"@earendil-works/pi-coding-agent": "0.84.1",
-		"@earendil-works/pi-tui": "0.84.1",
-		"typebox": "1.3.11",
+		"@biomejs/biome": "2.5.8",
+		"@earendil-works/pi-ai": "0.84.2",
+		"@earendil-works/pi-coding-agent": "0.84.2",
+		"@earendil-works/pi-tui": "0.84.2",
+		"typebox": "1.3.14",
 		"typescript": "7.0.2"
 	},
 	"dependencies": {
-		"@narumitw/pi-tui-kit": "^0.49.1"
+		"@narumitw/pi-tui-kit": "^0.56.0"
 	},
 	"repository": {
 		"type": "git",

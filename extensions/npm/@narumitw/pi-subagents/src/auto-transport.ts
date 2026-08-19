@@ -1,6 +1,6 @@
 import { discoverAgents } from "./agents/discovery.js";
 import type { SubagentSettings } from "./agents/types.js";
-import type { ManagedAgent, TurnOutcome } from "./registry.js";
+import type { AgentMailboxMessage, ManagedAgent, TurnOutcome } from "./registry.js";
 import { isWriteCapable } from "./stateful-safety.js";
 import type { SubagentTransport } from "./transport.js";
 import type {
@@ -46,6 +46,12 @@ export class AutoTransport implements SubagentTransport {
 				? { ...outcome.telemetry, selectionReason: selection.reason }
 				: outcome.telemetry,
 		};
+	}
+
+	async deliverMessage(agent: ManagedAgent, message: AgentMailboxMessage): Promise<boolean> {
+		const selection = this.selections.get(agent.id);
+		if (!selection) return false;
+		return this.transport(selection.kind).deliverMessage?.(agent, message) ?? false;
 	}
 
 	async release(agent: ManagedAgent): Promise<void> {

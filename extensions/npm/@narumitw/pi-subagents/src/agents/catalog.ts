@@ -8,7 +8,7 @@ import {
 	type AgentDiscoveryResult,
 	discoverAgents,
 } from "./discovery.js";
-import type { AgentConfig, SubagentSettings } from "./types.js";
+import { type AgentConfig, resolveAgentToolNames, type SubagentSettings } from "./types.js";
 
 export function formatAgentList(
 	agents: AgentConfig[],
@@ -70,6 +70,21 @@ function normalizeCatalogDescription(description: string, maxLength: number): st
 
 type CatalogScope = "user" | "project" | "project-fallback";
 
+function formatDeclaredItems(items: readonly string[] | undefined): string {
+	if (items === undefined) return "undeclared";
+	return items.length > 0 ? items.join(", ") : "none";
+}
+
+function catalogAgentContractMetadata(agent: AgentConfig): string {
+	const manifest = agent.capabilityManifest;
+	return [
+		`capabilities: ${formatDeclaredItems(manifest?.capabilities)}`,
+		`tools: ${formatDeclaredItems(resolveAgentToolNames(agent.tools))}`,
+		`filesystem: ${manifest?.authority?.filesystem ?? "undeclared"}`,
+		`result formats: ${formatDeclaredItems(manifest?.resultFormats)}`,
+	].join("; ");
+}
+
 function catalogAgentLine(
 	agent: AgentConfig,
 	scope: CatalogScope,
@@ -88,7 +103,7 @@ function catalogAgentLine(
 				? "; overrides the default user definition for project/both"
 				: "; scope-specific fallback for the default user override"
 			: "";
-	return `- ${agent.name} [source: ${agent.source}; ${scopeLabel}${collision}] — ${normalizeCatalogDescription(agent.description, maxDescriptionLength)}`;
+	return `- ${agent.name} [source: ${agent.source}; ${scopeLabel}${collision}] [${catalogAgentContractMetadata(agent)}] — ${normalizeCatalogDescription(agent.description, maxDescriptionLength)}`;
 }
 
 /**
@@ -153,6 +168,8 @@ export function formatAgentCatalog(
 	const render = (entries: typeof allEntries, omitted: number): string => {
 		const lines = [
 			"Available agent definitions (metadata only; runtime validation and trust remain authoritative).",
+			"Use capability and tool identifiers exactly as shown when authoring enforced contracts.",
+			"Enforced contract readPaths, writePaths, network, and secrets guarantees are unsupported.",
 		];
 		const userLines = entries
 			.filter((entry) => entry.scope === "user")

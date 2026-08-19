@@ -21,11 +21,8 @@ import type {
 	DelegationCwdPolicy,
 	SubagentSettings,
 } from "./agents/types.js";
-import {
-	type AutomationRegistrationDependencies,
-	registerSubagentAutomation,
-} from "./automation-registration.js";
 import { cachedModuleLoader, throwIfAborted } from "./cached-module-loader.js";
+import { renderCompletionMessage, SUBAGENT_COMPLETION_MESSAGE_TYPE } from "./completion-render.js";
 import {
 	type ConfigRegistrationDependencies,
 	registerSubagentConfigCommand,
@@ -60,13 +57,13 @@ type BlockingExecutionModule = Pick<typeof import("./execution.js"), "executeSub
 export interface SubagentsDependencies {
 	loadBlockingExecution?: () => Promise<BlockingExecutionModule>;
 	loadStatefulTransport?: () => Promise<SubagentTransport>;
-	automation?: AutomationRegistrationDependencies;
 	config?: ConfigRegistrationDependencies;
 	consult?: ConsultRegistrationDependencies;
 	inspect?: InspectRegistrationDependencies;
 }
 
 export default function (pi: ExtensionAPI, dependencies: SubagentsDependencies = {}) {
+	pi.registerMessageRenderer(SUBAGENT_COMPLETION_MESSAGE_TYPE, renderCompletionMessage);
 	const loadBlockingExecution = cachedModuleLoader(
 		dependencies.loadBlockingExecution ?? (() => import("./execution.js")),
 	);
@@ -78,9 +75,6 @@ export default function (pi: ExtensionAPI, dependencies: SubagentsDependencies =
 	const refreshBlockingCatalog = blockingEnabled
 		? registerBlockingSubagent(pi, () => currentSettings, loadBlockingExecution)
 		: () => undefined;
-	if (blockingEnabled) {
-		registerSubagentAutomation(pi, { getSettings: () => currentSettings }, dependencies.automation);
-	}
 	let refreshStatefulCatalog: (catalog: string) => void = () => undefined;
 	let refreshConsultCatalog: (catalog: string) => void = () => undefined;
 
@@ -225,7 +219,11 @@ function registerBlockingSubagent(
 		].join(" ");
 	const promptGuidelines = () => [
 		"Use subagent only when delegation fits; the main agent should decide how many subagents to spawn from task shape instead of waiting for the user to specify a count.",
+		"The main agent retains overall planning, immediate critical-path work, integration, final verification, and the final answer.",
 		"Use no subagent for simple answers, quick targeted edits, latency-sensitive one-step work, tasks requiring frequent user back-and-forth, or critical-path work the main agent can perform directly.",
+		"One ordinary implementation worker should not replace work the main agent can perform directly; use a blocking single only when intentional synchronous isolation or a user-requested specialist justifies waiting.",
+		"Keep ordinary planning in the main agent, or use explicit workflow mode when a genuine dependency graph requires caller-authored orchestration.",
+		"Keep ordinary review in the main agent with a review skill and deterministic checks; reserve panel mode or custom verifier agents for consequential independent verification.",
 		"Use the blocking subagent tool only when delegated outputs are required before the main agent's next action and waiting is intentional; the main agent cannot process queued steering until the call returns.",
 		"Use a blocking subagent single, parallel, chain, workflow, panel, or fan-in call only when synchronous context or output isolation is worth making the main agent unavailable while it runs.",
 		`If a blocking parallel subagent call is genuinely required, keep tasks independent, stay within the configured max ${resolveBlockingMaxParallelTasks(getSettings())}, and avoid write-heavy implementation touching the same files or shared state.`,
@@ -310,7 +308,6 @@ function appendAgentCatalog(baseDescription: string, catalog: string): string {
 
 export { parsePositiveInteger } from "./execution/runtime-policy.js";
 export { buildPiArgs } from "./pi-args.js";
-export { formatTokens, formatUsageStats } from "./render.js";
 export {
 	DEFAULT_CONSULT_RESOURCE_POLICY,
 	DEFAULT_CONSULTATION_CWD_POLICY,
@@ -339,3 +336,4 @@ export {
 	updateDelegationWorkflowSetting,
 	updateStatefulLimitSetting,
 } from "./settings.js";
+export { formatTokens, formatUsageStats } from "./usage-format.js";

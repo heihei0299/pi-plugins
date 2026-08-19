@@ -1,76 +1,8 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, SubagentThinkingLevel } from "./agents/types.js";
-import {
-	applyExecutionProfile,
-	EXECUTION_PROFILES,
-	type ExecutionProfile,
-	executionProfileDescription,
-	executionProfileLabel,
-	executionProfilePreview,
-	inspectExecutionProfile,
-} from "./execution-profiles.js";
 import { MAX_SUBAGENT_TIMEOUT_MS } from "./limits.js";
 import { safeTerminalLine as safeTerminalText } from "./safe-text.js";
 import { readSubagentSettings, updateAgentSettingsPatch } from "./settings.js";
-
-export function executionProfileScreen() {
-	const current = inspectExecutionProfile();
-	return {
-		kind: "actions" as const,
-		title: "Execution Profiles",
-		lines: [
-			`Current built-in mapping: ${current === "custom" ? "Custom or inherited" : executionProfileLabel(current)}`,
-			"Profiles change only built-in agent thinking defaults.",
-			"Models, timeouts, tools, transport, context, and explicit tool-call values are preserved.",
-		],
-		items: [
-			...EXECUTION_PROFILES.map((profile) => ({
-				id: profile,
-				label: executionProfileLabel(profile),
-				description: executionProfileDescription(profile),
-				action: "apply-execution-profile" as const,
-			})),
-			{ id: "back", label: "Back", action: "back" as const },
-		],
-		hint: "back" as const,
-	};
-}
-
-export async function applyExecutionProfileFromUi(
-	profileValue: string,
-	ctx: ExtensionCommandContext,
-	signal: AbortSignal,
-	isCurrent: () => boolean,
-) {
-	if (!EXECUTION_PROFILES.includes(profileValue as ExecutionProfile)) {
-		return { kind: "rejected" as const };
-	}
-	const profile = profileValue as ExecutionProfile;
-	const before = executionSettingsFingerprint();
-	const confirmed = await ctx.ui.confirm(
-		`Apply ${executionProfileLabel(profile)} profile?`,
-		[
-			executionProfileDescription(profile),
-			...executionProfilePreview(profile),
-			"Existing model, timeout, and tool overrides remain unchanged.",
-		].join("\n"),
-		{ signal },
-	);
-	if (signal.aborted || !isCurrent()) return { kind: "close" as const };
-	if (!confirmed) return { kind: "rejected" as const };
-	if (before !== executionSettingsFingerprint()) {
-		ctx.ui.notify("Agent execution settings changed while confirming; review again.", "warning");
-		return { kind: "rejected" as const };
-	}
-	try {
-		applyExecutionProfile(profile);
-		ctx.ui.notify(`Applied ${executionProfileLabel(profile)} profile.`, "info");
-		return { kind: "stay" as const };
-	} catch (error) {
-		ctx.ui.notify(`Execution profile was not saved: ${formatError(error)}`, "error");
-		return { kind: "rejected" as const };
-	}
-}
 
 export function executionAgentPickerScreen(agents: readonly AgentConfig[]) {
 	const configured = readSubagentSettings()?.agents ?? {};
@@ -309,10 +241,6 @@ function hasTerminalControl(value: string): boolean {
 		const code = character.codePointAt(0) ?? 0;
 		return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
 	});
-}
-
-function executionSettingsFingerprint(): string {
-	return JSON.stringify(readSubagentSettings()?.agents ?? {});
 }
 
 function formatError(error: unknown): string {

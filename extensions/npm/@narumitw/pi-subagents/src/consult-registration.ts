@@ -49,9 +49,10 @@ export function registerSubagentConsult(
 		description: baseDescription(),
 		promptSnippet: "Consult one constrained read-only subagent and wait for its answer",
 		promptGuidelines: [
-			"Use subagent_consult for bounded reconnaissance, planning, or review whose result is required in the current turn.",
+			"Use subagent_consult only for bounded read-only evidence gathering when an independent perspective is worth making the main agent wait.",
+			"Keep ordinary planning and review in the main agent with applicable skills and deterministic checks; use subagent_consult only when synchronous read-only isolation adds concrete value.",
 			"Set subagent_consult timeoutMs to the shortest realistic work deadline for the task difficulty; split oversized consultations instead of extending the deadline merely to compensate for broad scope.",
-			"Implementation-shaped tasks remain read-only and can return only analysis or instructions.",
+			"Implementation-shaped subagent_consult tasks remain read-only and can return only analysis or instructions.",
 		],
 		parameters: SubagentConsultParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
