@@ -10,7 +10,7 @@ import {
 import { ContentBlockSchema } from "@modelcontextprotocol/core";
 import type { ConsentManager } from "./consent-manager.ts";
 import { ServerError, wrapError } from "./errors.ts";
-import { formatAuthRequiredMessage } from "./utils.ts";
+import { formatAuthRequiredMessage, normalizeToolArguments } from "./utils.ts";
 import { buildHostHtmlTemplate, buildCspMetaContent } from "./host-html-template.ts";
 import { logger } from "./logger.ts";
 import type { McpServerManager } from "./server-manager.ts";
@@ -113,6 +113,7 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
   let currentDisplayMode: UiDisplayMode = options.hostContext?.displayMode ?? "inline";
   let nextEventId = 1;
   const eventLog: Array<{ id: number; name: string; payload: unknown }> = [];
+  let latestCheckpointEventId: number | undefined;
   let streamSummary: UiStreamSummary | undefined;
 
   // Track messages from UI for retrieval
@@ -185,9 +186,12 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
     lastHeartbeatAt = Date.now();
   };
 
-  const updateStreamSummary = (payload: unknown) => {
+  const updateStreamSummary = (eventId: number, payload: unknown) => {
     const envelope = getVisualizationStreamEnvelope((payload as { structuredContent?: unknown } | null)?.structuredContent);
     if (!envelope) return;
+    if (envelope.frameType === "checkpoint" || envelope.frameType === "final") {
+      latestCheckpointEventId = eventId;
+    }
     if (!streamSummary) {
       streamSummary = {
         streamId: envelope.streamId,
@@ -210,15 +214,9 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
   };
 
   const getLatestCheckpointIndex = () => {
-    for (let index = eventLog.length - 1; index >= 0; index -= 1) {
-      const entry = eventLog[index];
-      if (!entry) continue;
-      const envelope = getVisualizationStreamEnvelope((entry.payload as { structuredContent?: unknown } | null)?.structuredContent);
-      if (envelope?.frameType === "checkpoint" || envelope?.frameType === "final") {
-        return index;
-      }
-    }
-    return -1;
+    const firstEventId = eventLog[0]?.id;
+    if (latestCheckpointEventId === undefined || firstEventId === undefined || latestCheckpointEventId < firstEventId) return -1;
+    return latestCheckpointEventId - firstEventId;
   };
 
   const pruneEventLog = () => {
@@ -238,7 +236,7 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
     if (completed) return;
     const eventId = nextEventId++;
     eventLog.push({ id: eventId, name, payload });
-    updateStreamSummary(payload);
+    updateStreamSummary(eventId, payload);
     pruneEventLog();
     const chunk = serializeEvent(eventId, name, payload);
     for (const client of sseClients) {
@@ -438,12 +436,16 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
           return;
         }
 
+        let normalizedArguments: Record<string, unknown>;
+        try {
+          normalizedArguments = normalizeToolArguments(callParams.arguments, `tool "${callParams.name}" arguments`);
+        } catch (error) {
+          sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+          return;
+        }
         const callArgs = {
           name: callParams.name,
-          arguments:
-            callParams.arguments && typeof callParams.arguments === "object" && !Array.isArray(callParams.arguments)
-              ? callParams.arguments
-              : {},
+          arguments: normalizedArguments,
         };
         const toolMeta = {
           name: callParams.name,

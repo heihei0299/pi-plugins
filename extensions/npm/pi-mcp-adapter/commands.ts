@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { OverlayHandle } from "@earendil-works/pi-tui";
 import type { McpExtensionState } from "./state.ts";
 import { isServerDisabled, type McpAuthResult, type McpConfig, type McpPanelCallbacks, type McpPanelResult, type ImportKind } from "./types.ts";
 import {
@@ -20,6 +21,7 @@ import { loadMetadataCache, reconstructPromptMetadata } from "./metadata-cache.t
 import { buildToolMetadata } from "./tool-metadata.ts";
 import { supportsOAuth, authenticate, removeAuth, type McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { getAuthStorageOptions, inspectAuthForUrl } from "./mcp-auth.ts";
+import { inspectBearerTokenForUrl, removeBearerToken } from "./mcp-bearer-store.ts";
 import { loadOnboardingState, markSetupCompleted as persistSetupCompleted, markSharedConfigHintShown } from "./onboarding-state.ts";
 import { openPath, resolveServerUrl, sanitizeTerminalText } from "./utils.ts";
 import { isAbortError } from "./runtime-owner.ts";
@@ -287,25 +289,14 @@ export async function authenticateServer(
     const authStorageOptions = getAuthStorageOptions(config.settings?.oauthDir, cwd);
     const status = await authenticate(serverName, serverUrl, definition, {
       ...(authStorageOptions.baseDir ? { authStorageOptions } : {}),
-      onAuthorizationUrl: (authorizationUrl) => {
-        ui.notify(
-          `Open this URL to authenticate ${serverName}:\n\n${terminalHyperlink(authorizationUrl, authorizationUrl)}\n\n` +
-          "After approving, Pi will complete automatically if the browser can reach its localhost callback. " +
-          "On a remote machine, copy the full localhost URL from the browser address bar and paste it into Pi.",
-          "info"
-        );
-      },
+      onAuthorizationUrl: () => {},
       onAuthorizationInput: async (authorizationUrl, inputSignal) => {
-        const readyToPaste = await ui.confirm(
-          `Authorize ${serverName}`,
-          `Open this link in your browser:\n${terminalHyperlink(authorizationUrl, authorizationUrl)}\n\n` +
-          "After approving access, select Yes to paste the callback URL.",
-          { signal: inputSignal },
-        );
-        if (!readyToPaste || inputSignal.aborted) return undefined;
+        if (inputSignal.aborted) return undefined;
         return ui.input(
-          `Complete ${serverName} OAuth`,
-          "Paste the full callback URL",
+          `Complete ${serverName} OAuth\n\n` +
+            `${terminalHyperlink("Open authorization page", authorizationUrl)}\n${authorizationUrl}\n\n` +
+            "Approve access, then paste the full localhost callback URL below.",
+          undefined,
           { signal: inputSignal },
         );
       },
@@ -377,6 +368,75 @@ export async function logoutServer(
   updateStatusBar(state);
 
   const message = `OAuth credentials cleared for "${serverName}". Run /mcp-auth ${serverName} to authenticate again.`;
+  if (ui) ui.notify(message, "info");
+  return { ok: true, message };
+}
+
+function validateBearerTokenStoreServer(
+  serverName: string,
+  state: McpExtensionState,
+): { ok: true; serverUrl: string } | { ok: false; message: string; type: "error" | "warning" } {
+  const safeName = sanitizeTerminalText(serverName);
+  const definition = state.config.mcpServers[serverName];
+  if (!definition) return { ok: false, message: `Server "${safeName}" not found in config`, type: "error" };
+  if (isServerDisabled(definition)) return { ok: false, message: `Server "${safeName}" is disabled. Run /mcp enable ${safeName}, then /reload.`, type: "warning" };
+  if (definition.auth !== "bearer" || definition.bearerTokenStore !== true) {
+    return { ok: false, message: `Server "${safeName}" is not configured for bearerTokenStore.`, type: "error" };
+  }
+  // resolveServerUrl embeds the interpolated URL in its exceptions; redact it
+  // because the URL can carry userinfo or interpolated secrets.
+  let serverUrl: string | undefined;
+  try {
+    serverUrl = resolveServerUrl(definition);
+  } catch {
+    return { ok: false, message: `Server "${safeName}" has an invalid or unresolvable URL.`, type: "error" };
+  }
+  if (!serverUrl) return { ok: false, message: `Server "${safeName}" has no URL configured.`, type: "error" };
+  return { ok: true, serverUrl };
+}
+
+export async function manageBearerToken(
+  action: "set" | "remove" | "status",
+  serverName: string,
+  state: McpExtensionState,
+  ctx: ExtensionContext,
+): Promise<{ ok: boolean; message: string }> {
+  const ui = ctx.hasUI ? ctx.ui : undefined;
+  const safeName = sanitizeTerminalText(serverName);
+  const validation = validateBearerTokenStoreServer(serverName, state);
+  if (!validation.ok) {
+    if (ui) ui.notify(validation.message, validation.type);
+    return { ok: false, message: validation.message };
+  }
+
+  if (action === "set") {
+    const message = `Cannot store bearer token here: Pi extension UI has no masked secret input primitive. Run \`pi-mcp-adapter token set ${safeName}\` in a terminal; it reads the token from stdin only.`;
+    if (ui) ui.notify(message, "error");
+    return { ok: false, message };
+  }
+
+  if (action === "status") {
+    const status = inspectBearerTokenForUrl(serverName, validation.serverUrl);
+    const message = status.status === "present"
+      ? `Bearer token is stored for "${safeName}".`
+      : status.status === "url-mismatch"
+        ? `Bearer token is stored for "${safeName}", but its URL does not match the current server URL.`
+        : status.status === "unavailable"
+          ? status.message
+          : `No bearer token is stored for "${safeName}".`;
+    if (ui) ui.notify(message, status.status === "unavailable" ? "error" : "info");
+    return { ok: status.status !== "unavailable", message };
+  }
+
+  try {
+    removeBearerToken(serverName);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (ui) ui.notify(`Failed to remove bearer token for "${safeName}": ${sanitizeTerminalText(message)}`, "error");
+    return { ok: false, message };
+  }
+
+  const message = `Bearer token removed for "${safeName}".`;
   if (ui) ui.notify(message, "info");
   return { ok: true, message };
 }
@@ -484,6 +544,7 @@ function buildMcpPanelCallbacks(
   state: McpExtensionState,
   config: McpConfig,
   ctx: ExtensionContext,
+  getOverlayHandle?: () => OverlayHandle | undefined,
 ): McpPanelCallbacks {
   // Panel-only diagnostics keep status inspection from mutating connection
   // failure state while allowing the existing panel failure UI to show why the
@@ -496,7 +557,16 @@ function buildMcpPanelCallbacks(
       const definition = config.mcpServers[serverName];
       return definition ? !isServerDisabled(definition) && supportsOAuth(definition) : false;
     },
-    authenticate: (serverName: string) => authenticateServer(serverName, config, ctx, state.owner?.signal, state.oauthRuntime),
+    authenticate: async (serverName: string) => {
+      const overlay = getOverlayHandle?.();
+      overlay?.setHidden(true);
+      try {
+        return await authenticateServer(serverName, config, ctx, state.owner?.signal, state.oauthRuntime);
+      } finally {
+        overlay?.setHidden(false);
+        overlay?.focus();
+      }
+    },
     getConnectionStatus: (serverName: string) => {
       authStatusFailures.delete(serverName);
       const definition = config.mcpServers[serverName];
@@ -565,7 +635,8 @@ export async function openMcpPanel(
   const provenanceMap = getServerProvenance(configPath, ctx.cwd);
   const { lines: noticeLines, fingerprint } = buildSharedConfigNoticeLines(configPath, ctx.cwd);
 
-  const callbacks = buildMcpPanelCallbacks(state, config, ctx);
+  let overlayHandle: OverlayHandle | undefined;
+  const callbacks = buildMcpPanelCallbacks(state, config, ctx, () => overlayHandle);
 
   const { createMcpPanel } = await import("./mcp-panel.ts");
   let configChanged = false;
@@ -591,7 +662,11 @@ export async function openMcpPanel(
           });
         }, { noticeLines, keybindings });
       },
-      { overlay: true, overlayOptions: { anchor: "center", width: 82 } },
+      {
+        overlay: true,
+        overlayOptions: { anchor: "center", width: 82 },
+        onHandle: (handle) => { overlayHandle = handle; },
+      },
     );
   });
 
@@ -630,7 +705,8 @@ export async function openMcpAuthPanel(
   const cache = loadMetadataCache();
   const configPath = pi.getFlag("mcp-config") as string | undefined ?? configOverridePath;
   const provenanceMap = getServerProvenance(configPath, ctx.cwd);
-  const callbacks = buildMcpPanelCallbacks(state, config, ctx);
+  let overlayHandle: OverlayHandle | undefined;
+  const callbacks = buildMcpPanelCallbacks(state, config, ctx, () => overlayHandle);
   const { createMcpPanel } = await import("./mcp-panel.ts");
 
   await new Promise<void>((resolve) => {
@@ -645,7 +721,11 @@ export async function openMcpAuthPanel(
           noticeLines: ["Select an OAuth MCP server and press Enter or ctrl+a to authenticate."],
         });
       },
-      { overlay: true, overlayOptions: { anchor: "center", width: 82 } },
+      {
+        overlay: true,
+        overlayOptions: { anchor: "center", width: 82 },
+        onHandle: (handle) => { overlayHandle = handle; },
+      },
     );
   });
 

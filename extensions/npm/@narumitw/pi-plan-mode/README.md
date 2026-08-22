@@ -39,8 +39,12 @@ pi -e npm:@narumitw/pi-plan-mode
 Try this package locally from the repository root:
 
 ```bash
-pi -e ./extensions/pi-plan-mode
+pi -e ./packages/pi-plan-mode
 ```
+
+The package declares `dist/index.ts`, so an unbuilt local checkout must run `npm --workspace @narumitw/pi-plan-mode run build` before Pi loads the package directory.
+
+`just try plan-mode` runs that build automatically.
 
 ## 🚀 Usage
 
@@ -164,8 +168,12 @@ You can also exit directly. Before implementation, direct exit discards the late
 
 ## ⚙️ Settings
 
-Open **Settings** from an inactive `/plan` menu to edit one flat group of four workflow choices: **Plan thinking**, **Plan tools**, **After Implement**, and **Export destination**. You can also edit `$PI_CODING_AGENT_DIR/pi-plan-mode.json` (normally `~/.pi/agent/pi-plan-mode.json`) manually; `safeSubcommands` remains JSON-only. The file is optional, is read at session start, and is created only after an explicit Settings save or manual edit.
-
+Open **Settings** from an inactive `/plan` menu to edit one flat group of five workflow choices: **Plan thinking**, **Plan tools**, **After Implement**, **Export destination**, and **Plan mode shortcut**.
+You can also edit `$PI_CODING_AGENT_DIR/pi-plan-mode.json` (normally `~/.pi/agent/pi-plan-mode.json`) manually.
+`safeSubcommands` remains JSON-only.
+You can change the Plan-mode shortcut with `toggleShortcut` as long as the file remains JSON-only and uses a valid key string.
+The file is optional, is read at session start and reloaded automatically when changed, and is created only after an explicit Settings save or manual edit.
+When omitted, the shortcut is disabled by default.
 ```json
 {
   "thinkingLevel": "inherit",
@@ -175,7 +183,8 @@ Open **Settings** from an inactive `/plan` menu to edit one flat group of four w
   "safeSubcommands": {
     "git": ["status", "log", "rev-parse", "blame"],
     "gh": ["pr view", "pr list", "issue view", "issue list"]
-  }
+  },
+  "toggleShortcut": "<your_key>"
 }
 ```
 
@@ -198,6 +207,13 @@ Changing this setting applies to the next Implement action only. Each active imp
 `defaultPlanExportPath` controls only exports that omit a path. Omit it—or submit an empty value in Settings—to use `PLAN.md`. The value must be a non-empty string of at most 4,096 characters without terminal control characters or NUL. Relative values are resolved against the current working directory at export time; the Settings detail and every export input preview the concrete resolved destination. An explicit `/plan export <path>` is a one-off override and does not edit Settings. Saving a new destination affects the next export immediately, including export of a currently active implementation.
 
 The existing no-overwrite, cancellation, and atomic Plan-state behavior is unchanged. A failed save rolls the row back to its previous value; a failed or cancelled export preserves the plan and target. Long previews wrap or truncate to the available terminal width without changing the raw path used by the action.
+
+### Toggle shortcut
+
+`toggleShortcut` controls the global Plan-mode keybinding used by the TUI shortcut.
+Omit this setting to keep the shortcut disabled.
+Set `toggleShortcut` to the key string you want.
+Avoid values that conflict with editor shortcuts.
 
 ### Safe shell subcommands
 
@@ -264,7 +280,10 @@ This extension maps Codex's `ModeKind::Plan` behavior onto Pi's extension API:
 ## 🗂️ Package layout
 
 ```txt
-extensions/pi-plan-mode/
+packages/pi-plan-mode/
+├── dist/                  # Generated TypeScript runtime loaded by Jiti
+├── scripts/
+│   └── build-runtime.mjs  # Deterministic runtime builder and boundary validator
 ├── src/
 │   ├── index.ts      # Pi package entrypoint
 │   ├── plan-mode.ts      # Extension registration, mode state, and UI loading boundary
@@ -281,10 +300,12 @@ extensions/pi-plan-mode/
 ```json
 {
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": ["./dist/index.ts"]
   }
 }
 ```
+
+The generated runtime is built from the authoritative `src/index.ts` graph and does not import back into `src`.
 
 ## 🔎 Keywords
 

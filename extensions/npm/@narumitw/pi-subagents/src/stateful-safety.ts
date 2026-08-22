@@ -4,7 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents/discovery.js";
 import type { AgentScope, SubagentSettings } from "./agents/types.js";
 import { safeTerminalLine } from "./safe-text.js";
-import { readSubagentSettings } from "./settings.js";
+import { readSubagentSettings } from "./settings-reader.js";
 
 export function isWriteCapable(tools: string[] | undefined): boolean {
 	if (!tools) return true;

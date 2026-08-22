@@ -126,6 +126,42 @@ Each directory must contain a valid Agent Plugins 1.0 `plugin.json`. If it also 
 
 Agent Plugins is a portable package format. Native Pi MCP config remains `.mcp.json`, `~/.config/mcp/mcp.json`, and Pi-owned overrides.
 
+### Pi package manifests
+
+A Pi package can ship MCP servers for the installed adapter without requiring a separate MCP config file. Declare a package-relative config in its `package.json`:
+
+```json
+{
+  "pi": {
+    "mcp": "./mcp.json"
+  }
+}
+```
+
+`pi.mcp` can also be an array of package-relative paths. Each file uses the normal `mcpServers` object shape, but package manifests load only server entries: package `settings` and `imports` are ignored. Server names are prefixed with the sanitized package name, such as `acme_tools__docs`, and user/global/project MCP config has higher precedence. The adapter loads only Pi packages listed in Pi settings; it does not scan `node_modules`.
+
+### Runtime registration from other extensions
+
+An extension can register MCP servers with the installed adapter at runtime, for example a plugin host that discovers plugins after load:
+
+```ts
+import { registerMcpServer } from "pi-mcp-adapter";
+
+export default function pluginHost(pi) {
+  const registration = registerMcpServer({
+    pi,
+    name: "acme__docs",
+    definition: {
+      url: "https://mcp.example.com/mcp",
+    },
+  });
+  // Later, when the plugin is uninstalled:
+  await registration.dispose();
+}
+```
+
+Runtime registrations are session scoped and never written to config files. Duplicate server names fail closed against configured servers and other registrations. Registered servers use the normal lazy connection, OAuth, approval, and shutdown behavior, but they are proxy-tool-only and their tools become visible at the next tool sync. To change a definition, dispose the registration and register again. Registration throws when no adapter is installed for the given Pi instance.
+
 ### SDK configuration
 
 Use `createMcpAdapter` when an SDK or server integration already owns its MCP configuration:
@@ -178,7 +214,7 @@ pi.events.on(MCP_STATUS_EVENT, (snapshot) => {
 });
 ```
 
-The snapshot is read-only machine-readable data with copied per-server entries. It includes `totalTools`, `totalResources`, `connectedCount`, and `disabledCount`; each server includes `name`, `status`, `toolCount`, and `disabled`, with `resourceCount` when known and `failedAgoSeconds` only for an active failure. Reading status never connects a lazy server, starts authentication, or exposes SDK clients, transports, credentials, or server definitions. An initial snapshot is emitted after initialization, updates are emitted for status and metadata changes, and an empty snapshot is emitted when the session shuts down.
+The snapshot is read-only machine-readable data with copied per-server entries. It includes `totalTools`, `totalResources`, `connectedCount`, and `disabledCount`; each server includes `name`, `status`, `toolCount`, and `disabled`, with `resourceCount` when known and `failedAgoSeconds` only for an active failure. Reading status never connects a lazy server, starts authentication, or exposes SDK clients, transports, credentials, or server definitions. An initial snapshot is emitted after initialization, updates are emitted for status and metadata changes, and an empty snapshot is emitted when the session shuts down. Initialization withholds that first snapshot until authoritative metadata has been reconciled into Pi's active direct-tool registry. A `connected` snapshot therefore follows model-facing tool-surface synchronization, including removal of stale cached tools when the authoritative catalog is empty.
 
 In the configuration examples below, `30000` is illustrative only. If `requestTimeoutMs` is omitted or set to `<= 0`, the MCP SDK default timeout is used.
 
@@ -219,6 +255,7 @@ In the configuration examples below, `30000` is illustrative only. If `requestTi
 | `oauth.logoUri` | Client logo URL advertised during Dynamic Client Registration fallback (RFC 7591 `logo_uri`). Must be an absolute `http(s)` URL — consent screens fetch it server-side, so local paths render nothing. Omitted from the registration request when unset |
 | `oauth.skipIssuerMetadataValidation` | `true` disables the OAuth authorization-server metadata issuer check for this server. This weakens OAuth mix-up protection and should only be used for known-misconfigured internal servers while their metadata is being fixed. |
 | `bearerToken` / `bearerTokenEnv` | Token or env var name; `bearerToken` supports `${VAR}` and `$env:VAR` interpolation. A leading `!` in `bearerToken` runs a command when the HTTP server connects; use `!!` for a literal leading `!`. |
+| `bearerTokenStore` | Set to `true` to read a static bearer token from the adapter-owned OS credential store when `auth` is `"bearer"` and no `bearerToken` or `bearerTokenEnv` is configured. Stored records are keyed only by the server name, bind to the resolved server URL, and are never named by config. Store a token with `pi-mcp-adapter token set <server>`, which reads it from a masked prompt or stdin pipe and never from an argument. `/mcp token status <server>` and `/mcp token remove <server>` manage non-secret state inside Pi; `/mcp token set` stays disabled until Pi exposes masked secret input. |
 | `lifecycle` | `"lazy"` (default), `"eager"`, `"keep-alive"`, or `"lazy-keep-alive"` |
 | `idleTimeout` | Minutes before idle disconnect (overrides global) |
 | `requestTimeoutMs` | Request timeout in milliseconds for live MCP calls (overrides global; if omitted or `<= 0`, the MCP SDK default timeout is used) |
@@ -248,6 +285,8 @@ For pre-registered browser OAuth clients, set `oauth.redirectUri` to the exact c
 If an internal authorization server publishes mismatched OAuth metadata and cannot be fixed immediately, set `oauth.skipIssuerMetadataValidation: true` on that server only. This is security-weakening. It disables the RFC 8414 issuer echo check and should not be used for public or untrusted servers.
 
 Secret values in `headers`, `bearerToken`, `oauth.clientSecret`, and stdio `env` may use a leading `!command` to obtain their value at connection or authentication time. The command runs with stdin and stderr suppressed, stdout is limited to 1 MiB and trimmed, and it must finish within 10 seconds with non-empty output; failures stop the connection or authentication flow. Commands are not run during OAuth discovery or while reading, merging, previewing, hashing, or rendering configuration. Use `!!` to escape a literal leading `!`; ordinary and escaped values retain environment interpolation.
+
+For local desktop bearer tokens, `bearerTokenStore: true` can opt in to the adapter-owned credential-store namespace. It never falls back to plaintext if the store is unavailable, if the stored record is malformed, or if the stored URL differs from the effective server URL. Literal tokens, command tokens, and environment tokens keep precedence so existing configs do not change. Create or rotate a stored token with `pi-mcp-adapter token set <server>` (masked prompt on a terminal, or piped stdin such as `security find-generic-password -s my-token -w | pi-mcp-adapter token set <server>`); the record binds to the effective configured URL at write time. Token commands need Node 22.18+.
 
 ### Shared MCP processes with rmcp-mux
 
@@ -700,6 +739,7 @@ Servers that provide usage guidance via the MCP `instructions` field surface it 
 | Command | What it does |
 |---------|--------------|
 | `/mcp` | Interactive panel and first-run onboarding surface |
+| `/pi-mcp` | Alias for `/mcp` when the host reserves `/mcp` |
 | `/mcp setup` | Guided setup for imports, a minimal `.mcp.json`, curated known servers, RepoPrompt quick-add, and config-path inspection |
 | `/mcp tools` | List all tools |
 | `/mcp prompts` | List all MCP prompts registered as slash commands |

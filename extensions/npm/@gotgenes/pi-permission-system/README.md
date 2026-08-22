@@ -115,7 +115,7 @@ Within a surface map like `bash` or `mcp`, **last matching rule wins** — put b
 The optional `shellTools` field records which non-`bash` tools carry shell semantics (e.g. an `exec_command` tool that replaces native `bash`), so they are gated at full parity with native `bash` — see [docs/configuration.md](docs/configuration.md#shelltools--gating-aliased-shell-tools).
 
 The optional `authorizerChain` field names registered case-by-case decision links (e.g. a light model judge) to consult when a request lands on `ask`, ahead of the interactive prompt.
-A downstream extension registers a link via `getPermissionsService().registerAuthorizer(name, authorize)`; it decides nothing until you name it here (opt-in), config order fixes the chain order, and the chain owner caps any link's `allow` on `external_directory`/`path` to keep it within your policy — see [docs/configuration.md](docs/configuration.md#authorizer-chain--case-by-case-decision-links).
+A downstream extension registers a link via `getPermissionsService(sessionId).registerAuthorizer(name, authorize)`; it decides nothing until you name it here (opt-in), config order fixes the chain order, and the chain owner caps any link's `allow` on `external_directory`/`path` to keep it within your policy — see [docs/configuration.md](docs/configuration.md#authorizer-chain--case-by-case-decision-links).
 A subagent's ask is reviewed by the chain of the session serving it, one hop up, rather than inside the subagent — see the same section.
 [`@gotgenes/pi-permission-model-judge`](https://github.com/gotgenes/pi-packages/tree/main/packages/pi-permission-model-judge) is a first-party reference implementation of such a link — a deny-first reviewer that auto-denies mistyped out-of-directory paths.
 
@@ -137,6 +137,41 @@ Commands that previously slipped through silently on the error or empty-parse pa
 
 If you relied on the old permissive behavior for bash, set an explicit permissive bash policy — `"bash": { "*": "allow" }` — which also suppresses the new startup warning emitted when a top-level `"*": "allow"` leaves bash ungated.
 
+## Scope and non-goals
+
+**Purpose.**
+An agent takes many actions, most of them benign, but some of which need a human to confirm they are safe or correct.
+This package routes your attention to those, and turns each ruling into deterministic, reusable policy — enforced at the host level rather than by asking the model to police itself.
+
+**In scope.**
+Hardening the gates against bypass, fail-closed corrections (breaking ones included), named opt-in extension seams for downstream packages, and structural work backed by a written decision record.
+
+**Non-goals.**
+
+- _Sandboxing._
+  This is a decision layer, not a sandbox — it decides and records, it does not isolate.
+  If a dangerous action is reachable through an allowed tool, policy has to restrict it explicitly.
+- _Deciding project trust._
+  A policy enforcer, not a trust oracle: whether a project is trusted is Pi's decision and yours, and this package observes it.
+- _Permissive defaults, trust profiles, or workflow presets._
+  Your risk profile is not knowable from here, so defaults are least-privilege and common policies ship as documented recipes rather than preset keywords.
+- _Guessing what is sensitive._
+  No built-in secret denylist, and log redaction is key-name-structural rather than predictive — a redactor that silently misses a key invites treating the log as safe to share.
+- _Model judgment in the core._
+  This package makes no LLM call and holds no model config; model-assisted judging attaches as a chain link over the authorizer seam instead.
+  A link decides nothing until you name it in `authorizerChain`, and its `allow` on an excluded surface is downgraded to `defer`.
+
+The [architecture doc](https://github.com/gotgenes/pi-packages/blob/main/packages/pi-permission-system/docs/architecture/architecture.md#scope-and-non-goals) carries the full inventory, with the decision record behind each entry.
+
+**One decision is still open.**
+How policy may _enter_ the system — which channels are admissible, and with what precedence — is being worked out in [issue #639](https://github.com/gotgenes/pi-packages/issues/639), along with whether a capability model replaces the current surface list.
+Several requested widenings are parked on it rather than declined, durable persistence of an approval among them.
+
+**Where adjacent requests belong.**
+True isolation of a permitted action → an agent sandbox.
+Model-assisted judging of an `ask` → a chain link over the authorizer seam; [@gotgenes/pi-permission-model-judge](https://www.npmjs.com/package/@gotgenes/pi-permission-model-judge) is the first-party one, and judges mistyped paths.
+Approve-and-steer, edit diffs, and risk explanations → a downstream package over the `permissions:decision` event and the presentation seams.
+
 ## Documentation
 
 | Document                                                                                                                       | Contents                                                                                                             |
@@ -144,7 +179,7 @@ If you relied on the old permissive behavior for bash, set an explicit permissiv
 | [docs/configuration.md](docs/configuration.md)                                                                                 | Full policy reference, runtime knobs, per-agent overrides, recipes                                                   |
 | [docs/session-approvals.md](docs/session-approvals.md)                                                                         | Session-scoped rules, pattern suggestions, bash arity table                                                          |
 | [docs/cross-extension-api.md](docs/cross-extension-api.md)                                                                     | Cross-extension service accessor, event bus integration, prompt and decision broadcasts                              |
-| [docs/subagent-integration.md](docs/subagent-integration.md)                                                                   | Permission forwarding, coexistence with subagent extensions                                                          |
+| [docs/subagent-integration.md](docs/subagent-integration.md)                                                                   | The subagent adapter convention, permission forwarding, coexistence with subagent extensions                         |
 | [docs/guides/permission-frontmatter-for-subagent-extensions.md](docs/guides/permission-frontmatter-for-subagent-extensions.md) | Convention guide for subagent extension authors                                                                      |
 | [docs/opencode-compatibility.md](docs/opencode-compatibility.md)                                                               | OpenCode compatibility — shared concepts, divergences, porting guide                                                 |
 | [docs/troubleshooting.md](docs/troubleshooting.md)                                                                             | Common issues, diagnostic logging, threat model                                                                      |
@@ -153,6 +188,7 @@ If you relied on the old permissive behavior for bash, set an explicit permissiv
 | [docs/migration/0644-project-trust-gating.md](docs/migration/0644-project-trust-gating.md)                                     | Project-trust gating (breaking) — project config loads only after project trust                                      |
 | [docs/migration/0745-prompt-payload-contracts.md](docs/migration/0745-prompt-payload-contracts.md)                             | Prompt payload contracts (breaking) — the forwarded wire, the `ui_prompt` broadcast, and the deprecated preview caps |
 | [docs/migration/0746-review-log-fields.md](docs/migration/0746-review-log-fields.md)                                           | Review-log fields (breaking) — `message` replaced by request facts, and the `reviewLogFieldMaxWidth` bound           |
+| [docs/migration/0794-keyed-service-locator.md](docs/migration/0794-keyed-service-locator.md)                                   | Keyed service locator (breaking) — `getPermissionsService(sessionId)`, and the repeating ready event                 |
 
 ## Development
 

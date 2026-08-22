@@ -12,6 +12,7 @@ export interface RpcTurnCapture {
 	provider?: string;
 	model?: string;
 	usage: TransportUsage;
+	inFlightUsage?: TransportUsage;
 	firstActivityAt?: number;
 	journal: TimeoutProgressJournal;
 }
@@ -25,8 +26,9 @@ export function createRpcTurnCapture(): RpcTurnCapture {
 	};
 }
 
-export function captureRpcEvent(event: unknown, capture: RpcTurnCapture): void {
-	if (!isRecord(event)) return;
+export function captureRpcEvent(event: unknown, capture: RpcTurnCapture): boolean {
+	if (!isRecord(event)) return false;
+	const previousUsage = snapshotRpcUsage(capture);
 	if (event.type === "tool_execution_start") {
 		capture.journal.recordToolCall(
 			typeof event.toolCallId === "string" ? event.toolCallId : "",
@@ -42,7 +44,12 @@ export function captureRpcEvent(event: unknown, capture: RpcTurnCapture): void {
 			{ content: result.content, isError: event.isError },
 		);
 	}
+	if (event.type === "message_start" && isRecord(event.message)) {
+		if (event.message.role === "assistant") commitRpcInFlightUsage(capture);
+	}
 	if (event.type === "message_update") {
+		const usage = normalizeUsage(event.usage);
+		if (usage) capture.inFlightUsage = usage;
 		const delta = event.assistantMessageEvent;
 		if (isRecord(delta) && delta.type === "text_delta" && typeof delta.delta === "string") {
 			capture.partial = truncateUtf8(
@@ -51,10 +58,28 @@ export function captureRpcEvent(event: unknown, capture: RpcTurnCapture): void {
 			).text;
 		}
 	}
-	if (event.type !== "message_end" || !isRecord(event.message)) return;
-	const candidate = event.message;
-	if (candidate.role !== "toolResult") journalMessages(capture.journal, [candidate]);
-	if (candidate.role !== "assistant") return;
+	if (event.type === "message_end" && isRecord(event.message)) {
+		const candidate = event.message;
+		if (candidate.role !== "toolResult") journalMessages(capture.journal, [candidate]);
+		if (candidate.role === "assistant") captureAssistantEnd(candidate, capture);
+	}
+	return !sameUsage(previousUsage, snapshotRpcUsage(capture));
+}
+
+export function snapshotRpcUsage(capture: RpcTurnCapture): TransportUsage {
+	const usage = { ...capture.usage };
+	if (capture.inFlightUsage) addUsage(usage, capture.inFlightUsage);
+	return usage;
+}
+
+export function commitRpcInFlightUsage(capture: RpcTurnCapture): boolean {
+	if (!capture.inFlightUsage) return false;
+	addUsage(capture.usage, capture.inFlightUsage);
+	capture.inFlightUsage = undefined;
+	return true;
+}
+
+function captureAssistantEnd(candidate: Record<string, unknown>, capture: RpcTurnCapture): void {
 	capture.output = truncateUtf8(
 		assistantText(candidate.content) || capture.partial,
 		DEFAULT_MAX_OUTPUT_BYTES,
@@ -76,8 +101,11 @@ export function captureRpcEvent(event: unknown, capture: RpcTurnCapture): void {
 				? candidate.model
 				: undefined;
 	capture.model = responseModel ? boundedPrivateText(responseModel, 256) : undefined;
-	capture.usage.turns++;
-	addUsage(capture.usage, candidate.usage);
+	const finalUsage = normalizeUsage(candidate.usage);
+	const completedUsage = finalUsage ?? capture.inFlightUsage;
+	if (completedUsage) addUsage(capture.usage, completedUsage);
+	capture.inFlightUsage = undefined;
+	capture.usage.turns = addUsageValue(capture.usage.turns, 1);
 }
 
 export function observeRpcBudgetEvent(event: unknown, monitor: TurnBudgetMonitor): void {
@@ -101,29 +129,76 @@ function assistantToolCallCount(content: unknown): number {
 	return content.filter((part) => isRecord(part) && part.type === "toolCall").length;
 }
 
-function addUsage(target: TransportUsage, value: unknown): void {
-	if (!isRecord(value)) return;
-	target.input += safeNonNegative(value.input);
-	target.output += safeNonNegative(value.output);
-	target.cacheRead += safeNonNegative(value.cacheRead);
-	target.cacheWrite += safeNonNegative(value.cacheWrite);
+function normalizeUsage(value: unknown): TransportUsage | undefined {
+	if (!isRecord(value)) return undefined;
+	const input = safeNonNegative(value.input);
+	const output = safeNonNegative(value.output);
+	const cacheRead = safeNonNegative(value.cacheRead);
+	const cacheWrite = safeNonNegative(value.cacheWrite);
 	const reportedTotal = safeNonNegative(value.totalTokens);
-	target.totalTokens +=
-		reportedTotal ||
-		safeNonNegative(value.input) +
-			safeNonNegative(value.output) +
-			safeNonNegative(value.cacheRead) +
-			safeNonNegative(value.cacheWrite);
-	if (isRecord(value.cost)) target.cost += safeNonNegative(value.cost.total);
+	const cost = isRecord(value.cost) ? safeNonNegative(value.cost.total) : undefined;
+	if (
+		input === undefined &&
+		output === undefined &&
+		cacheRead === undefined &&
+		cacheWrite === undefined &&
+		reportedTotal === undefined &&
+		cost === undefined
+	) {
+		return undefined;
+	}
+	const components = [input, output, cacheRead, cacheWrite].reduce<number>(
+		(total, current) => addUsageValue(total, current ?? 0),
+		0,
+	);
+	return {
+		input: input ?? 0,
+		output: output ?? 0,
+		cacheRead: cacheRead ?? 0,
+		cacheWrite: cacheWrite ?? 0,
+		totalTokens: reportedTotal ?? components,
+		cost: cost ?? 0,
+		turns: 0,
+	};
 }
 
-function safeNonNegative(value: unknown): number {
+function addUsage(target: TransportUsage, value: TransportUsage): void {
+	for (const key of [
+		"input",
+		"output",
+		"cacheRead",
+		"cacheWrite",
+		"totalTokens",
+		"cost",
+		"turns",
+	] as const) {
+		target[key] = addUsageValue(target[key], value[key]);
+	}
+}
+
+function addUsageValue(current: number, addition: number): number {
+	return Math.min(Number.MAX_SAFE_INTEGER, current + addition);
+}
+
+function safeNonNegative(value: unknown): number | undefined {
 	return typeof value === "number" &&
 		Number.isFinite(value) &&
 		value >= 0 &&
 		value <= Number.MAX_SAFE_INTEGER
 		? value
-		: 0;
+		: undefined;
+}
+
+function sameUsage(left: TransportUsage, right: TransportUsage): boolean {
+	return (
+		left.input === right.input &&
+		left.output === right.output &&
+		left.cacheRead === right.cacheRead &&
+		left.cacheWrite === right.cacheWrite &&
+		left.totalTokens === right.totalTokens &&
+		left.cost === right.cost &&
+		left.turns === right.turns
+	);
 }
 
 function assistantText(value: unknown): string {

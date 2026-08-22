@@ -7,7 +7,9 @@ import { PLAN_MODE_QUESTION_TOOL_NAME } from "./question-tool.js";
 import {
 	configuredImplementationPlanRetention,
 	configuredPlanExportPath,
+	configuredPlanModeToggleShortcut,
 	IMPLEMENTATION_PLAN_RETENTIONS,
+	normalizeKeyId,
 	PLAN_MODE_THINKING_LEVELS,
 	type PlanModeSettings,
 	type PlanModeSettingsLoadResult,
@@ -41,7 +43,7 @@ export interface PlanModeSettingsMenuOptions {
 	onSaved(settings: PlanModeSettings): void;
 }
 
-type Screen = "settings" | "tools" | "export";
+type Screen = "settings" | "tools" | "export" | "shortcut";
 type Action =
 	| "set-thinking"
 	| "open-tools"
@@ -49,7 +51,9 @@ type Action =
 	| "reset-tools"
 	| "set-retention"
 	| "open-export"
-	| "set-export";
+	| "set-export"
+	| "open-shortcut"
+	| "set-shortcut";
 
 export async function showPlanModeSettings(
 	ctx: ExtensionContext,
@@ -124,6 +128,13 @@ export async function showPlanModeSettings(
 									currentValue: safeTerminalText(configuredPlanExportPath(state.settings)),
 									action: "open-export",
 								},
+								{
+									id: "toggleShortcut",
+									label: "Plan mode shortcut",
+									description: "Set the global shortcut used to toggle Plan mode.",
+									currentValue: configuredPlanModeToggleShortcut(state.settings) ?? "none",
+									action: "open-shortcut",
+								},
 							],
 						},
 			tools: ({ state }) => ({
@@ -162,6 +173,19 @@ export async function showPlanModeSettings(
 					hint: "back",
 				};
 			},
+			shortcut: ({ state }) => ({
+				kind: "input",
+				title: "Plan mode shortcut",
+				lines: [
+					`Configured: ${configuredPlanModeToggleShortcut(state.settings) ?? "none"}`,
+					"Use Pi key identifiers.",
+					"Submit an empty value to clear the shortcut.",
+					"When unset, Plan mode has no global shortcut.",
+				],
+				placeholder: configuredPlanModeToggleShortcut(state.settings) ?? "",
+				action: "set-shortcut",
+				hint: "back",
+			}),
 		},
 		actions: {
 			"set-thinking": async ({ ctx: actionCtx, value, signal }) => {
@@ -198,6 +222,27 @@ export async function showPlanModeSettings(
 					defaultPlanExportPath
 						? `Default Plan export destination: ${safeTerminalText(defaultPlanExportPath)}.`
 						: "Default Plan export destination reset to PLAN.md.",
+				);
+				return result.kind === "stay" ? { kind: "to", screen: "settings" } : result;
+			},
+			"open-shortcut": async () => ({ kind: "to", screen: "shortcut" }),
+			"set-shortcut": async ({ ctx: actionCtx, value, signal }) => {
+				const raw = value?.trim() || null;
+				if (raw && !normalizeKeyId(raw)) {
+					actionCtx.ui.notify(
+						`Invalid key identifier: ${safeTerminalText(raw)}. Use Pi key identifiers like ctrl+alt+p.`,
+						"warning",
+					);
+					return { kind: "stay" as const };
+				}
+				const toggleShortcut = raw as PlanModeSettingsPatch["toggleShortcut"];
+				const result = await savePatch(
+					actionCtx,
+					{ toggleShortcut },
+					signal,
+					toggleShortcut
+						? `Plan mode shortcut: ${safeTerminalText(toggleShortcut)}.`
+						: "Plan mode shortcut cleared (no global shortcut).",
 				);
 				return result.kind === "stay" ? { kind: "to", screen: "settings" } : result;
 			},

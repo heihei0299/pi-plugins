@@ -15,29 +15,45 @@ It provides direct, synchronous, type-safe function calls.
 ### Quick Start
 
 ```typescript
-try {
-  const { getPermissionsService } = await import(
-    "@gotgenes/pi-permission-system"
-  );
-  const permissions = getPermissionsService();
-  if (permissions) {
-    const result = permissions.checkPermission("bash", "git push");
-    console.log(result.state); // "allow" | "deny" | "ask"
-  }
-} catch {
-  // Not installed — graceful degradation
-}
+pi.events.on("permissions:ready", (data) => {
+  const { sessionId } = data as PermissionsReadyEvent;
+  if (!sessionId) return;
+  void (async () => {
+    try {
+      const { getPermissionsService } =
+        await import("@gotgenes/pi-permission-system");
+      const permissions = getPermissionsService(sessionId);
+      if (permissions) {
+        const result = permissions.checkPermission("bash", "git push");
+        console.log(result.state); // "allow" | "deny" | "ask"
+      }
+    } catch {
+      // Not installed — graceful degradation
+    }
+  })();
+});
 ```
+
+Inside your own `session_start` handler, `ctx.sessionManager.getSessionId()` is the same key.
 
 ### How It Works
 
 Pi's extension loader creates a fresh [jiti](https://github.com/nicolo-ribaudo/jiti) instance per extension with `moduleCache: false`, which isolates module-level state.
 `Symbol.for()` and `globalThis` are process-global by spec, so they survive this isolation.
 
-The permission-system extension publishes a service object on `globalThis` via `Symbol.for("@gotgenes/pi-permission-system:service")` at `session_start`.
-Consumers call `getPermissionsService()` to retrieve it — even though their `import()` loads a fresh module copy, the accessor reads from the shared `globalThis` slot.
-An in-process subagent child does not publish its own service; inside a child, `getPermissionsService()` resolves the parent's service.
-A consumer reacting to the `permissions:ready` broadcast (also emitted at `session_start`, after the publish) can resolve the service immediately.
+One process can host several **nodes** — one Pi session runtime each, with its own gates and its own registries.
+A root session and each of its in-process subagent children are separate nodes, and each loads its own instance of this extension.
+Registrations never cross a node boundary: a formatter, an access extractor, or an authorizer link is read by the node it was registered in.
+
+Each node therefore publishes its own service at `session_start`, into a `globalThis` map keyed by that node's session id (`Symbol.for("@gotgenes/pi-permission-system:session-services")`).
+Consumers call `getPermissionsService(sessionId)` to retrieve it — even though their `import()` loads a fresh module copy, the accessor reads from the shared `globalThis` slot.
+The session id arrives as a field on the `permissions:ready` broadcast, which each node emits at its own `session_start`, right after publishing — and again at that node's first `before_agent_start`, so a consumer whose own `session_start` ran later still hears it.
+
+`getRootPermissionsService()` remains, reading a separate legacy slot that holds the **process root's** service, but it is deprecated: in any node but the root it answers the wrong question, handing an in-process child the parent's service.
+Calling it emits a once-guarded Node `DeprecationWarning` (code `PI_PERMISSION_SYSTEM_DEP0001`); run with `--trace-deprecation` to locate your call site, or `--no-deprecation` to silence it.
+Removal is deferred to a future major release.
+
+Both accessors were renamed in the major that reclaimed `getPermissionsService` for the keyed locator; if you are upgrading from a release whose `getPermissionsService()` took no argument, see [migration/0794-keyed-service-locator.md](migration/0794-keyed-service-locator.md).
 
 All types below are directly importable and type-check with `tsc` out of the box.
 `@gotgenes/pi-permission-system`'s published `exports` resolve `import type { … }` to a self-contained, bundled declaration file with no internal module references, so a downstream `tsconfig.json` needs no special path configuration.
@@ -184,30 +200,33 @@ Register during your extension's initialization and store the disposer for teard
 export default function myExtension(pi: ExtensionAPI): void {
   let disposeFormatter: (() => void) | undefined;
 
-  void (async () => {
-    try {
-      const { getPermissionsService } = await import(
-        "@gotgenes/pi-permission-system"
-      );
-      const permissions = getPermissionsService();
-      disposeFormatter = permissions?.registerToolInputFormatter(
-        "deploy", // a tool THIS extension registers with Pi
-        (input) => {
-          const target =
-            typeof input.target === "string" ? input.target : undefined;
-          const services = Array.isArray(input.services)
-            ? input.services.length
-            : undefined;
-          if (!target) return undefined; // decline → default preview
-          return services !== undefined
-            ? `with target ${target} (${services} services)`
-            : `with target ${target}`;
-        },
-      );
-    } catch {
-      // permission-system not installed — nothing to register
-    }
-  })();
+  pi.events.on("permissions:ready", (data) => {
+    const { sessionId } = data as PermissionsReadyEvent;
+    if (disposeFormatter || !sessionId) return;
+    void (async () => {
+      try {
+        const { getPermissionsService } =
+          await import("@gotgenes/pi-permission-system");
+        const permissions = getPermissionsService(sessionId);
+        disposeFormatter = permissions?.registerToolInputFormatter(
+          "deploy", // a tool THIS extension registers with Pi
+          (input) => {
+            const target =
+              typeof input.target === "string" ? input.target : undefined;
+            const services = Array.isArray(input.services)
+              ? input.services.length
+              : undefined;
+            if (!target) return undefined; // decline → default preview
+            return services !== undefined
+              ? `with target ${target} (${services} services)`
+              : `with target ${target}`;
+          },
+        );
+      } catch {
+        // permission-system not installed — nothing to register
+      }
+    })();
+  });
 
   pi.on("session_shutdown", () => {
     disposeFormatter?.();
@@ -265,23 +284,26 @@ The extractor must not throw — guard your parsing and return `undefined` on an
 
 #### Subagent session registration
 
-In-process subagent registration is event-driven.
-`@gotgenes/pi-subagents` emits `subagents:child:session-created` before `bindExtensions()` and `subagents:child:disposed` in the run's `finally`; the permission system subscribes automatically — no service call from the spawner is required.
-See [Subagent Integration](subagent-integration.md) for details.
+Subagent registration is announcement-driven, and the spawner makes no service call.
+The channel names, payload shapes, pre-bind ordering, and the out-of-process environment variable are specified by the subagent adapter convention in [Subagent Integration](subagent-integration.md#the-subagent-adapter-convention).
 
 ### Reload Safety
 
 During `/reload`, all extensions re-initialize.
-The permission-system re-publishes a fresh service at `session_start`; teardown is identity-scoped, so a superseded generation's shutdown only clears the slot when it still owns it and cannot wipe the new service.
+The permission-system re-publishes a fresh service at `session_start`; teardown is identity-scoped for both slots, so a superseded generation's shutdown only removes an entry it still owns and cannot wipe the new service.
 Consumers that re-initialize during reload naturally get the new instance.
 
-Best practice: call `getPermissionsService()` per use rather than caching the reference.
+Best practice: resolve the service per use rather than caching the reference.
 
 ### Graceful Degradation
 
-`getPermissionsService()` returns `undefined` when the permission-system extension has not loaded (or has been unloaded).
+`getPermissionsService(sessionId)` returns `undefined` when the permission-system extension has not loaded into that node (or has been unloaded).
 The `import()` throws if the package is not installed.
 Wrap both in `try/catch` + `if` guard as shown in the Quick Start example.
+
+It also returns `undefined` when called with no session id at all — a shape TypeScript rejects but JavaScript reaches — rather than falling back to the process root's service, since answering with another node's service is the defect the keyed locator exists to prevent.
+That call emits a once-guarded Node warning (code `PI_PERMISSION_SYSTEM_WARN0001`), because the guard above turns the missing service into a registration that silently never happens.
+It is deliberately not a `DeprecationWarning`: `--no-deprecation` does not silence it.
 
 ---
 
@@ -299,11 +321,11 @@ All three broadcasts are best-effort: a throwing listener cannot block permissio
 
 ## Channel Reference
 
-| Channel                 | Direction | When                              | Payload type              |
-| ----------------------- | --------- | --------------------------------- | ------------------------- |
-| `permissions:ready`     | Broadcast | At `session_start`, after publish | `PermissionsReadyEvent`   |
-| `permissions:ui_prompt` | Broadcast | Before active UI prompt           | `PermissionUiPromptEvent` |
-| `permissions:decision`  | Broadcast | After every gate resolution       | `PermissionDecisionEvent` |
+| Channel                 | Direction | When                                                                                                  | Payload type              |
+| ----------------------- | --------- | ----------------------------------------------------------------------------------------------------- | ------------------------- |
+| `permissions:ready`     | Broadcast | At each node's `session_start` after that node publishes, and again at its first `before_agent_start` | `PermissionsReadyEvent`   |
+| `permissions:ui_prompt` | Broadcast | Before active UI prompt                                                                               | `PermissionUiPromptEvent` |
+| `permissions:decision`  | Broadcast | After every gate resolution                                                                           | `PermissionDecisionEvent` |
 
 ---
 
@@ -401,12 +423,13 @@ A served decision carries a non-null `forwarding` context; the requesting sessio
 
 The `requestId` is the same id the request's review-log entries carry, and the same one `permissions:ui_prompt` carried if the request reached a prompt — so a prompt and its outcome are joinable, as are two concurrent prompts for the same command.
 A request that reaches a prompt is answered by exactly one terminal event on that prompt's own bus, including when the dialog itself fails.
-It identifies a permission *request*, not a tool call: one tool call runs several gates and so raises several requests, each with its own id.
+It identifies a permission _request_, not a tool call: one tool call runs several gates and so raises several requests, each with its own id.
 Use the review log's `toolCallId` to join back to the Pi transcript.
 
 ```typescript
 pi.events.on("permissions:decision", (raw) => {
-  const event = raw as import("@gotgenes/pi-permission-system").PermissionDecisionEvent;
+  const event =
+    raw as import("@gotgenes/pi-permission-system").PermissionDecisionEvent;
   console.log(event.surface, event.result, event.resolution);
   // e.g. "bash" "allow" "user_approved_for_session"
 });
@@ -445,20 +468,47 @@ pi.events.on("permissions:decision", (raw) => {
 
 ## Ready Event
 
-The extension emits `permissions:ready` at `session_start`, right after the service is published — so a consumer reacting to it can immediately resolve `getPermissionsService()`.
-It fires once per `session_start` (including `/reload`).
+Each node emits `permissions:ready` at its own `session_start`, right after publishing its service — so a consumer reacting to it can immediately resolve that node's service.
+It emits again at that node's first `before_agent_start`, which runs after every extension's `session_start` and before any tool call, hence before any permission prompt.
 
-The payload is intentionally empty (`Record<string, never>`): the channel is a pure readiness signal.
+So the channel's contract is: **fires at least once per session, and may repeat.**
+A handler must be idempotent.
+That guarantee is what makes the ready event alone a sufficient registration site: a consumer that needs its own config before it can register no longer has to attempt registration from `session_start` as well, hoping one of the two orderings completes the pair.
+A new session generation (`/reload`, `/new`, `/resume`) starts the cycle over: one emission at `session_start`, one at the first turn that follows.
+
+Guard your registration on the disposer you stored, as the example below does.
+An unguarded handler that calls `registerAuthorizer`, `registerToolInputFormatter`, or `registerToolAccessExtractor` on every emission hits the duplicate-registration throw on the second one.
+That throw is caught by Pi's event bus and reported on stderr — your first registration stays live — but the noise is avoidable, and it was already reachable before the latch existed, since `/reload` re-runs `session_start`.
+
+The payload carries plain facts about the node that emitted it, never a live capability: the bus announces, the locator provides.
 It carries no `protocolVersion` — the broadcast contract is defined by the published types plus package semver.
 
+| Field                | Type             | Meaning                                                                                                                                                               |
+| -------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessionId`          | `string \| null` | The emitting node's session id — the key for `getPermissionsService`. `null` when the host exposed no session id, in which case that node published no keyed service. |
+| `adjudicatesLocally` | `boolean`        | Whether this node's authorizer chain runs, or the node relays its asks to a serving node that runs _its_ chain over the same facts.                                   |
+
 ```typescript
-pi.events.on("permissions:ready", () => {
+let dispose: (() => void) | undefined;
+
+pi.events.on("permissions:ready", (data) => {
+  const { sessionId } = data as PermissionsReadyEvent;
+  // Idempotent: ready may repeat, so a second emission must be a no-op.
+  if (dispose || !sessionId) return;
   void (async () => {
-    const { getPermissionsService } = await import(
-      "@gotgenes/pi-permission-system"
-    );
-    const permissions = getPermissionsService();
-    // The service is published just before this fires — resolve it now.
+    const { getPermissionsService } =
+      await import("@gotgenes/pi-permission-system");
+    const permissions = getPermissionsService(sessionId);
+    // This node published before the event fired — resolve and register now.
+    dispose = permissions?.registerAuthorizer("my-link", authorize);
   })();
 });
+
+pi.on("session_shutdown", () => {
+  dispose?.();
+  dispose = undefined;
+});
 ```
+
+A registration needs no branch on `adjudicatesLocally`.
+Formatters and access extractors are read by every node's own gates, and a chain link registered on a relaying node is accepted (its disposer works) and recorded in the review log as `authorizer_link_vacant` rather than refused — so registering everywhere is the correct default.

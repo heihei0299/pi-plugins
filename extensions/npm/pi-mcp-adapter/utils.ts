@@ -282,6 +282,76 @@ export function normalizeDirectToolInputSchema(schema: unknown): Record<string, 
   return normalized;
 }
 
+export function normalizeToolArguments(
+  value: unknown,
+  context = "tool arguments",
+): Record<string, unknown> {
+  if (value === undefined || value === null || value === "") return {};
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") return {};
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (error) {
+      throw new Error(
+        `${context}: invalid args JSON (${error instanceof SyntaxError ? error.message : String(error)}); ` +
+        `pass args as a JSON object, or as a valid JSON string encoding one`,
+        { cause: error },
+      );
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(
+        `${context}: expected a JSON object, got ${Array.isArray(parsed) ? "array" : typeof parsed}`,
+      );
+    }
+    return parsed as Record<string, unknown>;
+  }
+
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(
+      `${context}: expected a JSON object, got ${Array.isArray(value) ? "array" : typeof value}`,
+    );
+  }
+
+  assertJsonSerializable(value, context);
+  try {
+    return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(
+      `${context}: value is not JSON-serializable: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+}
+
+function assertJsonSerializable(value: unknown, context: string, path = ""): void {
+  if (value === null) return;
+  if (typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error(`${context}: value at ${path || "root"} is not a finite number`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const [index, item] of value.entries()) assertJsonSerializable(item, context, `${path}[${index}]`);
+    return;
+  }
+  if (typeof value === "object") {
+    if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
+      throw new Error(`${context}: value at ${path || "root"} is not a plain JSON object`);
+    }
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      throw new Error(`${context}: value at ${path || "root"} has symbol keys`);
+    }
+    for (const [key, item] of Object.entries(value)) {
+      assertJsonSerializable(item, context, path ? `${path}.${key}` : key);
+    }
+    return;
+  }
+  throw new Error(`${context}: value at ${path || "root"} is not JSON-serializable`);
+}
+
 export function formatAuthRequiredMessage(
   config: Pick<McpConfig, "settings">,
   serverName: string,

@@ -1,6 +1,6 @@
 {
   "name": "pi-mcp-adapter",
-  "version": "2.26.1",
+  "version": "2.27.0",
   "description": "MCP (Model Context Protocol) adapter extension for Pi coding agent",
   "type": "module",
   "types": "./index.ts",
@@ -88,6 +88,7 @@
     "ui-tool-visibility.ts",
     "ui-app-bridge-helpers.ts",
     "config.ts",
+    "package-mcp-loader.ts",
     "server-manager.ts",
     "request-headers-command.ts",
     "unix-socket-transport.ts",
@@ -115,6 +116,7 @@
     "oauth-handler.ts",
     "oauth.ts",
     "mcp-auth.ts",
+    "mcp-bearer-store.ts",
     "mcp-keyring-helper.cjs",
     "mcp-oauth-provider.ts",
     "mcp-callback-server.ts",

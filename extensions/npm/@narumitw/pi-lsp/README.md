@@ -73,6 +73,10 @@ Try this package locally from the repository root:
 pi -e ./packages/pi-lsp
 ```
 
+The package declares `dist/index.ts`, so an unbuilt local checkout must run `npm --workspace @narumitw/pi-lsp run build` before Pi loads the package directory.
+
+`just try lsp` runs that build automatically.
+
 ## ⚙️ Configuration
 
 If no config is provided, pi-lsp ships a broad catalog of direct-command defaults. Servers are started only when matching files are requested. pi-lsp does not download language servers, so install the commands you need and make them available on `PATH`. During no-config diagnostics, unavailable default commands are filtered before workspace discovery. If none can run, diagnostics completes successfully and reports the skipped servers. Explicitly selected or custom-configured missing commands still report an error.
@@ -275,6 +279,9 @@ Shows configured LSP commands and whether each command is available on `PATH`.
 
 ```txt
 packages/pi-lsp/
+├── dist/                  # Generated TypeScript runtime loaded by Jiti
+├── scripts/
+│   └── build-runtime.mjs  # Deterministic runtime builder and boundary validator
 ├── src/
 │   ├── index.ts
 │   ├── adapters.ts
@@ -291,6 +298,8 @@ packages/pi-lsp/
 ├── tsconfig.json
 └── package.json
 ```
+
+The generated runtime is built from the authoritative `src/index.ts` graph and does not import back into `src`.
 
 ## 🔎 Keywords
 

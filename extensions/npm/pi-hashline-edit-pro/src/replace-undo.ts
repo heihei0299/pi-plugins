@@ -7,7 +7,7 @@ import { recordServedDiff } from "./served";
 import { contentChecksum } from "./hashline/hasher";
 import { resolveTarget, writeAtomic } from "./fs-write";
 import { toCwd } from "./paths";
-import { toLF, stripBOM, genDiff, restoreEndings, type LineEnding } from "./replace-diff";
+import { toLF, stripBOM, genDiff, genPatch, restoreEndings, type LineEnding } from "./replace-diff";
 import { cntDiff, splitLines, errCode, makePrepareArguments } from "./utils";
 import { loadP, loadGuide } from "./prompts";
 import { buildMetrics } from "./replace-response";
@@ -170,7 +170,7 @@ export function regReplaceUndo(pi: ExtensionAPI): void {
         try {
           const store = await loadHashStore();
           upsertSnapshot(store, mutationTargetPath, contentChecksum(undo.content), splitLines(undo.content).length, undo.hashes);
-          recordServedDiff(store, mutationTargetPath, undoDiff);
+          recordServedDiff(store, mutationTargetPath, undoDiff, new Set(undo.hashes));
         } catch (error) {
           console.error("Failed to restore hash store snapshot after undo:", error);
         }
@@ -198,6 +198,7 @@ export function regReplaceUndo(pi: ExtensionAPI): void {
           ],
           details: {
             diff: undoDiff,
+            patch: genPatch(path, currentNormalized, undo.content),
             metrics: buildMetrics({
               classification: "applied",
               editsAttempted: 1,

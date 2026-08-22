@@ -1,10 +1,10 @@
 import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
 import type { McpExtensionState } from "./state.ts";
-import type { DirectToolSpec, McpAdapterOptions, McpConfig, PromptMetadata } from "./types.ts";
+import type { DirectToolSpec, McpAdapterOptions, McpConfig, PromptMetadata, ServerEntry } from "./types.ts";
 import type { McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { Type } from "typebox";
 import type { TSchema } from "typebox";
-import { showStatus, showTools, showPrompts, reconnectServer, reconnectServers, authenticateServer, logoutServer, openMcpAuthPanel, openMcpPanel, openMcpSetup } from "./commands.ts";
+import { showStatus, showTools, showPrompts, reconnectServer, reconnectServers, authenticateServer, logoutServer, manageBearerToken, openMcpAuthPanel, openMcpPanel, openMcpSetup } from "./commands.ts";
 import { cloneMcpConfig, loadMcpConfig, writeProjectServerDisabledOverride } from "./config.ts";
 import { buildProxyDescription, createDirectToolExecutor, getMissingConfiguredDirectToolServers, resolveDirectTools } from "./direct-tools.ts";
 import { flushMetadataCache, initializeMcp, updateStatusBar } from "./init.ts";
@@ -22,6 +22,7 @@ import { runMcpScript } from "./mcp-code.ts";
 import { cleanupMaterializedBinaryResources } from "./tool-registrar.ts";
 
 export type { McpAdapterOptions } from "./types.ts";
+export type { ServerEntry } from "./types.ts";
 export {
   MCP_STATUS_EVENT,
   MCP_STATUS_SNAPSHOT_VERSION,
@@ -37,6 +38,14 @@ export {
 
 const INIT_WAIT_TIMEOUT_MS = 30_000;
 const INIT_WAIT_TIMED_OUT: unique symbol = Symbol("init-wait-timed-out");
+
+export interface McpServerRegistration {
+  dispose(): Promise<void>;
+}
+
+// Routes runtime registrations to the adapter installed for a specific Pi
+// instance, so a process with several adapters cannot cross-register.
+const runtimeRegistrars = new WeakMap<ExtensionAPI, (name: string, definition: ServerEntry) => McpServerRegistration>();
 
 async function awaitWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | typeof INIT_WAIT_TIMED_OUT> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -130,6 +139,19 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   let proxyToolRegistered = false;
   let proxyToolDescription: string | null = null;
   let directToolsFrozen = false;
+  // Session/runtime scoped server registrations from other extensions. They
+  // survive session restarts within this install and die with the process.
+  const runtimeServers = new Map<string, ServerEntry>();
+
+  // Mirrors init's per-server lifecycle registration so runtime servers get
+  // idle cleanup and keep-alive health recovery like configured servers.
+  function attachRuntimeServerLifecycle(targetState: McpExtensionState, name: string, definition: ServerEntry): void {
+    const lifecycleMode = definition.lifecycle ?? "lazy";
+    const persistsAfterFirstSpawn = lifecycleMode === "eager" || lifecycleMode === "lazy-keep-alive";
+    const idleOverride = definition.idleTimeout ?? (persistsAfterFirstSpawn ? 0 : undefined);
+    targetState.lifecycle.registerServer(name, definition, idleOverride !== undefined ? { idleTimeout: idleOverride } : undefined);
+    if (lifecycleMode === "keep-alive") targetState.lifecycle.markKeepAlive(name, definition);
+  }
 
   // OMP remaps `typebox` to a host shim that historically lacked Type.Unsafe.
   // Prefer Unsafe when present (real TypeBox / fixed OMP shim); otherwise pass
@@ -282,6 +304,45 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 
   registerPromptCommands(resolveCachedPrompts(earlyConfig));
 
+  runtimeRegistrars.set(pi, (name: string, definition: ServerEntry): McpServerRegistration => {
+    if (typeof name !== "string" || name.trim() === "") {
+      throw new Error("MCP server name must be a non-empty string");
+    }
+    if (typeof definition !== "object" || definition === null || Array.isArray(definition)) {
+      throw new Error(`MCP server definition for "${name}" must be an object`);
+    }
+    const effective = state?.config ?? earlyConfig;
+    if (runtimeServers.has(name) || Object.hasOwn(effective.mcpServers, name)) {
+      throw new Error(`MCP server "${name}" is already registered`);
+    }
+    // Runtime-registered servers are proxy-tool-only: direct tools are frozen
+    // at startup and must not be rebuilt for late registrations.
+    const entry: ServerEntry = { ...structuredClone(definition), directTools: false };
+    runtimeServers.set(name, entry);
+    const registeredState = state;
+    if (registeredState) {
+      registeredState.config.mcpServers[name] = entry;
+      attachRuntimeServerLifecycle(registeredState, name, entry);
+      syncToolSurface();
+      updateStatusBar(registeredState);
+    }
+    let disposed = false;
+    return {
+      dispose: async (): Promise<void> => {
+        if (disposed) return;
+        disposed = true;
+        runtimeServers.delete(name);
+        const currentState = state;
+        if (!currentState || currentState.config.mcpServers[name] !== entry) return;
+        delete currentState.config.mcpServers[name];
+        currentState.lifecycle.unregisterServer(name);
+        await currentState.manager.close(name);
+        syncToolSurface();
+        updateStatusBar(currentState);
+      },
+    };
+  });
+
   const getPiTools = (): ToolInfo[] => pi.getAllTools();
 
   pi.registerFlag("mcp-config", {
@@ -299,7 +360,6 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           }
         : {}),
       oauthRuntime,
-      statusEvents: pi.events,
     });
     initPromise = promise;
 
@@ -314,6 +374,14 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       }
 
       state = nextState;
+      for (const [name, definition] of runtimeServers) {
+        if (Object.hasOwn(nextState.config.mcpServers, name)) {
+          console.error(`MCP: runtime-registered server "${name}" now collides with a configured server; keeping the configured server`);
+          continue;
+        }
+        nextState.config.mcpServers[name] = definition;
+        attachRuntimeServerLifecycle(nextState, name, definition);
+      }
       nextState.onToolMetadataUpdated = (_serverName, _reason) => {
         if (state !== nextState || !owner.isActive()) return;
         syncPromptCommands();
@@ -325,6 +393,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       };
       syncPromptCommands();
       syncToolSurface(ctx);
+      // A connected snapshot is readiness-like external state. Publish it only
+      // after Pi's model-facing direct-tool surface reflects live metadata.
+      nextState.statusEvents = pi.events;
       updateStatusBar(nextState);
       initPromise = null;
       if (earlyConfig.settings?.freezeDirectTools === true) {
@@ -467,7 +538,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   // Re-flag returned MCP tool failures so pi registers them as errors (see toolErrorOverride).
   pi.on("tool_result", (event) => toolErrorOverride(event.details));
 
-  pi.registerCommand("mcp", {
+  const registerMcpCommand = (commandName: string) => pi.registerCommand(commandName, {
     description: "Show MCP server status",
     getArgumentCompletions: (prefix: string) => {
       const normalized = prefix.trimStart();
@@ -479,6 +550,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           { value: "prompts", label: "prompts — List all MCP prompts" },
           { value: "setup", label: "setup — Configure MCP servers" },
           { value: "logout", label: "logout — Clear server credentials" },
+          { value: "token", label: "token — Manage stored bearer tokens" },
           { value: "disable", label: "disable — Disable a server" },
           { value: "enable", label: "enable — Enable a server" },
           { value: "status", label: "status — Show server status" },
@@ -488,10 +560,26 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 
       const [, subcommand, argumentPrefix] = argumentMatch;
       if (
-        (subcommand !== "reconnect" && subcommand !== "logout" && subcommand !== "disable" && subcommand !== "enable")
+        (subcommand !== "reconnect" && subcommand !== "logout" && subcommand !== "disable" && subcommand !== "enable" && subcommand !== "token")
         || argumentPrefix === undefined
         || !state
       ) return null;
+
+      if (subcommand === "token") {
+        const tokenMatch = argumentPrefix.trimStart().match(/^(set|remove|status)\s+(.*)$/);
+        if (!tokenMatch) {
+          const actions = ["set", "remove", "status"]
+            .filter(action => action.startsWith(argumentPrefix.trimStart()))
+            .map(action => ({ value: `token ${action} `, label: `${action} — Bearer token ${action}` }));
+          return actions.length > 0 ? actions : null;
+        }
+        const action = tokenMatch[1] ?? "";
+        const serverPrefix = tokenMatch[2] ?? "";
+        const servers = Object.keys(state.config.mcpServers)
+          .filter(serverName => serverName.startsWith(serverPrefix.trimStart()))
+          .map(serverName => ({ value: `token ${action} ${serverName}`, label: serverName }));
+        return servers.length > 0 ? servers : null;
+      }
 
       const servers = Object.keys(state.config.mcpServers)
         .filter((serverName) => serverName.startsWith(argumentPrefix.trimStart()))
@@ -568,6 +656,21 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           await logoutServer(serverName, state, commandCtx);
           break;
         }
+        case "token": {
+          const action = parts[1];
+          const serverName = parts.slice(2).join(" ");
+          if (action !== "set" && action !== "remove" && action !== "status") {
+            if (commandCtx.hasUI) commandCtx.ui?.notify("Usage: /mcp token set|remove|status <server>", "error");
+            return;
+          }
+          if (!serverName) {
+            if (commandCtx.hasUI) commandCtx.ui?.notify("Usage: /mcp token set|remove|status <server>", "error");
+            return;
+          }
+          commandOwner?.throwIfInactive();
+          await manageBearerToken(action, serverName, state, commandCtx);
+          break;
+        }
         case "disable":
         case "enable": {
           const serverName = rest;
@@ -618,6 +721,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       }
     },
   });
+  registerMcpCommand("mcp");
+  registerMcpCommand("pi-mcp");
 
   pi.registerCommand("mcp-auth", {
     description: "Authenticate with an MCP server (OAuth)",
@@ -782,6 +887,28 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           }
           return args as Record<string, unknown>;
         };
+        const validateNestedGatewayParams = (value: Record<string, unknown>): typeof params => {
+          for (const key of ["tool", "connect", "describe", "instructions", "search", "server", "action"] as const) {
+            if (value[key] !== undefined && typeof value[key] !== "string") {
+              throw new Error(`Invalid nested gateway param \`${key}\`: expected string, got ${Array.isArray(value[key]) ? "array" : typeof value[key]}`);
+            }
+          }
+          for (const key of ["regex", "includeSchemas"] as const) {
+            if (value[key] !== undefined && typeof value[key] !== "boolean") {
+              throw new Error(`Invalid nested gateway param \`${key}\`: expected boolean, got ${Array.isArray(value[key]) ? "array" : typeof value[key]}`);
+            }
+          }
+          for (const key of ["limit", "offset"] as const) {
+            if (value[key] !== undefined && typeof value[key] !== "number") {
+              throw new Error(`Invalid nested gateway param \`${key}\`: expected number, got ${Array.isArray(value[key]) ? "array" : typeof value[key]}`);
+            }
+          }
+          const args = value.args;
+          if (args !== undefined && typeof args !== "string" && (typeof args !== "object" || args === null || Array.isArray(args))) {
+            throw new Error(`Invalid nested gateway param \`args\`: expected JSON object or JSON string, got ${Array.isArray(args) ? "array" : args === null ? "null" : typeof args}`);
+          }
+          return value as typeof params;
+        };
         let parsedArgs = parseArgs(params.args);
         let dispatchParams = params;
         const hasGatewayMode = (value: typeof params): boolean =>
@@ -793,7 +920,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           || value.server !== undefined
           || value.action !== undefined;
         if (!hasGatewayMode(params) && parsedArgs) {
-          const nestedParams = parsedArgs as typeof params;
+          const nestedParams = validateNestedGatewayParams(parsedArgs);
           if (hasGatewayMode(nestedParams)) {
             dispatchParams = nestedParams;
             parsedArgs = parseArgs(nestedParams.args);
@@ -937,6 +1064,22 @@ export function createMcpAdapter(options: McpAdapterOptions = {}) {
       ...(factoryConfig !== undefined ? { config: cloneMcpConfig(factoryConfig) } : {}),
     });
   };
+}
+
+/**
+ * Register an MCP server with the adapter installed for this Pi instance.
+ * Registrations are session/runtime scoped and never persisted. Duplicate
+ * names fail closed. Registered servers are proxy-tool-only; their tools
+ * become visible at the next tool sync. To change a definition, dispose the
+ * registration and register again.
+ */
+export function registerMcpServer(options: { pi: ExtensionAPI; name: string; definition: ServerEntry }): McpServerRegistration {
+  const { pi, name, definition } = options;
+  const register = runtimeRegistrars.get(pi);
+  if (!register) {
+    throw new Error("pi-mcp-adapter is not installed for this Pi instance");
+  }
+  return register(name, definition);
 }
 
 export default createMcpAdapter();

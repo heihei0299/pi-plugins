@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { extname, join, resolve as resolvePath, sep as pathSep } from "node:path";
+import { createHash } from "node:crypto";
+import { basename, dirname, extname, join, resolve as resolvePath, sep as pathSep } from "node:path";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import { checkGhAvailable, checkRepoSize, fetchViaApi, showGhHint } from "./github-api.ts";
@@ -39,8 +40,13 @@ export interface GitHubUrlInfo {
 }
 
 interface CachedClone {
-	localPath: string;
+	destination: CloneDestination;
 	clonePromise: Promise<string | null>;
+}
+
+interface CloneDestination {
+	rootPath: string;
+	localPath: string;
 }
 
 interface GitHubCloneConfig {
@@ -137,20 +143,21 @@ export function parseGitHubUrl(url: string): GitHubUrlInfo | null {
 	const host = parsed.hostname.toLowerCase();
 	if (host !== "github.com" && host !== "www.github.com") return null;
 
-	const segments = parsed.pathname
-		.split("/")
-		.filter(Boolean)
-		.map((segment) => {
-			try {
-				return decodeURIComponent(segment);
-			} catch {
-				return segment;
-			}
-		});
+	const segments: string[] = [];
+	for (const segment of parsed.pathname.split("/").filter(Boolean)) {
+		try {
+			segments.push(decodeURIComponent(segment));
+		} catch {
+			return null;
+		}
+	}
 	if (segments.length < 2) return null;
 
 	const owner = segments[0];
 	const repo = segments[1].replace(/\.git$/, "");
+	if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)) return null;
+	if (owner.includes("--")) return null;
+	if (!/^[A-Za-z0-9._-]{1,100}$/.test(repo) || repo === "." || repo === "..") return null;
 
 	if (NON_CODE_SEGMENTS.has(segments[2]?.toLowerCase())) return null;
 
@@ -163,6 +170,7 @@ export function parseGitHubUrl(url: string): GitHubUrlInfo | null {
 	if (segments.length < 4) return null;
 
 	const ref = segments[3];
+	if (ref.length === 0 || ref.length > 1024 || /[\0-\x1f\x7f]/.test(ref)) return null;
 	const refIsFullSha = /^[0-9a-f]{40}$/.test(ref);
 	const pathParts = segments.slice(4);
 	const path = pathParts.length > 0 ? pathParts.join("/") : "";
@@ -181,9 +189,32 @@ function cacheKey(owner: string, repo: string, ref?: string): string {
 	return ref ? `${owner}/${repo}@${ref}` : `${owner}/${repo}`;
 }
 
-function cloneDir(config: GitHubCloneConfig, owner: string, repo: string, ref?: string): string {
-	const dirName = ref ? `${repo}@${ref}` : repo;
-	return join(config.clonePath, owner, dirName);
+function cloneDestination(config: GitHubCloneConfig, owner: string, repo: string, ref?: string): CloneDestination | null {
+	try {
+		mkdirSync(resolvePath(config.clonePath), { recursive: true });
+		const rootPath = realpathSync(resolvePath(config.clonePath));
+		const digest = createHash("sha256").update(JSON.stringify([owner, repo, ref ?? null])).digest("hex");
+		const localPath = resolvePath(rootPath, digest);
+		if (dirname(localPath) !== rootPath) return null;
+		return { rootPath, localPath };
+	} catch {
+		return null;
+	}
+}
+
+function removeCloneDestination(destination: CloneDestination): boolean {
+	const rootPath = resolvePath(destination.rootPath);
+	const localPath = resolvePath(destination.localPath);
+	if (dirname(localPath) !== rootPath || !/^[0-9a-f]{64}$/.test(basename(localPath))) return false;
+	try {
+		const entry = lstatSync(localPath);
+		if (entry.isSymbolicLink()) unlinkSync(localPath);
+		else rmSync(localPath, { recursive: true, force: true });
+		return true;
+	} catch (err) {
+		if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return true;
+		return false;
+	}
 }
 
 const PROCESS_KILL_GRACE_MS = 3000;
@@ -225,8 +256,9 @@ function terminateProcessTree(child: ChildProcess): void {
 	forceKill.unref();
 }
 
-function execClone(args: string[], localPath: string, timeoutMs: number, signal?: AbortSignal): Promise<string | null> {
+function execClone(args: string[], destination: CloneDestination, timeoutMs: number, signal?: AbortSignal): Promise<string | null> {
 	return new Promise((resolve) => {
+		const { localPath } = destination;
 		let settled = false;
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		let onAbort: (() => void) | undefined;
@@ -238,10 +270,7 @@ function execClone(args: string[], localPath: string, timeoutMs: number, signal?
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 
 			if (!success) {
-				try {
-					rmSync(localPath, { recursive: true, force: true });
-				} catch {
-				}
+				removeCloneDestination(destination);
 				resolve(null);
 				return;
 			}
@@ -282,14 +311,11 @@ async function cloneRepo(
 	repo: string,
 	ref: string | undefined,
 	config: GitHubCloneConfig,
+	destination: CloneDestination,
 	signal?: AbortSignal,
 ): Promise<string | null> {
-	const localPath = cloneDir(config, owner, repo, ref);
-
-	try {
-		rmSync(localPath, { recursive: true, force: true });
-	} catch {
-	}
+	const { localPath } = destination;
+	if (!removeCloneDestination(destination)) return null;
 
 	const timeoutMs = config.cloneTimeoutSeconds * 1000;
 	const hasGh = await checkGhAvailable();
@@ -297,7 +323,7 @@ async function cloneRepo(
 	if (hasGh) {
 		const args = ["gh", "repo", "clone", `${owner}/${repo}`, localPath, "--", "--depth", "1", "--single-branch"];
 		if (ref) args.push("--branch", ref);
-		return execClone(args, localPath, timeoutMs, signal);
+		return execClone(args, destination, timeoutMs, signal);
 	}
 
 	showGhHint();
@@ -306,7 +332,7 @@ async function cloneRepo(
 	const args = ["git", "clone", "--depth", "1", "--single-branch"];
 	if (ref) args.push("--branch", ref);
 	args.push(gitUrl, localPath);
-	return execClone(args, localPath, timeoutMs, signal);
+	return execClone(args, destination, timeoutMs, signal);
 }
 
 function isBinaryFile(filePath: string): boolean {
@@ -671,9 +697,15 @@ export async function extractGitHub(
 		return cachedResult;
 	}
 
-	const clonePromise = cloneRepo(owner, repo, info.ref, config, signal);
-	const localPath = cloneDir(config, owner, repo, info.ref);
-	cloneCache.set(key, { localPath, clonePromise });
+	const destination = cloneDestination(config, owner, repo, info.ref);
+	if (!destination) {
+		const apiFallback = await fetchViaApi(url, owner, repo, info);
+		if (apiFallback) activityMonitor.logComplete(activityId, 200);
+		else activityMonitor.logError(activityId, "invalid clone destination");
+		return apiFallback;
+	}
+	const clonePromise = cloneRepo(owner, repo, info.ref, config, destination, signal);
+	cloneCache.set(key, { destination, clonePromise });
 
 	const result = await clonePromise;
 	if (signal?.aborted) {
@@ -707,10 +739,7 @@ export async function extractGitHub(
 
 export function clearCloneCache(): void {
 	for (const entry of cloneCache.values()) {
-		try {
-			rmSync(entry.localPath, { recursive: true, force: true });
-		} catch {
-		}
+		removeCloneDestination(entry.destination);
 	}
 	cloneCache.clear();
 	cachedConfig = null;

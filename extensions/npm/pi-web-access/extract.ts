@@ -27,6 +27,7 @@ import { formatSeconds, getWebSearchConfigPath } from "./utils.ts";
 import { isImageEnabled } from "./feature-config.ts";
 import { assertAuthFetchUrl, authFetchRedirectGuard, type AuthFetchProfile } from "./auth-fetch.ts";
 import { getBrowserCookiesForHosts, getLastBrowserCookieDiagnostic } from "./chrome-cookies.ts";
+import { sanitizeInlineDataUris } from "./data-uri-sanitize.ts";
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const CONCURRENT_LIMIT = 3;
@@ -1001,7 +1002,7 @@ async function extractViaHttp(
 		const requestInit = {
 			signal: controller.signal,
 			headers: {
-				"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+				"User-Agent": "OpenAI File Downloader, XaiImageApiFetch/1.0",
 				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
 				"Accept-Language": "en-US,en;q=0.9",
 				"Cache-Control": "no-cache",
@@ -1250,5 +1251,14 @@ export async function fetchAllContent(
 	signal?: AbortSignal,
 	options?: ExtractOptions,
 ): Promise<ExtractedContent[]> {
-	return Promise.all(urls.map((url) => fetchLimit(() => extractContent(url, signal, options))));
+	const results = await Promise.all(urls.map((url) => fetchLimit(() => extractContent(url, signal, options))));
+	if (options?.mode === "raw") return results;
+	// Inline data: URIs in extracted markdown would otherwise flow into tool
+	// results and the fetch cache as opaque base64; typed thumbnail/frame image
+	// blocks are deliberate outputs and are left untouched.
+	return results.map((result, index) => {
+		if (!result.content) return result;
+		const sanitized = sanitizeInlineDataUris(result.content, `urls[${index}].content`);
+		return sanitized.omissions.length > 0 ? { ...result, content: sanitized.text } : result;
+	});
 }

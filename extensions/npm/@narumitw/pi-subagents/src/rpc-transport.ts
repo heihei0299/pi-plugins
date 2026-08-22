@@ -37,8 +37,10 @@ import {
 } from "./rpc-transport-metadata.js";
 import {
 	captureRpcEvent,
+	commitRpcInFlightUsage,
 	createRpcTurnCapture,
 	observeRpcBudgetEvent,
+	snapshotRpcUsage,
 } from "./rpc-turn-capture.js";
 import { terminateProcess } from "./runner.js";
 import { safeTerminalText } from "./safe-text.js";
@@ -501,11 +503,17 @@ export class RpcTransport implements SubagentTransport {
 		});
 		void settled.catch(() => undefined);
 		const unsubscribeEvent = child.client.onEvent((event) => {
-			captureRpcEvent(event, capture);
+			const usageChanged = captureRpcEvent(event, capture);
 			observeRpcBudgetEvent(event, budgetMonitor);
 			if (!capture.firstActivityAt && isActivityEvent(event)) {
 				capture.firstActivityAt = Date.now();
-				publish({ phase: "running", timing: { firstActivityAt: capture.firstActivityAt } });
+				publish({
+					phase: "running",
+					timing: { firstActivityAt: capture.firstActivityAt },
+					...(usageChanged ? { usage: snapshotRpcUsage(capture) } : {}),
+				});
+			} else if (usageChanged) {
+				publish({ usage: snapshotRpcUsage(capture) });
 			}
 			const type = eventType(event);
 			if (type === "auto_retry_start") publish({ phase: "retrying" });
@@ -572,7 +580,7 @@ export class RpcTransport implements SubagentTransport {
 						phase: explicitAbort ? "interrupted" : "failed",
 						failurePhase: "running",
 						timing: { settledAt: Date.now() },
-						usage: capture.usage,
+						usage: snapshotRpcUsage(capture),
 					});
 					const checkpointOutput = termination
 						? formatTimeoutCheckpoint(termination.checkpoint)
@@ -591,7 +599,11 @@ export class RpcTransport implements SubagentTransport {
 					};
 				}
 
-				publish({ phase: "finalizing", failurePhase: "running" });
+				publish({
+					phase: "finalizing",
+					failurePhase: "running",
+					usage: snapshotRpcUsage(capture),
+				});
 				const finalizationStartedAt = Date.now();
 				const summary = await finalizeTimedOutRpcTurn({
 					client: child.client,
@@ -605,6 +617,7 @@ export class RpcTransport implements SubagentTransport {
 					finalizationTimeoutMs: this.options.timeoutFinalizationMs,
 					abortGraceMs: this.options.abortGraceMs ?? ABORT_GRACE_MS,
 					resetCapture() {
+						commitRpcInFlightUsage(capture);
 						capture.output = "";
 						capture.partial = "";
 						capture.stopReason = undefined;
@@ -625,7 +638,7 @@ export class RpcTransport implements SubagentTransport {
 					phase: "failed",
 					failurePhase: "running",
 					timing: { settledAt: Date.now() },
-					usage: capture.usage,
+					usage: snapshotRpcUsage(capture),
 				});
 				const checkpointOutput = termination ? formatTimeoutCheckpoint(termination.checkpoint) : "";
 				return {
@@ -651,7 +664,7 @@ export class RpcTransport implements SubagentTransport {
 				timing: { settledAt: Date.now() },
 				provider: capture.provider ?? telemetry.provider,
 				model: capture.model ?? telemetry.model,
-				usage: capture.usage,
+				usage: snapshotRpcUsage(capture),
 			});
 			return {
 				output: output.text,
@@ -686,6 +699,7 @@ export class RpcTransport implements SubagentTransport {
 				phase: signal.aborted ? "interrupted" : "failed",
 				failurePhase: accepted ? "running" : "ready",
 				timing: { settledAt: Date.now() },
+				usage: snapshotRpcUsage(capture),
 			});
 			return {
 				output:

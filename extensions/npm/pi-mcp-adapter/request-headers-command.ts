@@ -8,64 +8,62 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const USE_PROCESS_GROUP = process.platform !== "win32";
 const CLEANUP_TOKEN_ENV = "PI_MCP_REQUEST_HEADERS_CLEANUP_TOKEN";
+// Busy hosts can exceed spawnSync's 1 MiB default when `ps axeww` dumps each
+// process environment. Keep discovery below a bounded cap instead of letting
+// `ps` get SIGTERM'd and reporting a false cleanup failure.
+const PS_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 
 function isNoSuchProcessError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ESRCH";
 }
 
-function runPosixPs(args: string[]): { status: number | null; stdout: string } {
-  if (process.env.PI_MCP_ADAPTER_TEST_FAIL_PS === "1") return { status: 1, stdout: "" };
-  return spawnSync("ps", args, { encoding: "utf8" });
+function runPosixPs(args: string[]): { status: number | null; signal: NodeJS.Signals | null; stdout: string } {
+  if (process.env.PI_MCP_ADAPTER_TEST_FAIL_PS === "1") return { status: 1, signal: null, stdout: "" };
+  const result = spawnSync("ps", args, { encoding: "utf8", maxBuffer: PS_MAX_BUFFER_BYTES });
+  return { status: result.status, signal: result.signal, stdout: result.stdout };
 }
 
-function collectPosixDescendantPids(rootPid: number): number[] {
-  const result = runPosixPs(["-axo", "pid=,ppid="]);
+function psFailureReason(result: { status: number | null; signal: NodeJS.Signals | null }): string {
+  return result.status === null
+    ? `ps was killed by signal ${result.signal ?? "unknown"}`
+    : `ps exited with code ${result.status}`;
+}
+
+function collectPosixProcessPids(rootPid: number, cleanupToken?: string): number[] {
+  const result = runPosixPs(["axeww", "-o", "pid=,ppid=,command="]);
   if (result.status !== 0) {
-    throw new Error(`HTTP request headers command cleanup failed: ps exited with code ${result.status ?? "unknown"}`);
+    throw new Error(`HTTP request headers command cleanup failed: ${psFailureReason(result)}`);
   }
 
   const childrenByParent = new Map<number, number[]>();
+  const processPids = new Set<number>();
+  const needle = cleanupToken ? `${CLEANUP_TOKEN_ENV}=${cleanupToken}` : undefined;
   for (const line of result.stdout.split("\n")) {
-    const [pidText, ppidText] = line.trim().split(/\s+/, 2);
-    const pid = Number(pidText);
-    const ppid = Number(ppidText);
+    const match = /^\s*(\d+)\s+(\d+)(?:\s+(.*))?$/.exec(line);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const ppid = Number(match[2]);
     if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
     const children = childrenByParent.get(ppid);
     if (children) children.push(pid);
     else childrenByParent.set(ppid, [pid]);
+    if (needle && pid !== process.pid && match[3]?.includes(needle)) processPids.add(pid);
   }
 
-  const descendants: number[] = [];
   const stack = [...(childrenByParent.get(rootPid) ?? [])];
   while (stack.length > 0) {
     const pid = stack.pop()!;
-    descendants.push(pid);
+    processPids.add(pid);
     stack.push(...(childrenByParent.get(pid) ?? []));
   }
-  return descendants;
-}
-
-function collectPosixCleanupTokenPids(cleanupToken: string): number[] {
-  const result = runPosixPs(["axeww", "-o", "pid=,command="]);
-  if (result.status !== 0) {
-    throw new Error(`HTTP request headers command cleanup failed: ps exited with code ${result.status ?? "unknown"}`);
-  }
-
-  const needle = `${CLEANUP_TOKEN_ENV}=${cleanupToken}`;
-  const pids: number[] = [];
-  for (const line of result.stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed.includes(needle)) continue;
-    const [pidText] = trimmed.split(/\s+/, 1);
-    const pid = Number(pidText);
-    if (Number.isInteger(pid) && pid !== process.pid) pids.push(pid);
-  }
-  return pids;
+  return [...processPids];
 }
 
 function assertPosixProcessDiscoveryAvailable(): void {
-  collectPosixDescendantPids(process.pid);
-  collectPosixCleanupTokenPids(`${process.pid}-preflight`);
+  const result = runPosixPs(["axeww", "-o", "pid=,ppid=,command="]);
+  if (result.status !== 0) {
+    throw new Error(`HTTP request headers command cleanup failed: ${psFailureReason(result)}`);
+  }
 }
 
 function isTaskkillNoSuchProcess(result: ReturnType<typeof spawnSync>): boolean {
@@ -109,10 +107,7 @@ function killRequestHeadersCommand(child: ChildProcess, trackedPosixDescendantPi
       }
       let stablePasses = 0;
       for (let pass = 0; pass < 16; pass++) {
-        const candidates = [
-          ...collectPosixDescendantPids(child.pid),
-          ...(cleanupToken ? collectPosixCleanupTokenPids(cleanupToken) : []),
-        ];
+        const candidates = collectPosixProcessPids(child.pid, cleanupToken);
         const newPids = candidates.filter(pid => !frozenPids.has(pid));
         if (newPids.length === 0) {
           stablePasses++;
@@ -212,8 +207,7 @@ async function invokeRequestHeadersCommand(
     const trackPosixDescendants = () => {
       if (!USE_PROCESS_GROUP || child.pid === undefined || settled || trackingError) return;
       try {
-        for (const pid of collectPosixDescendantPids(child.pid)) trackedPosixDescendantPids.add(pid);
-        for (const pid of collectPosixCleanupTokenPids(cleanupToken)) trackedPosixDescendantPids.add(pid);
+        for (const pid of collectPosixProcessPids(child.pid, cleanupToken)) trackedPosixDescendantPids.add(pid);
       } catch (error) {
         trackingError = error instanceof Error ? error : new Error(String(error));
       }

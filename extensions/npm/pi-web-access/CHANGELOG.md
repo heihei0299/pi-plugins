@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-08-21
+
+### Added
+- Added `pdf.maxPages` to limit Datalab, Gemini, and local PDF extraction to the first N pages. Thanks to [@jaudiger](https://github.com/jaudiger) for issue #277.
+- Added optional `openaiSearchProviders` config to choose which Pi model providers fund OpenAI `web_search`, in priority order. Thanks to [@hank-warren](https://github.com/hank-warren) for PR #276.
+- Added Windows Chrome and Edge browser-cookie support for Gemini Web. Thanks to [@laixuanthoi](https://github.com/laixuanthoi) for issue #286.
+
+### Fixed
+- Hardened GitHub clone cache path handling. Thanks to [@spikelab](https://github.com/spikelab) for the responsible disclosure.
+- Updated the local `fetch_content` HTTP User-Agent for wider compatible content retrieval. Thanks to [@_can1357](https://x.com/_can1357) for [the User-Agent observation](https://x.com/_can1357/status/2090837707069014224).
+- Replaced inline RFC 2397 `data:` URIs in extracted page content with explicit bounded omission markers (MIME type, encoding, encoded/decoded byte counts, SHA-256 digest, `retrieval=not-retained`) before content reaches tool results, the fetch cache, or session persistence. Readable prose and Markdown image alt text are preserved; typed thumbnail/frame image blocks are unaffected. Thanks to [@bbbRye007](https://github.com/bbbRye007) for #281 and #282.
+- Detached Linux curator browser launches so `xdg-open` cannot block `web_search` until the browser exits. Thanks to [@nguyenphivn](https://github.com/nguyenphivn) for issue #279.
+- Allowed configured Firecrawl API base URLs to use loopback addresses without opening loopback for submitted fetch targets. Thanks to [@ackalker](https://github.com/ackalker) for issue #280.
+
 ## [0.24.0] - 2026-08-18
 
 ### Highlights
