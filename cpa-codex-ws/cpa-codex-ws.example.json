@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "transport": "websocket-cached",
+  "channels": [
+    {
+      "provider": "cpa",
+      "modelPrefix": "gpt-",
+      "enabled": true,
+      "baseUrl": "http://127.0.0.1:8317"
+    }
+  ]
+}
