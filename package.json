@@ -1,0 +1,11 @@
+{
+  "name": "pi-locked-subagents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal-parent-context Pi subagents with config-locked models.",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
