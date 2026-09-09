@@ -1,0 +1,47 @@
+{
+  "piBinary": "pi",
+  "agents": {
+    "worker": {
+      "model": "cpa/gpt-5.6-luna",
+      "thinking": "high",
+      "tools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
+      "systemPrompt": "Implement the assigned task. Inspect the repository yourself, make the required changes, run relevant verification, and return a concise summary.",
+      "isolate": {
+        "noExtensions": false,
+        "noSkills": true,
+        "noContextFiles": true,
+        "noPromptTemplates": true,
+        "noThemes": true,
+        "noApprove": true
+      }
+    },
+    "reviewer": {
+      "model": "cpa/gpt-5.6-luna",
+      "thinking": "high",
+      "tools": ["read", "grep", "find", "ls", "bash"],
+      "systemPrompt": "Review the assigned code or change independently. Do not modify files. Report only concrete correctness, regression, security, or blocking issues with file references.",
+      "isolate": {
+        "noExtensions": false,
+        "noSkills": true,
+        "noContextFiles": true,
+        "noPromptTemplates": true,
+        "noThemes": true,
+        "noApprove": true
+      }
+    },
+    "scout": {
+      "model": "cpa/gpt-5.6-luna",
+      "thinking": "medium",
+      "tools": ["read", "grep", "find", "ls"],
+      "systemPrompt": "Locate the files and code relevant to the assigned task. Do not modify files. Return a concise map of what matters.",
+      "isolate": {
+        "noExtensions": false,
+        "noSkills": true,
+        "noContextFiles": true,
+        "noPromptTemplates": true,
+        "noThemes": true,
+        "noApprove": true
+      }
+    }
+  }
+}
