@@ -16,13 +16,18 @@ A deliberately small subagent extension:
 - full child JSON event stream is written to disk
 - only the child's final assistant answer is handed back to the parent
 
-The parent therefore sees only:
+The parent sees one tool plus a bounded role catalog:
 
 ```text
 subagent(agent, task)
+
+Available subagents:
+- reviewer: Review code independently for concrete defects.
+- scout: Explore the codebase and locate relevant files and flows.
+- worker: Implement a self-contained coding task.
 ```
 
-It does **not** receive model/thinking/tool/session/timeout controls or agent definitions.
+The `agent` parameter is advertised as an enum when the config is readable at extension load time, so the model can select a role directly instead of searching the filesystem. Only role names and short descriptions are exposed; model/thinking/tools/system prompt/session/timeout controls stay local and locked. Reload Pi after adding or renaming roles so the advertised catalog refreshes.
 
 ### Why transcripts are separate
 
@@ -63,6 +68,7 @@ Example agent:
 {
   "agents": {
     "reviewer": {
+      "description": "Review code independently for concrete defects.",
       "model": "cpa/gpt-5.6-luna",
       "thinking": "high",
       "tools": ["read", "grep", "find", "ls", "bash"],
