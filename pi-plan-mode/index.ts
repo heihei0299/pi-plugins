@@ -42,11 +42,13 @@ Restrictions:
 - Bash is restricted to an allowlist of read-only commands.
 - Do not mutate project or system state.
 - Do not execute the implementation.
+- Only create a Plan when the user explicitly asks for a plan, outline, steps, implementation approach, or to refine an existing plan.
+- For ordinary questions, respond directly without a "Plan:" header.
 
 Explore enough code to understand call paths, data flow, tests, constraints, risks, and verification needs.
 Ask clarifying questions with the questionnaire tool when necessary.
 
-Create an implementation-ready numbered plan under a "Plan:" header:
+When explicitly asked, create an implementation-ready numbered plan under a "Plan:" header:
 
 Plan:
 1. First step
@@ -81,6 +83,7 @@ function uniqueToolNames(names: string[]): string[] {
 
 export default function planModeExtension(pi: ExtensionAPI): void {
   let planModeEnabled = false;
+  let planRequestPending = false;
   let toolsBeforePlanMode: string[] | undefined;
 
   pi.registerFlag("plan", {
@@ -126,6 +129,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
   function enterPlanMode(ctx: ExtensionContext): void {
     planModeEnabled = true;
+    planRequestPending = false;
     enablePlanModeTools();
     updateStatus(ctx);
     persistState();
@@ -134,6 +138,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
   function exitPlanMode(ctx: ExtensionContext): void {
     planModeEnabled = false;
+    planRequestPending = false;
     restoreNormalModeTools();
     updateStatus(ctx);
     persistState();
@@ -147,6 +152,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
   function handoffPlan(plan: string, ctx: ExtensionContext): void {
     planModeEnabled = false;
+    planRequestPending = false;
     restoreNormalModeTools();
     updateStatus(ctx);
     persistState();
@@ -186,6 +192,13 @@ export default function planModeExtension(pi: ExtensionAPI): void {
   pi.registerShortcut(Key.ctrlAlt("p"), {
     description: "Toggle plan mode",
     handler: async (ctx) => togglePlanMode(ctx),
+  });
+
+  pi.on("input", async (event) => {
+    if (!planModeEnabled || event.source === "extension") return;
+
+    // ponytail: keyword intent heuristic; add an explicit plan command if natural-language detection becomes unreliable.
+    planRequestPending = /\b(plan|outline|steps|approach|refine|revise)\b|计划|规划|方案|步骤|大纲/i.test(event.text);
   });
 
   pi.on("tool_call", async (event) => {
@@ -238,11 +251,12 @@ export default function planModeExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    if (!planModeEnabled || !ctx.hasUI) return;
+    if (!planModeEnabled || !ctx.hasUI || !planRequestPending) return;
 
     const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
     const plan = lastAssistant ? extractPlan(getTextContent(lastAssistant)) : null;
     if (!plan) return;
+    planRequestPending = false;
 
     const choice = await ctx.ui.select("Plan mode - what next?", [
       "Execute the plan",
@@ -259,6 +273,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
     if (choice === "Refine the plan") {
       const refinement = await ctx.ui.editor("Refine the plan:", "");
       if (refinement?.trim()) {
+        planRequestPending = true;
         pi.sendMessage(
           { customType: "plan-current", content: plan, display: true },
           { deliverAs: "followUp" },
