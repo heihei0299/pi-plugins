@@ -1,9 +1,9 @@
 {
-  "name": "pi-locked-subagents",
+  "name": "pi-plugins",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Minimal-parent-context Pi subagents with config-locked models.",
+  "description": "Pi extensions monorepo (see each plugin directory).",
   "dependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
