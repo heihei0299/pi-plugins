@@ -1,84 +1,66 @@
-# pi-locked-subagents
+# pi-plugins
 
-A deliberately small Pi extension for one job:
+Small Pi extensions optimized for low parent-context overhead.
 
-- expose **one** parent-facing LLM tool: `subagent`
-- expose only **two** arguments: `agent` and `task`
-- lock `model`, `thinking`, tools, system prompt, and child resource policy in a local JSON file
-- use a fresh one-shot child (`pi -p --no-session`)
-- do not impose a plugin token limit, turn limit, or deadline
-- keep custom Pi provider extensions available by default
+## pi-locked-subagents
 
-## Why this is smaller in the parent context
+A deliberately small subagent extension:
 
-The parent model gets only one custom tool schema:
+- exactly **one** parent-facing LLM tool: `subagent`
+- exactly **two** arguments: `agent` and `task`
+- model, thinking, tools and policy are locked in local config
+- fresh one-shot child: `pi -p --no-session`
+- child context files, skills, prompts and themes are disabled by default
+- custom provider extensions remain available by default for providers such as CPA
+- no plugin token, line, byte, turn or deadline limit
+- full child JSON event stream is written to disk
+- only the child's final assistant answer is handed back to the parent
+
+The parent therefore sees only:
 
 ```text
 subagent(agent, task)
 ```
 
-There is intentionally no:
+It does **not** receive model/thinking/tool/session/timeout controls or agent definitions.
+
+### Why transcripts are separate
+
+The child runs in Pi JSON mode. Its complete stdout event stream is written incrementally to:
 
 ```text
-model
-thinking
-tools
-timeout
-max_turns
-inherit_context
+~/.pi/agent/subagent-runs/<timestamp>-<uuid>.jsonl
 ```
 
-The parent LLM therefore cannot request another model. The extension reads the locked model from local config after the tool call.
+The extension parses only enough of that stream to retain the latest completed assistant message. Tool calls, intermediate messages and other child events stay out of the parent context.
 
-Agent definitions and system prompts are **not** injected into the parent LLM context.
+There is no plugin-level output truncation. This does not remove natural limits imposed by the selected model, provider, Pi runtime or the parent model's own context window.
 
-## Install
+Override the run directory with:
 
-Copy:
+```bash
+export PI_LOCKED_SUBAGENTS_RUN_DIR=/path/to/runs
+```
+
+### Install
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
 cp pi-locked-subagents.ts ~/.pi/agent/extensions/
-cp locked-subagents.example.json ~/.pi/agent/locked-subagents.json
+cp pi-locked-subagents/locked-subagents.example.json ~/.pi/agent/locked-subagents.json
 ```
 
-Then edit:
-
-```bash
-$EDITOR ~/.pi/agent/locked-subagents.json
-```
-
-Restart Pi or run:
+Then edit the JSON and reload Pi:
 
 ```text
 /reload
-```
-
-Check configuration:
-
-```text
 /subagents
 ```
 
-## Config
-
-Default config path:
-
-```text
-~/.pi/agent/locked-subagents.json
-```
-
-Override it without changing the tool schema:
-
-```bash
-export PI_LOCKED_SUBAGENTS_CONFIG=/path/to/locked-subagents.json
-```
-
-Example:
+Example agent:
 
 ```json
 {
-  "piBinary": "pi",
   "agents": {
     "reviewer": {
       "model": "cpa/gpt-5.6-luna",
@@ -98,49 +80,12 @@ Example:
 }
 ```
 
-## Important for CPA/provider shims
+The model cannot be overridden by the parent because `model` is not part of the tool schema. Task text is passed after `--`, so it cannot become a Pi CLI flag.
 
-`noExtensions` defaults to **false**.
+## pi-plan-mode
 
-This is intentional. If `cpa/gpt-5.6-luna` is registered by a Pi extension/provider shim, starting the child with `--no-extensions` can make the model disappear.
+A separate lightweight plan-mode extension lives under `pi-plan-mode/`. Plan and subagent orchestration intentionally remain independent: plan mode should not require a subagent framework, and subagents should not inject planning machinery into every parent turn.
 
-If your provider works without extension discovery and you want the smallest child context, set:
+## Design rule
 
-```json
-"noExtensions": true
-```
-
-Pi supports explicit `-e` extensions even with `--no-extensions`; add paths under `isolate.extensions` if you need only a specific provider extension.
-
-## Hard model lock
-
-The tool call has no model field. For:
-
-```json
-"reviewer": {
-  "model": "cpa/gpt-5.6-luna"
-}
-```
-
-the process command is constructed from local config as:
-
-```bash
-pi -p --no-session --model cpa/gpt-5.6-luna ...
-```
-
-The task supplied by the parent is placed after `--`, so task text cannot become CLI flags.
-
-There is also deliberately no arbitrary `extraArgs` config controlled by the LLM.
-
-## Limits
-
-This extension adds **no** token ceiling, max-turn setting, child deadline, or concurrency governor.
-
-Normal limits still exist outside the extension:
-- the selected model's context window
-- provider/API limits
-- Pi/runtime tool-result truncation and process behavior
-
-## Security note
-
-The child inherits the parent process environment, including provider credentials, because that is how Pi normally finds them. Tool access is controlled per configured agent.
+Keep the always-visible surface small. Put behavior in local configuration or opt-in commands instead of adding more LLM-callable tools and schemas.
