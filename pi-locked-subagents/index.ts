@@ -103,7 +103,10 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           stopReason: result.stopReason ?? null,
         };
 
-        const modelFailed = result.stopReason === "error" || result.stopReason === "aborted";
+        const modelFailed =
+          result.stopReason === "error" ||
+          result.stopReason === "aborted" ||
+          Boolean(result.errorMessage?.trim());
         if (result.code !== 0 || modelFailed) {
           const failure = result.errorMessage?.trim() || result.stderr.trim() || result.finalOutput || "(no output)";
           return {
@@ -125,7 +128,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           isError: true,
           content: [{
             type: "text",
-            text: `Failed to start subagent "${params.agent}": ${err instanceof Error ? err.message : String(err)}`,
+            text: `Subagent "${params.agent}" execution failed: ${err instanceof Error ? err.message : String(err)}`,
           }],
           details: { agent: params.agent, lockedModel: agent.model },
         };
