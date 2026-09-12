@@ -9,6 +9,8 @@ A deliberately small subagent extension:
 - exactly **one** parent-facing LLM tool: `subagent`
 - exactly **two** arguments: `agent` and `task`
 - model, thinking, tools and policy are locked in local config
+- optional `allowedAgents` restricts which roles a child can discover and delegate to
+- nested delegation is bounded by `maxDepth` (default: `2`)
 - fresh one-shot child: `pi -p --no-session`
 - child context files, skills, prompts and themes are disabled by default
 - custom provider extensions remain available by default for providers such as CPA
@@ -28,6 +30,48 @@ Available subagents:
 ```
 
 The `agent` parameter is advertised as an enum when the config is readable at extension load time, so the model can select a role directly instead of searching the filesystem. Only role names and short descriptions are exposed; model/thinking/tools/system prompt/session/timeout controls stay local and locked. Reload Pi after adding or renaming roles so the advertised catalog refreshes.
+
+### Nested delegation
+
+`allowedAgents` is a child visibility allowlist. Before a child Pi starts, the parent passes only that role list to the child process. The child extension filters its registry before building the tool description, so disallowed role names never enter that child's model context.
+
+Example:
+
+```text
+worker
+├── scout
+└── reviewer
+    └── scout
+
+scout
+└── no delegation
+```
+
+Use:
+
+```json
+{
+  "maxDepth": 2,
+  "agents": {
+    "worker": {
+      "allowedAgents": ["scout", "reviewer"],
+      "tools": ["read", "grep", "find", "ls", "bash", "edit", "write", "subagent"]
+    },
+    "reviewer": {
+      "allowedAgents": ["scout"],
+      "tools": ["read", "grep", "find", "ls", "bash", "subagent"]
+    },
+    "scout": {
+      "allowedAgents": [],
+      "tools": ["read", "grep", "find", "ls"]
+    }
+  }
+}
+```
+
+If `allowedAgents` is omitted, delegation defaults to none. A child only receives the `subagent` tool when all three conditions hold: its role has allowed agents, its configured tools include `subagent`, and the next child would remain below `maxDepth`. The default `maxDepth: 2` permits root → child → grandchild, but no deeper delegation.
+
+Configuration validation rejects non-string allowlists, unknown agent names, direct self-reference, and invalid depth values. Indirect cycles are bounded by the depth guard instead of requiring a complex graph scheduler.
 
 ### Why transcripts are separate
 
@@ -69,9 +113,10 @@ Example agent:
   "agents": {
     "reviewer": {
       "description": "Review code independently for concrete defects.",
+      "allowedAgents": ["scout"],
       "model": "cpa/gpt-5.6-luna",
       "thinking": "high",
-      "tools": ["read", "grep", "find", "ls", "bash"],
+      "tools": ["read", "grep", "find", "ls", "bash", "subagent"],
       "systemPrompt": "Review independently. Do not modify files.",
       "isolate": {
         "noExtensions": false,
