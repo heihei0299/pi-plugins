@@ -38,6 +38,7 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
   /\b(sudo|su|kill|pkill|killall|reboot|shutdown)\b/i,
   /\bsystemctl\s+(start|stop|restart|reload|enable|disable|mask|unmask)\b/i,
   /\bservice\s+\S+\s+(start|stop|restart|reload)\b/i,
+  /\bcurl\b[^\n]*(?:\s-o(?:\s|$)|\s--output(?:=|\s)|\s-O(?:\s|$)|\s--remote-name(?:\s|$))/i,
   /\b(vim?|nano|emacs|code|subl)\b/i,
 ];
 
@@ -89,7 +90,7 @@ const SAFE_PATTERNS: RegExp[] = [
   /^\s*node\s+--version\b/i,
   /^\s*(python|python3)\s+--version\b/i,
   /^\s*curl\s/i,
-  /^\s*wget\s+-O\s*-\b/i,
+  /^\s*wget\s+-O\s*-/i,
   /^\s*jq\b/i,
   /^\s*sed\s+-n\b/i,
   /^\s*awk\b/i,
