@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, readFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 interface AgentConfig {
+  description?: string;
   model: string;
   thinking?: Thinking;
   tools?: string[];
@@ -39,15 +40,57 @@ const DEFAULT_SYSTEM_PROMPT =
   "You are a focused subagent. Complete the assigned task independently. " +
   "Read what you need yourself. Return only the useful final result.";
 
-async function loadConfig(): Promise<Config> {
-  const parsed = JSON.parse(await readFile(CONFIG_PATH, "utf8")) as Config;
+const MAX_ADVERTISED_AGENTS = 16;
+const MAX_AGENT_DESCRIPTION_CHARS = 160;
+
+function parseConfig(raw: string): Config {
+  const parsed = JSON.parse(raw) as Config;
   if (!parsed?.agents || typeof parsed.agents !== "object") throw new Error(`Invalid config: ${CONFIG_PATH}`);
+
   for (const [name, agent] of Object.entries(parsed.agents)) {
     if (!name.trim() || !agent || typeof agent.model !== "string" || !agent.model) {
       throw new Error(`Agent "${name}" must define a locked model`);
     }
+    if (agent.description !== undefined && typeof agent.description !== "string") {
+      throw new Error(`Agent "${name}" description must be a string`);
+    }
   }
   return parsed;
+}
+
+async function loadConfig(): Promise<Config> {
+  return parseConfig(await readFile(CONFIG_PATH, "utf8"));
+}
+
+function loadConfigSnapshot(): Config | null {
+  try {
+    return parseConfig(readFileSync(CONFIG_PATH, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function compactDescription(value: string | undefined): string {
+  const text = (value ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const firstSentence = text.match(/^.*?[.!?](?=\s|$)/)?.[0] ?? text;
+  return firstSentence.length <= MAX_AGENT_DESCRIPTION_CHARS
+    ? firstSentence
+    : `${firstSentence.slice(0, MAX_AGENT_DESCRIPTION_CHARS - 1).trimEnd()}…`;
+}
+
+function agentCatalog(config: Config): string {
+  const entries = Object.entries(config.agents)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .slice(0, MAX_ADVERTISED_AGENTS)
+    .map(([name, agent]) => {
+      const description = compactDescription(agent.description);
+      return description ? `- ${name}: ${description}` : `- ${name}`;
+    });
+
+  const omitted = Math.max(0, Object.keys(config.agents).length - entries.length);
+  if (omitted > 0) entries.push(`- … ${omitted} more configured role(s)`);
+  return entries.join("\n");
 }
 
 function childArgs(agent: AgentConfig, task: string): string[] {
@@ -148,14 +191,32 @@ async function runChild(binary: string, args: string[], cwd: string, signal?: Ab
 }
 
 export default function lockedSubagents(pi: ExtensionAPI) {
-  // Parent context sees one tiny tool schema: subagent(agent, task).
+  // Mature subagent plugins advertise only a bounded name + purpose catalog.
+  // Full model/thinking/tools/systemPrompt configuration remains local.
+  const startupConfig = loadConfigSnapshot();
+  const startupAgentNames = startupConfig
+    ? Object.keys(startupConfig.agents).sort((left, right) => left.localeCompare(right))
+    : [];
+  const catalog = startupConfig ? agentCatalog(startupConfig) : "";
+  const description = [
+    "Delegate a self-contained task to a configured isolated subagent.",
+    "Use the matching role directly; do not inspect the filesystem to discover subagents.",
+    "Model, thinking, tools, system prompt, and policy are locked locally.",
+    catalog ? `Available subagents:\n${catalog}` : "",
+  ].filter(Boolean).join("\n\n");
+
+  // Parent context still sees exactly one tool with two arguments. Agent names
+  // become an enum when the config is readable at extension load time.
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Delegate a self-contained task to a configured isolated subagent. Use it for independent research, code exploration, implementation, or review. Prefer delegation when the task can be completed independently without requiring the main conversation history. Model and policy are locked locally.",
+    description,
     parameters: Type.Object({
-      agent: Type.String({ description: "Configured subagent role to delegate the task to" }),
-      task: Type.String({ description: "Complete self-contained task with enough context for independent execution" }),
+      agent: Type.String({
+        description: "Configured subagent role.",
+        ...(startupAgentNames.length > 0 ? { enum: startupAgentNames } : {}),
+      }),
+      task: Type.String({ description: "Complete self-contained task with enough context for independent execution." }),
     }, { additionalProperties: false }),
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
