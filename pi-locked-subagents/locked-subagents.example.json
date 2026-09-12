@@ -2,6 +2,7 @@
   "piBinary": "pi",
   "agents": {
     "worker": {
+      "description": "Implement a self-contained coding task.",
       "model": "cpa/gpt-5.6-luna",
       "thinking": "high",
       "tools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
@@ -16,6 +17,7 @@
       }
     },
     "reviewer": {
+      "description": "Review code independently for concrete defects.",
       "model": "cpa/gpt-5.6-luna",
       "thinking": "high",
       "tools": ["read", "grep", "find", "ls", "bash"],
@@ -30,6 +32,7 @@
       }
     },
     "scout": {
+      "description": "Explore the codebase and locate relevant files and flows.",
       "model": "cpa/gpt-5.6-luna",
       "thinking": "medium",
       "tools": ["read", "grep", "find", "ls"],
