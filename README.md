@@ -91,11 +91,24 @@ Override the run directory with:
 export PI_LOCKED_SUBAGENTS_RUN_DIR=/path/to/runs
 ```
 
+### Structure
+
+```text
+pi-locked-subagents/
+├── index.ts                      # tool registration and orchestration entry
+├── config.ts                     # config types, validation, env-scoped filtering
+├── registry.ts                   # model-visible agent catalog
+├── runner.ts                     # child Pi args, spawn, JSONL result capture
+└── locked-subagents.example.json
+```
+
+The root `pi-locked-subagents.ts` file is only a compatibility shim that re-exports the folder entrypoint.
+
 ### Install
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
-cp pi-locked-subagents.ts ~/.pi/agent/extensions/
+cp -r pi-locked-subagents ~/.pi/agent/extensions/
 cp pi-locked-subagents/locked-subagents.example.json ~/.pi/agent/locked-subagents.json
 ```
 
@@ -152,3 +165,14 @@ Use this fork when you want FFF search performance without adding duplicate `fff
 ## Design rule
 
 Keep the always-visible surface small. Put behavior in local configuration or opt-in commands instead of adding more LLM-callable tools and schemas.
+
+For locked subagents, keep the architecture layered but intentionally small:
+
+```text
+config -> registry/advertisement -> runner -> child Pi -> final result
+             ^
+             |
+        parent tool entry
+```
+
+Do not add a lifecycle manager until the extension actually needs background agents, resume, steering, or durable orchestration.
