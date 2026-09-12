@@ -86,6 +86,18 @@ The model cannot be overridden by the parent because `model` is not part of the 
 
 A separate lightweight plan-mode extension lives under `pi-plan-mode/`. Plan and subagent orchestration intentionally remain independent: plan mode should not require a subagent framework, and subagents should not inject planning machinery into every parent turn.
 
+## pi-fff-minimal
+
+A low-context fork of `@ff-labs/pi-fff` lives under `pi-fff-minimal/`.
+
+- defaults to FFF-backed `find` / `grep` override mode
+- removes upstream `promptGuidelines`
+- keeps compact tool snippets and parameter schemas
+- preserves FFF indexing, fuzzy search, frecency/git ranking, pagination, watcher, health/rescan commands, and @-mention support
+- keeps multi-grep disabled by default
+
+Use this fork when you want FFF search performance without adding duplicate `fffind` / `ffgrep` tools or verbose model instructions.
+
 ## Design rule
 
 Keep the always-visible surface small. Put behavior in local configuration or opt-in commands instead of adding more LLM-callable tools and schemas.
