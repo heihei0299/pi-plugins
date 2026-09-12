@@ -211,6 +211,10 @@ export default function lockedSubagents(pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description,
+    promptSnippet: "Delegate independent work to the matching configured subagent.",
+    promptGuidelines: [
+      "Use subagent for self-contained exploration, review, research, or implementation when a listed role matches; choose the role by its advertised description instead of searching for agent configuration.",
+    ],
     parameters: Type.Object({
       agent: Type.String({
         description: "Configured subagent role.",
@@ -254,7 +258,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       try {
         const config = await loadConfig();
-        ctx.ui.notify(Object.entries(config.agents).map(([name, a]) => `${name} -> ${a.model}${a.thinking ? `:${a.thinking}` : ""}`).join("\n") || "No subagents configured", "info");
+        ctx.ui.notify(Object.entries(config.agents).map(([name, a]) => {\n          const purpose = compactDescription(a.description);\n          return `${name}${purpose ? ` — ${purpose}` : ""} -> ${a.model}${a.thinking ? `:${a.thinking}` : ""}`;\n        }).join("\n") || "No subagents configured", "info");
       } catch (err) { ctx.ui.notify(err instanceof Error ? err.message : String(err), "error"); }
     },
   });
