@@ -9,6 +9,7 @@ A deliberately small subagent extension:
 - exactly **one** parent-facing LLM tool: `subagent`
 - exactly **two** arguments: `agent` and `task`
 - model, thinking, tools and policy are locked in local config
+- an explicit empty `tools: []` disables all child tools instead of falling back to Pi defaults
 - optional `allowedAgents` restricts which roles a child can discover and delegate to
 - nested delegation is bounded by `maxDepth` (default: `2`)
 - fresh one-shot child: `pi -p --no-session`
@@ -69,7 +70,7 @@ Use:
 }
 ```
 
-If `allowedAgents` is omitted, delegation defaults to none. A child only receives the `subagent` tool when all three conditions hold: its role has allowed agents, its configured tools include `subagent`, and the next child would remain below `maxDepth`. The default `maxDepth: 2` permits root → child → grandchild, but no deeper delegation.
+If `allowedAgents` is omitted, delegation defaults to none. A child only receives the `subagent` tool and nested-agent allowlist when all three conditions hold: its role has allowed agents, its configured tools include `subagent`, and the next child would remain below `maxDepth`. Otherwise the child receives an empty nested-agent allowlist. The default `maxDepth: 2` permits root → child → grandchild, but no deeper delegation.
 
 Configuration validation rejects non-string allowlists, unknown agent names, direct self-reference, and invalid depth values. Indirect cycles are bounded by the depth guard instead of requiring a complex graph scheduler.
 
@@ -81,7 +82,7 @@ The child runs in Pi JSON mode. Its complete stdout event stream is written incr
 ~/.pi/agent/subagent-runs/<timestamp>-<uuid>.jsonl
 ```
 
-The extension parses only enough of that stream to retain the latest completed assistant message. Tool calls, intermediate messages and other child events stay out of the parent context.
+The extension parses only enough of that stream to retain the latest completed assistant message plus its `stopReason` / `errorMessage`. Tool calls, intermediate messages and other child events stay out of the parent context. A transcript write failure aborts the child instead of surfacing as an unhandled stream error.
 
 There is no plugin-level output truncation. This does not remove natural limits imposed by the selected model, provider, Pi runtime or the parent model's own context window.
 
