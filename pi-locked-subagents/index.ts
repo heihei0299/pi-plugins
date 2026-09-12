@@ -23,8 +23,8 @@ export default function lockedSubagents(pi: ExtensionAPI) {
     "Delegate a self-contained task to a configured isolated subagent.",
     "Use the matching role directly; do not inspect the filesystem to discover subagents.",
     "Model, thinking, tools, system prompt, and policy are locked locally.",
-    catalog ? `Available subagents:\\n${catalog}` : "",
-  ].filter(Boolean).join("\\n\\n");
+    catalog ? `Available subagents:\n${catalog}` : "",
+  ].filter(Boolean).join("\n\n");
 
   const delegationAvailable = startupAgentNames.length > 0 && depth < depthLimit;
 
@@ -107,7 +107,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
             isError: true,
             content: [{
               type: "text",
-              text: `Subagent "${params.agent}" failed (${result.code}).\\n${result.stderr.trim() || result.finalOutput || "(no output)"}\\nTranscript: ${result.transcriptPath}`,
+              text: `Subagent "${params.agent}" failed (${result.code}).\n${result.stderr.trim() || result.finalOutput || "(no output)"}\nTranscript: ${result.transcriptPath}`,
             }],
             details,
           };
@@ -139,7 +139,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           const purpose = compactDescription(agent.description);
           const delegates = agent.allowedAgents?.length ? ` -> [${agent.allowedAgents.join(", ")}]` : "";
           return `${name}${purpose ? ` — ${purpose}` : ""} -> ${agent.model}${agent.thinking ? `:${agent.thinking}` : ""}${delegates}`;
-        }).join("\\n") || "No subagents configured", "info");
+        }).join("\n") || "No subagents configured", "info");
       } catch (err) {
         ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
       }
