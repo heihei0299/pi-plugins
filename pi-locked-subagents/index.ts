@@ -82,7 +82,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
       const canDelegate = childDepth < limit && allowedAgents.length > 0 && (agent.tools?.includes("subagent") ?? false);
       const childEnv: NodeJS.ProcessEnv = {
         ...process.env,
-        [ALLOWED_ENV]: allowedAgents.join(","),
+        [ALLOWED_ENV]: canDelegate ? allowedAgents.join(",") : "",
         [DEPTH_ENV]: String(childDepth),
       };
 
@@ -100,14 +100,17 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           thinking: agent.thinking ?? null,
           transcriptPath: result.transcriptPath,
           exitCode: result.code,
+          stopReason: result.stopReason ?? null,
         };
 
-        if (result.code !== 0) {
+        const modelFailed = result.stopReason === "error" || result.stopReason === "aborted";
+        if (result.code !== 0 || modelFailed) {
+          const failure = result.errorMessage?.trim() || result.stderr.trim() || result.finalOutput || "(no output)";
           return {
             isError: true,
             content: [{
               type: "text",
-              text: `Subagent "${params.agent}" failed (${result.code}).\n${result.stderr.trim() || result.finalOutput || "(no output)"}\nTranscript: ${result.transcriptPath}`,
+              text: `Subagent "${params.agent}" failed (exit=${result.code}, stop=${result.stopReason ?? "unknown"}).\n${failure}\nTranscript: ${result.transcriptPath}`,
             }],
             details,
           };
