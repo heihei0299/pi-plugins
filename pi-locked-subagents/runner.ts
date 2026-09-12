@@ -41,7 +41,7 @@ function assistantText(message: unknown): string | null {
       !!p && typeof p === "object" && (p as { type?: string }).type === "text" &&
       typeof (p as { text?: unknown }).text === "string")
     .map((p) => p.text)
-    .join("\\n");
+    .join("\n");
   return text || null;
 }
 
@@ -84,7 +84,7 @@ export async function runChild(
     child.stdout.on("data", (chunk: string) => {
       transcript.write(chunk);
       pending += chunk;
-      const lines = pending.split("\\n");
+      const lines = pending.split("\n");
       pending = lines.pop() ?? "";
       for (const line of lines) parseLine(line);
     });
