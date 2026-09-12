@@ -15,7 +15,10 @@ export function childArgs(agent: AgentConfig, task: string, canDelegate: boolean
 
   if (agent.thinking) args.push("--thinking", agent.thinking);
   const tools = canDelegate ? agent.tools : agent.tools?.filter((tool) => tool !== "subagent");
-  if (tools?.length) args.push("--tools", tools.join(","));
+  if (tools !== undefined) {
+    if (tools.length === 0) args.push("--no-tools");
+    else args.push("--tools", tools.join(","));
+  }
   if (iso.noSkills ?? true) args.push("--no-skills");
   if (iso.noContextFiles ?? true) args.push("--no-context-files");
   if (iso.noPromptTemplates ?? true) args.push("--no-prompt-templates");
@@ -32,17 +35,34 @@ export function childArgs(agent: AgentConfig, task: string, canDelegate: boolean
   return args;
 }
 
-function assistantText(message: unknown): string | null {
+interface AssistantMessageInfo {
+  text: string | null;
+  stopReason?: string;
+  errorMessage?: string;
+}
+
+function assistantMessageInfo(message: unknown): AssistantMessageInfo | null {
   if (!message || typeof message !== "object") return null;
-  const m = message as { role?: string; content?: unknown };
+  const m = message as {
+    role?: string;
+    content?: unknown;
+    stopReason?: unknown;
+    errorMessage?: unknown;
+  };
   if (m.role !== "assistant" || !Array.isArray(m.content)) return null;
+
   const text = m.content
     .filter((p): p is { type: string; text: string } =>
       !!p && typeof p === "object" && (p as { type?: string }).type === "text" &&
       typeof (p as { text?: unknown }).text === "string")
     .map((p) => p.text)
     .join("\n");
-  return text || null;
+
+  return {
+    text: text || null,
+    stopReason: typeof m.stopReason === "string" ? m.stopReason : undefined,
+    errorMessage: typeof m.errorMessage === "string" ? m.errorMessage : undefined,
+  };
 }
 
 export async function runChild(
@@ -55,7 +75,14 @@ export async function runChild(
   await mkdir(RUN_DIR, { recursive: true, mode: 0o700 });
   const transcriptPath = join(RUN_DIR, `${Date.now()}-${randomUUID()}.jsonl`);
 
-  return new Promise<{ code: number | null; finalOutput: string; stderr: string; transcriptPath: string }>((resolve, reject) => {
+  return new Promise<{
+    code: number | null;
+    finalOutput: string;
+    stderr: string;
+    transcriptPath: string;
+    stopReason?: string;
+    errorMessage?: string;
+  }>((resolve, reject) => {
     const transcript = createWriteStream(transcriptPath, { encoding: "utf8", mode: 0o600 });
     const child = spawn(binary, args, {
       cwd,
@@ -64,17 +91,24 @@ export async function runChild(
       detached: process.platform !== "win32",
     });
 
+    let settled = false;
     let pending = "";
     let finalOutput = "";
     let stderr = "";
+    let stopReason: string | undefined;
+    let errorMessage: string | undefined;
 
     const parseLine = (line: string) => {
       if (!line.trim()) return;
       try {
         const event = JSON.parse(line) as { type?: string; message?: unknown };
         if (event.type === "message_end") {
-          const text = assistantText(event.message);
-          if (text !== null) finalOutput = text;
+          const info = assistantMessageInfo(event.message);
+          if (info) {
+            if (info.text !== null) finalOutput = info.text;
+            if (info.stopReason !== undefined) stopReason = info.stopReason;
+            if (info.errorMessage !== undefined) errorMessage = info.errorMessage;
+          }
         }
       } catch { /* full raw line is already preserved in transcript */ }
     };
@@ -97,18 +131,34 @@ export async function runChild(
         else child.kill("SIGTERM");
       } catch { child.kill("SIGTERM"); }
     };
+
+    transcript.once("error", (err) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      abort();
+      transcript.destroy();
+      reject(new Error(`Failed to write subagent transcript: ${err.message}`, { cause: err }));
+    });
     if (signal?.aborted) abort();
     signal?.addEventListener("abort", abort, { once: true });
 
     child.once("error", (err) => {
+      if (settled) return;
+      settled = true;
       signal?.removeEventListener("abort", abort);
       transcript.end();
       reject(err);
     });
     child.once("close", (code) => {
+      if (settled) return;
       signal?.removeEventListener("abort", abort);
       if (pending.trim()) parseLine(pending);
-      transcript.end(() => resolve({ code, finalOutput, stderr, transcriptPath }));
+      transcript.end(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ code, finalOutput, stderr, transcriptPath, stopReason, errorMessage });
+      });
     });
   });
 }
