@@ -152,10 +152,10 @@ export default function lockedSubagents(pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Run a locally configured isolated subagent. Model and policy are locked locally.",
+    description: "Delegate a self-contained task to a configured isolated subagent. Use it for independent research, code exploration, implementation, or review. Prefer delegation when the task can be completed independently without requiring the main conversation history. Model and policy are locked locally.",
     parameters: Type.Object({
-      agent: Type.String({ description: "Configured subagent name" }),
-      task: Type.String({ description: "Self-contained task" }),
+      agent: Type.String({ description: "Configured subagent role to delegate the task to" }),
+      task: Type.String({ description: "Complete self-contained task with enough context for independent execution" }),
     }, { additionalProperties: false }),
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
