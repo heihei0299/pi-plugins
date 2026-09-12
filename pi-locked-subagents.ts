@@ -11,6 +11,7 @@ type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 interface AgentConfig {
   description?: string;
+  allowedAgents?: string[];
   model: string;
   thinking?: Thinking;
   tools?: string[];
@@ -28,6 +29,7 @@ interface AgentConfig {
 
 interface Config {
   piBinary?: string;
+  maxDepth?: number;
   agents: Record<string, AgentConfig>;
 }
 
@@ -42,10 +44,16 @@ const DEFAULT_SYSTEM_PROMPT =
 
 const MAX_ADVERTISED_AGENTS = 16;
 const MAX_AGENT_DESCRIPTION_CHARS = 160;
+const DEFAULT_MAX_DEPTH = 2;
+const ALLOWED_ENV = "PI_LOCKED_SUBAGENT_ALLOWED";
+const DEPTH_ENV = "PI_LOCKED_SUBAGENT_DEPTH";
 
 function parseConfig(raw: string): Config {
   const parsed = JSON.parse(raw) as Config;
   if (!parsed?.agents || typeof parsed.agents !== "object") throw new Error(`Invalid config: ${CONFIG_PATH}`);
+  if (parsed.maxDepth !== undefined && (!Number.isInteger(parsed.maxDepth) || parsed.maxDepth < 0)) {
+    throw new Error("maxDepth must be a non-negative integer");
+  }
 
   for (const [name, agent] of Object.entries(parsed.agents)) {
     if (!name.trim() || !agent || typeof agent.model !== "string" || !agent.model) {
@@ -54,8 +62,25 @@ function parseConfig(raw: string): Config {
     if (agent.description !== undefined && typeof agent.description !== "string") {
       throw new Error(`Agent "${name}" description must be a string`);
     }
+    if (agent.allowedAgents !== undefined) {
+      if (!Array.isArray(agent.allowedAgents) || agent.allowedAgents.some((value) => typeof value !== "string" || !value.trim())) {
+        throw new Error(`Agent "${name}" allowedAgents must be an array of agent names`);
+      }
+      for (const allowed of agent.allowedAgents) {
+        if (allowed === name) throw new Error(`Agent "${name}" cannot allow itself`);
+        if (!parsed.agents[allowed]) throw new Error(`Agent "${name}" references unknown allowed agent "${allowed}"`);
+      }
+    }
   }
-  return parsed;
+
+  const rawAllowlist = process.env[ALLOWED_ENV];
+  if (rawAllowlist === undefined) return parsed;
+
+  const allowed = new Set(rawAllowlist.split(",").map((value) => value.trim()).filter(Boolean));
+  return {
+    ...parsed,
+    agents: Object.fromEntries(Object.entries(parsed.agents).filter(([name]) => allowed.has(name))),
+  };
 }
 
 async function loadConfig(): Promise<Config> {
@@ -93,12 +118,22 @@ function agentCatalog(config: Config): string {
   return entries.join("\n");
 }
 
-function childArgs(agent: AgentConfig, task: string): string[] {
+function currentDepth(): number {
+  const value = Number.parseInt(process.env[DEPTH_ENV] ?? "0", 10);
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function maxDepth(config: Config): number {
+  return config.maxDepth ?? DEFAULT_MAX_DEPTH;
+}
+
+function childArgs(agent: AgentConfig, task: string, canDelegate: boolean): string[] {
   const iso = agent.isolate ?? {};
   const args = ["-p", "--mode", "json", "--no-session", "--model", agent.model];
 
   if (agent.thinking) args.push("--thinking", agent.thinking);
-  if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
+  const tools = canDelegate ? agent.tools : agent.tools?.filter((tool) => tool !== "subagent");
+  if (tools?.length) args.push("--tools", tools.join(","));
   if (iso.noSkills ?? true) args.push("--no-skills");
   if (iso.noContextFiles ?? true) args.push("--no-context-files");
   if (iso.noPromptTemplates ?? true) args.push("--no-prompt-templates");
@@ -128,7 +163,13 @@ function assistantText(message: unknown): string | null {
   return text || null;
 }
 
-async function runChild(binary: string, args: string[], cwd: string, signal?: AbortSignal) {
+async function runChild(
+  binary: string,
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
+) {
   await mkdir(RUN_DIR, { recursive: true, mode: 0o700 });
   const transcriptPath = join(RUN_DIR, `${Date.now()}-${randomUUID()}.jsonl`);
 
@@ -136,7 +177,7 @@ async function runChild(binary: string, args: string[], cwd: string, signal?: Ab
     const transcript = createWriteStream(transcriptPath, { encoding: "utf8", mode: 0o600 });
     const child = spawn(binary, args, {
       cwd,
-      env: process.env,
+      env,
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
@@ -194,6 +235,8 @@ export default function lockedSubagents(pi: ExtensionAPI) {
   // Mature subagent plugins advertise only a bounded name + purpose catalog.
   // Full model/thinking/tools/systemPrompt configuration remains local.
   const startupConfig = loadConfigSnapshot();
+  const depth = currentDepth();
+  const depthLimit = startupConfig ? maxDepth(startupConfig) : DEFAULT_MAX_DEPTH;
   const startupAgentNames = startupConfig
     ? Object.keys(startupConfig.agents).sort((left, right) => left.localeCompare(right))
     : [];
@@ -205,9 +248,13 @@ export default function lockedSubagents(pi: ExtensionAPI) {
     catalog ? `Available subagents:\n${catalog}` : "",
   ].filter(Boolean).join("\n\n");
 
+  // A restricted child with no advertised agents, or a process already at the
+  // depth limit, should not expose delegation at all.
+  const delegationAvailable = startupAgentNames.length > 0 && depth < depthLimit;
+
   // Parent context still sees exactly one tool with two arguments. Agent names
   // become an enum when the config is readable at extension load time.
-  pi.registerTool({
+  if (delegationAvailable) pi.registerTool({
     name: "subagent",
     label: "Subagent",
     description,
@@ -235,8 +282,29 @@ export default function lockedSubagents(pi: ExtensionAPI) {
         return { isError: true, content: [{ type: "text", text: `Unknown subagent "${params.agent}". Available: ${Object.keys(config.agents).join(", ")}` }], details: {} };
       }
 
+      const depthNow = currentDepth();
+      const limit = maxDepth(config);
+      if (depthNow >= limit) {
+        return { isError: true, content: [{ type: "text", text: `Subagent depth limit reached (${depthNow}/${limit}).` }], details: {} };
+      }
+
+      const childDepth = depthNow + 1;
+      const allowedAgents = agent.allowedAgents ?? [];
+      const canDelegate = childDepth < limit && allowedAgents.length > 0 && (agent.tools?.includes("subagent") ?? false);
+      const childEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        [ALLOWED_ENV]: allowedAgents.join(","),
+        [DEPTH_ENV]: String(childDepth),
+      };
+
       try {
-        const result = await runChild(config.piBinary || process.env.PI_BINARY || "pi", childArgs(agent, params.task), ctx.cwd, signal);
+        const result = await runChild(
+          config.piBinary || process.env.PI_BINARY || "pi",
+          childArgs(agent, params.task, canDelegate),
+          ctx.cwd,
+          childEnv,
+          signal,
+        );
         const details = { agent: params.agent, lockedModel: agent.model, thinking: agent.thinking ?? null, transcriptPath: result.transcriptPath, exitCode: result.code };
 
         if (result.code !== 0) {
@@ -258,7 +326,11 @@ export default function lockedSubagents(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       try {
         const config = await loadConfig();
-        ctx.ui.notify(Object.entries(config.agents).map(([name, a]) => {\n          const purpose = compactDescription(a.description);\n          return `${name}${purpose ? ` — ${purpose}` : ""} -> ${a.model}${a.thinking ? `:${a.thinking}` : ""}`;\n        }).join("\n") || "No subagents configured", "info");
+        ctx.ui.notify(Object.entries(config.agents).map(([name, a]) => {
+          const purpose = compactDescription(a.description);
+          const delegates = a.allowedAgents?.length ? ` -> [${a.allowedAgents.join(", ")}]` : "";
+          return `${name}${purpose ? ` — ${purpose}` : ""} -> ${a.model}${a.thinking ? `:${a.thinking}` : ""}${delegates}`;
+        }).join("\n") || "No subagents configured", "info");
       } catch (err) { ctx.ui.notify(err instanceof Error ? err.message : String(err), "error"); }
     },
   });
