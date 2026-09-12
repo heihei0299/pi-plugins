@@ -632,9 +632,7 @@ export default function fffExtension(pi: ExtensionAPI) {
   > = Omit<
     ToolDefinition<TParams, TDetails, TState>,
     "name" | "label" | "promptGuidelines"
-  > & {
-    promptGuidelines?: (names: ToolNames) => string[];
-  };
+  >;
 
   const pendingTools: (() => string)[] = [];
   let toolsRegistered = false;
@@ -644,13 +642,11 @@ export default function fffExtension(pi: ExtensionAPI) {
     definition: PendingToolDefinition<TParams, TDetails, TState>,
   ): void {
     pendingTools.push(() => {
-      const { promptGuidelines, ...tool } = definition;
       const resolvedName = resolveName();
       pi.registerTool({
-        ...tool,
+        ...definition,
         name: resolvedName,
         label: resolvedName,
-        promptGuidelines: promptGuidelines?.(toolNames),
       });
       return resolvedName;
     });
