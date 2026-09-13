@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "channels": [
+    {
+      "provider": "openai",
+      "modelPrefix": "gpt-",
+      "enabled": true
+    }
+  ]
+}
