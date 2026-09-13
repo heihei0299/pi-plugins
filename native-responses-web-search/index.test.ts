@@ -43,6 +43,15 @@ function nativeAdapter(capture: { options?: any }) {
   };
 }
 
+function confirmProviderOwnership(pi: any) {
+  const providerConfig = pi.providers[0]?.config;
+  pi.handlers.get("session_start")?.({}, {
+    modelRegistry: {
+      getRegisteredProviderConfig: () => providerConfig,
+    },
+  });
+}
+
 const standardConfig = normalizeConfig({
   channels: [
     { provider: "openai", modelPrefix: "gpt-", enabled: true },
@@ -88,6 +97,7 @@ async function runStandardPayload(
     "/tmp/config.json",
     { standard: nativeAdapter(capture) as any },
   );
+  confirmProviderOwnership(pi);
   const stream = pi.providers[0].config.streamSimple(model, {}, { onPayload });
   const result = await capture.options.onPayload(payload, model);
   return { pi, capture, result, stream };
@@ -135,6 +145,64 @@ test("reload reads the current config instead of carrying the previous channel",
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("fails closed when another provider shim replaces the channel owner", () => {
+  const pi = createPi();
+  const capture: { options?: any } = {};
+  installNativeResponsesWebSearch(
+    pi,
+    standardConfig,
+    "/tmp/config.json",
+    { standard: nativeAdapter(capture) as any },
+  );
+
+  pi.handlers.get("session_start")?.({}, {
+    modelRegistry: {
+      getRegisteredProviderConfig: () => ({
+        api: "openai-responses",
+        streamSimple: () => ({ type: "other-shim" }),
+      }),
+    },
+  });
+
+  expect(() => pi.providers[0].config.streamSimple(standardModel, {}, {
+    onPayload: async () => undefined,
+  })).toThrow("Dedicated Provider Conflict");
+});
+
+test("does not send until provider ownership is confirmed", () => {
+  const pi = createPi();
+  const capture: { options?: any } = {};
+  installNativeResponsesWebSearch(
+    pi,
+    standardConfig,
+    "/tmp/config.json",
+    { standard: nativeAdapter(capture) as any },
+  );
+
+  expect(() => pi.providers[0].config.streamSimple(standardModel, {}, {
+    onPayload: async () => undefined,
+  })).toThrow("Dedicated Provider Conflict");
+});
+
+test("rejects a Standard model that does not match the configured prefix", () => {
+  const pi = createPi();
+  const capture: { options?: any } = {};
+  installNativeResponsesWebSearch(
+    pi,
+    standardConfig,
+    "/tmp/config.json",
+    { standard: nativeAdapter(capture) as any },
+  );
+  confirmProviderOwnership(pi);
+
+  expect(() => pi.providers[0].config.streamSimple({
+    ...standardModel,
+    id: "o3-mini",
+  }, {}, {
+    onPayload: async () => undefined,
+  })).toThrow("does not match");
 });
 
 test("registers a Standard provider without replacing its models or auth", () => {
@@ -218,26 +286,22 @@ test("does not add search when tool choice is none", async () => {
   });
 });
 
-test("does not affect other providers, APIs, or model prefixes", async () => {
-  const otherProvider = await runStandardPayload({ input: "hello" }, {
-    provider: "anthropic",
-    id: "claude-sonnet",
-    api: "anthropic-messages",
-  });
-  const otherApi = await runStandardPayload({ input: "hello" }, {
-    provider: "openai",
-    id: "gpt-4.1",
-    api: "openai-completions",
-  });
-  const otherPrefix = await runStandardPayload({ input: "hello" }, {
-    provider: "openai",
-    id: "o3-mini",
-    api: "openai-responses",
-  });
-
-  expect(otherProvider.result).toEqual({ input: "hello" });
-  expect(otherApi.result).toEqual({ input: "hello" });
-  expect(otherPrefix.result).toEqual({ input: "hello" });
+test("does not add capability for other providers, APIs, or model prefixes", () => {
+  expect(augmentPayloadForModel(
+    { input: "hello" },
+    { provider: "anthropic", id: "claude-sonnet", api: "anthropic-messages" },
+    standardConfig.channels,
+  )).toEqual({ input: "hello" });
+  expect(augmentPayloadForModel(
+    { input: "hello" },
+    { provider: "openai", id: "gpt-4.1", api: "openai-completions" },
+    standardConfig.channels,
+  )).toEqual({ input: "hello" });
+  expect(augmentPayloadForModel(
+    { input: "hello" },
+    { provider: "openai", id: "o3-mini", api: "openai-responses" },
+    standardConfig.channels,
+  )).toEqual({ input: "hello" });
 });
 
 test("does not duplicate an existing native web search declaration", async () => {
@@ -262,6 +326,7 @@ test("fails closed when a local web_search tool is active", async () => {
     "/tmp/config.json",
     { standard: nativeAdapter(capture) as any },
   );
+  confirmProviderOwnership(pi);
   pi.providers[0].config.streamSimple(standardModel, {}, {
     onPayload: async () => undefined,
   });
@@ -293,10 +358,9 @@ test("rejects a runtime without the provider payload callback", async () => {
     "/tmp/config.json",
     { standard: nativeAdapter(capture) as any },
   );
-  pi.providers[0].config.streamSimple(standardModel, {}, {});
-
-  await expect(capture.options.onPayload({ input: "hello" }, standardModel))
-    .rejects.toThrow("provider payload callback is required");
+  confirmProviderOwnership(pi);
+  expect(() => pi.providers[0].config.streamSimple(standardModel, {}, {}))
+    .toThrow("provider payload callback is required");
 });
 
 test("status reports a missing payload callback after a failed runtime check", async () => {
@@ -308,9 +372,9 @@ test("status reports a missing payload callback after a failed runtime check", a
     "/tmp/config.json",
     { standard: nativeAdapter(capture) as any },
   );
-  pi.providers[0].config.streamSimple(standardModel, {}, {});
-  await expect(capture.options.onPayload({ input: "hello" }, standardModel))
-    .rejects.toThrow("provider payload callback is required");
+  confirmProviderOwnership(pi);
+  expect(() => pi.providers[0].config.streamSimple(standardModel, {}, {}))
+    .toThrow("provider payload callback is required");
 
   const notifications: string[] = [];
   await pi.commands.get("native-web-search")?.handler("", {
@@ -333,6 +397,7 @@ test("reports a clear error when the endpoint rejects hosted search", async () =
     "/tmp/config.json",
     { standard: nativeAdapter(capture) as any },
   );
+  confirmProviderOwnership(pi);
   pi.providers[0].config.streamSimple(standardModel, {}, {
     onPayload: async () => undefined,
   });
@@ -371,6 +436,7 @@ test("Codex composes existing callbacks and keeps the endpoint text path untouch
     "/tmp/config.json",
     { codex: nativeAdapter(capture) as any },
   );
+  confirmProviderOwnership(pi);
 
   const stream = pi.providers[0].config.streamSimple(codexModel, {}, {
     transport: "sse",
@@ -409,6 +475,7 @@ test("Codex does not add search when tool choice is none", async () => {
     "/tmp/config.json",
     { codex: nativeAdapter(capture) as any },
   );
+  confirmProviderOwnership(pi);
   pi.providers[0].config.streamSimple(codexModel, {}, {
     onPayload: async (payload: any) => ({ ...payload, tool_choice: "none" }),
   });
@@ -417,7 +484,7 @@ test("Codex does not add search when tool choice is none", async () => {
   expect(result).toEqual({ input: "no tools", tool_choice: "none" });
 });
 
-test("Codex leaves a non-matching model without the hosted capability", async () => {
+test("rejects a Codex model that does not match the configured prefix", () => {
   const pi = createPi();
   const capture: { options?: any } = {};
   installNativeResponsesWebSearch(
@@ -426,13 +493,12 @@ test("Codex leaves a non-matching model without the hosted capability", async ()
     "/tmp/config.json",
     { codex: nativeAdapter(capture) as any },
   );
+  confirmProviderOwnership(pi);
   const nonMatchingModel = { ...codexModel, id: "o3-mini" };
-  pi.providers[0].config.streamSimple(nonMatchingModel, {}, {
-    onPayload: async () => undefined,
-  });
 
-  const result = await capture.options.onPayload({ input: "hello" }, nonMatchingModel);
-  expect(result).toEqual({ input: "hello" });
+  expect(() => pi.providers[0].config.streamSimple(nonMatchingModel, {}, {
+    onPayload: async () => undefined,
+  })).toThrow("does not match");
 });
 
 test("selects the correct endpoint-specific declaration", () => {
@@ -462,6 +528,7 @@ test("passes every supported Codex transport without URL inference", () => {
       "/tmp/config.json",
       { codex: nativeAdapter(capture) as any },
     );
+    confirmProviderOwnership(pi);
 
     pi.providers[0].config.streamSimple({
       provider,
@@ -482,6 +549,7 @@ test("reports the configured endpoint, transport, and current match state", asyn
     "/tmp/config.json",
     { codex: nativeAdapter(capture) as any },
   );
+  confirmProviderOwnership(pi);
   const notifications: string[] = [];
 
   await pi.commands.get("native-web-search")?.handler("", {
@@ -505,7 +573,11 @@ test("status distinguishes a capability conflict and an incompatible endpoint", 
     standardModel,
     "/tmp/config.json",
     ["web_search"],
-    { payloadCallback: "available", activeTools: "available" },
+    {
+      payloadCallback: "available",
+      activeTools: "available",
+      providerOwnership: "available",
+    },
   );
   const incompatible = formatStatus(
     standardConfig,
@@ -516,7 +588,11 @@ test("status distinguishes a capability conflict and an incompatible endpoint", 
     },
     "/tmp/config.json",
     [],
-    { payloadCallback: "available", activeTools: "available" },
+    {
+      payloadCallback: "available",
+      activeTools: "available",
+      providerOwnership: "available",
+    },
   );
 
   expect(conflict).toContain("Capability Conflict");
@@ -539,6 +615,12 @@ test("rejects malformed, unsupported, or duplicate enabled channel configuration
       { provider: "openai", enabled: true },
     ],
   })).toThrow("duplicate enabled provider");
+  expect(() => normalizeConfig({
+    channels: [
+      { provider: "openai", enabled: true },
+      { provider: "codex", endpoint: "codex", enabled: true },
+    ],
+  })).toThrow("one enabled Dedicated Provider Channel");
 });
 
 test("does not synthesize source data or rewrite endpoint text", async () => {

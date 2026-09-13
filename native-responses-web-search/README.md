@@ -62,11 +62,11 @@ Example:
 }
 ```
 
-A channel is disabled unless its own `enabled` value is explicitly `true`. The configured provider must already have the desired Responses models, base URL, and authentication. The extension registers an overlay for that provider without supplying `models`, `baseUrl`, or `apiKey`, so the existing catalogue and credentials remain authoritative.
+A channel is disabled unless its own `enabled` value is explicitly `true`. Only one channel may be enabled at a time; change the endpoint or transport in the file and run `/reload`. The configured provider must already have the desired Responses models, base URL, and authentication. The extension registers an overlay for that provider without supplying `models`, `baseUrl`, or `apiKey`, so the existing catalogue and credentials remain authoritative.
 
-Reserve the configured provider ID for this extension. Do not use the same provider ID with another provider shim such as `cpa-codex-ws`.
+Reserve the configured provider ID for this extension. Do not use the same provider ID with another provider shim such as `cpa-codex-ws`. After reload, the plugin checks the registered stream owner when the runtime exposes that registration; an ownership conflict leaves the channel unavailable instead of sending a request through the wrong adapter. Provider ownership is a channel-level deployment contract because Pi does not expose a pre-registration owner query.
 
-`modelPrefix` is optional; when omitted, all models on the dedicated provider channel that use the selected Responses API match.
+`modelPrefix` is optional; when omitted, all models on the dedicated provider channel that use the selected Responses API match. A model on the channel that does not match the prefix is rejected before the native request is created, so keep unrelated models on a different provider channel.
 
 ## Endpoint and transport
 
@@ -85,7 +85,7 @@ The model still decides whether to search. No search is forced for ordinary prom
 
 ## Failure hardening
 
-The runtime must provide `ExtensionAPI.getActiveTools()` and the provider `onPayload` callback. If either capability is missing, the channel is reported as unavailable and the request fails closed instead of silently losing the safety checks.
+The runtime must provide `ExtensionAPI.getActiveTools()` and the provider `onPayload` callback. If either capability is missing, the channel is reported as unavailable and the request fails closed instead of silently losing the safety checks. The payload callback is verified on the first provider call; before that, status reports that the capability check is pending and still fails closed if it is absent.
 
 If the current active tool list contains a local `web_search`, the request reports `Capability Conflict` and is not sent. The plugin never removes, renames, or disables that local tool. HTTP endpoint rejection is surfaced as an error for the current turn; the plugin does not switch credentials, alter configuration, permanently disable the channel, or implement a fallback search provider.
 
