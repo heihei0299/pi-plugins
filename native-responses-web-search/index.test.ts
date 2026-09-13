@@ -1,356 +1,249 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
+  addNativeWebSearch,
   formatStatus,
   installNativeResponsesWebSearch,
-  loadConfig,
   normalizeConfig,
-  prepareNativePayload,
 } from "./index.ts";
 
-type Handler = (event: any, ctx: any) => unknown;
-
-function createPi(activeTools: string[] = [], withToolInspection = true) {
-  const providers: Array<{ name: string; config: any }> = [];
-  const commands = new Map<string, { handler: Handler }>();
-  const pi: any = {
-    providers,
-    commands,
-    registerProvider(name: string, config: unknown) {
-      providers.push({ name, config });
-    },
-    registerCommand(name: string, command: { handler: Handler }) {
-      commands.set(name, command);
-    },
-  };
-  if (withToolInspection) pi.getActiveTools = () => activeTools;
-  return pi;
-}
-
-function nativeAdapter(capture: { called?: boolean; options?: any }) {
-  return (_model: unknown, _context: unknown, options: unknown) => {
-    capture.called = true;
-    capture.options = options;
-    return { type: "fake-stream" } as any;
-  };
-}
-
-const standardConfig = normalizeConfig({
-  channels: [
-    { provider: "openai", modelPrefix: "gpt-", enabled: true },
-  ],
-});
-
-const codexConfig = normalizeConfig({
-  transport: "sse",
-  channels: [
-    {
-      provider: "codex-channel",
-      endpoint: "codex",
-      modelPrefix: "gpt-",
-      transport: "websocket",
-      enabled: true,
-    },
-  ],
-});
-
-const standardModel = {
-  provider: "openai",
-  id: "gpt-4.1",
-  api: "openai-responses",
-};
-
-const codexModel = {
-  provider: "codex-channel",
+const model = {
+  provider: "codex",
   id: "gpt-5-codex",
   api: "openai-codex-responses",
 };
 
-async function runStandardPayload(
-  payload: unknown,
-  model = standardModel,
-  activeTools: string[] = [],
-  onPayload: ((payload: unknown, model: unknown) => unknown) | undefined = async () => undefined,
-) {
-  const pi = createPi(activeTools);
-  const capture: { called?: boolean; options?: any } = {};
-  installNativeResponsesWebSearch(
-    pi,
-    standardConfig,
-    "/tmp/config.json",
-    { standard: nativeAdapter(capture) as any },
-  );
-  const stream = pi.providers[0].config.streamSimple(model, {}, { onPayload });
-  const result = await capture.options.onPayload(payload, model);
-  return { pi, capture, result, stream };
+const config = normalizeConfig({
+  transport: "sse",
+  channels: [{
+    provider: "codex",
+    endpoint: "codex",
+    modelPrefix: "gpt-",
+    enabled: true,
+  }],
+});
+
+function assistantResult(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: "answer" }],
+    api: "openai-codex-responses",
+    provider: "codex",
+    model: "gpt-5-codex",
+    usage: {
+      input: 1,
+      output: 2,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 3,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+    ...overrides,
+  };
 }
 
-test("keeps the plugin and channels opt-in by default", () => {
-  const pi = createPi();
-  installNativeResponsesWebSearch(pi, normalizeConfig({}));
+function setup(result = assistantResult(), transport = "sse") {
+  const tools: any[] = [];
+  const providers: Array<{ name: string; config: any }> = [];
+  const commands = new Map<string, { handler: any }>();
+  const capture: { calls: any[] } = { calls: [] };
+  const pi: any = {
+    tools,
+    providers,
+    commands,
+    registerTool(tool: any) {
+      tools.push(tool);
+    },
+    registerProvider(name: string, providerConfig: any) {
+      providers.push({ name, config: providerConfig });
+    },
+    registerCommand(name: string, command: { handler: any }) {
+      commands.set(name, command);
+    },
+  };
+  const adapter = (adapterModel: unknown, context: unknown, options: unknown) => {
+    capture.calls.push({ model: adapterModel, context, options });
+    return { result: async () => result } as any;
+  };
+  const channelConfig = normalizeConfig({
+    transport,
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "gpt-",
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(pi, channelConfig, "/tmp/config", {
+    codex: adapter as any,
+  });
+  return { pi, capture, modelRegistry: authRegistry() };
+}
 
-  expect(pi.providers).toEqual([]);
-  expect(pi.commands.has("native-web-search")).toBe(true);
+function authRegistry() {
+  return {
+    getApiKeyAndHeaders: async () => ({
+      ok: true,
+      apiKey: "key",
+      headers: { "x-test": "yes" },
+    }),
+  };
+}
+
+function toolContext(
+  modelOverride: unknown = model,
+  modelRegistry: unknown = authRegistry(),
+) {
+  return {
+    model: modelOverride,
+    modelRegistry,
+    signal: undefined,
+    sessionManager: { getSessionId: () => "parent-session" },
+  };
+}
+
+test("registers the local tool and preserves the Codex provider overlay", () => {
+  const { pi } = setup();
+
+  expect(pi.tools).toHaveLength(1);
+  expect(pi.tools[0].name).toBe("web_search");
+  expect(pi.tools[0].parameters).toEqual({
+    type: "object",
+    properties: {
+      query: { type: "string", description: "The web search query" },
+    },
+    required: ["query"],
+    additionalProperties: false,
+  });
+  expect(pi.providers).toHaveLength(1);
+  expect(pi.providers[0].name).toBe("codex");
+  expect(pi.providers[0].config.api).toBe("openai-codex-responses");
 });
 
-test("requires explicit opt-in for a configured channel", () => {
-  const pi = createPi();
-  installNativeResponsesWebSearch(pi, normalizeConfig({
-    channels: [{ provider: "openai" }],
-  }));
+test("does not register a tool when the plugin is disabled", () => {
+  const pi: any = {
+    tools: [],
+    providers: [],
+    registerTool(tool: unknown) { this.tools.push(tool); },
+    registerProvider(name: string, config: unknown) { this.providers.push({ name, config }); },
+    registerCommand() {},
+  };
 
-  expect(pi.providers).toEqual([]);
-});
-
-test("reload reads the current config instead of carrying the previous channel", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "native-responses-web-search-"));
-  const path = join(directory, "config.json");
-  try {
-    await writeFile(path, JSON.stringify({
-      channels: [{ provider: "openai", endpoint: "standard", enabled: true }],
-    }));
-    const first = await loadConfig(path);
-
-    await writeFile(path, JSON.stringify({
-      channels: [{
-        provider: "codex-channel",
-        endpoint: "codex",
-        transport: "sse",
-        enabled: true,
-      }],
-    }));
-    const second = await loadConfig(path);
-
-    expect(first.channels[0].provider).toBe("openai");
-    expect(second.channels[0].provider).toBe("codex-channel");
-    expect(second.channels[0].endpoint).toBe("codex");
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("registers a Standard provider without replacing its models or auth", () => {
-  const pi = createPi();
-  const capture: { options?: any } = {};
   installNativeResponsesWebSearch(
     pi,
-    standardConfig,
-    "/tmp/config.json",
-    { standard: nativeAdapter(capture) as any },
+    normalizeConfig({
+      enabled: false,
+      channels: [{ provider: "codex", endpoint: "codex", enabled: true }],
+    }),
+    "/tmp/config",
+    {},
   );
 
-  expect(pi.providers).toHaveLength(1);
-  expect(pi.providers[0].name).toBe("openai");
-  expect(pi.providers[0].config.api).toBe("openai-responses");
-  expect(pi.providers[0].config.streamSimple).toBeFunction();
+  expect(pi.tools).toHaveLength(0);
+  expect(pi.providers).toHaveLength(0);
 });
 
-test("adds the minimal Standard Responses hosted search tool", async () => {
-  const payload = {
-    model: "gpt-4.1",
-    input: [{ role: "user", content: "What changed today?" }],
-    tools: [{ type: "function", name: "read" }],
-    temperature: 0,
+test("requires enabled channels to use the Codex endpoint", () => {
+  expect(() => normalizeConfig({
+    channels: [{ provider: "openai", endpoint: "standard", enabled: true }],
+  })).toThrow("endpoint must be \"codex\"");
+
+  expect(() => normalizeConfig({
+    channels: [
+      { provider: "codex", endpoint: "codex", enabled: true },
+      { provider: "other", endpoint: "codex", enabled: true },
+    ],
+  })).toThrow("one enabled Dedicated Provider Channel");
+});
+
+test("validates query and model before resolving auth", async () => {
+  const { pi } = setup();
+  let authCalls = 0;
+  const registry = {
+    getApiKeyAndHeaders: async () => {
+      authCalls += 1;
+      return { ok: true, apiKey: "key" };
+    },
   };
+  const tool = pi.tools[0];
 
-  const { result } = await runStandardPayload(payload);
+  await expect(tool.execute("1", {}, undefined, undefined, toolContext(model, registry)))
+    .rejects.toThrow("non-empty");
+  await expect(tool.execute(
+    "1",
+    { query: "x" },
+    undefined,
+    undefined,
+    toolContext({ ...model, provider: "other" }, registry),
+  )).rejects.toThrow("does not match");
 
-  expect(result).toEqual({
-    ...payload,
+  expect(authCalls).toBe(0);
+});
+
+test("runs a nested native Codex search with auth, transport, signal, and no session", async () => {
+  const { pi, capture, modelRegistry } = setup();
+  const signal = new AbortController().signal;
+  const result = await pi.tools[0].execute(
+    "1",
+    { query: "  latest news  " },
+    signal,
+    undefined,
+    toolContext(model, modelRegistry),
+  );
+  const call = capture.calls[0];
+  const payload = await call.options.onPayload({
+    input: "latest news",
+    tools: [{ type: "function", name: "read" }],
+  });
+
+  expect(result.content).toEqual([{ type: "text", text: "answer" }]);
+  expect(result.usage.input).toBe(1);
+  expect(call.context.systemPrompt).toContain("native web search");
+  expect(call.context.messages).toHaveLength(1);
+  expect(call.context.messages[0]).toMatchObject({
+    role: "user",
+    content: "latest news",
+  });
+  expect(call.context.messages[0].timestamp).toBeNumber();
+  expect(call.context.tools).toEqual([]);
+  expect(call.options).toMatchObject({
+    apiKey: "key",
+    headers: { "x-test": "yes" },
+    transport: "sse",
+    toolChoice: "required",
+    signal,
+  });
+  expect(call.options.sessionId).toBeUndefined();
+  expect(payload).toEqual({
+    input: "latest news",
     tools: [
       { type: "function", name: "read" },
-      { type: "web_search_preview" },
+      { type: "web_search" },
     ],
   });
-  expect(payload.tools).toEqual([{ type: "function", name: "read" }]);
 });
 
-test("preserves payload changes made by an earlier payload callback", async () => {
-  const payload = {
-    model: "gpt-4.1",
-    input: "latest news",
-    metadata: { requestSource: "existing-extension" },
-  };
-
-  const { result } = await runStandardPayload(
-    payload,
-    standardModel,
-    [],
-    async (current) => ({ ...current as any, temperature: 0 }),
-  );
-
-  expect(result).toEqual({
-    ...payload,
-    temperature: 0,
-    tools: [{ type: "web_search_preview" }],
-  });
-});
-
-test("does not add search when tool choice is none and there is no conflict", async () => {
-  const payload = {
-    model: "gpt-4.1",
-    input: "no tools",
-    tool_choice: "none",
-  };
-  const { result } = await runStandardPayload(payload);
-
-  expect(result).toEqual(payload);
-});
-
-test("rejects a Standard model that does not match the provider, API, or prefix", () => {
-  const models = [
-    { provider: "anthropic", id: "claude-sonnet", api: "anthropic-messages" },
-    { provider: "openai", id: "gpt-4.1", api: "openai-completions" },
-    { provider: "openai", id: "o3-mini", api: "openai-responses" },
-  ];
-
-  for (const model of models) {
-    const pi = createPi();
-    installNativeResponsesWebSearch(pi, standardConfig, "/tmp/config.json", {
-      standard: (() => ({})) as any,
-    });
-    expect(() => pi.providers[0].config.streamSimple(model, {}, {
-      onPayload: async () => undefined,
-    })).toThrow("does not match");
-  }
-});
-
-test("does not duplicate an existing native web search declaration", async () => {
+test("does not duplicate an existing native declaration or mutate the payload", () => {
   const payload = {
     input: "already enabled",
-    tools: [
-      { type: "function", name: "read" },
-      { type: "web_search_preview" },
-    ],
+    tools: [{ type: "web_search" }],
   };
-  const { result } = await runStandardPayload(payload);
+  const result = addNativeWebSearch(payload, "codex");
 
-  expect(result).toEqual(payload);
+  expect(result).toBe(payload);
+  expect(payload.tools).toEqual([{ type: "web_search" }]);
+  expect(addNativeWebSearch({ input: "none", tool_choice: "none" }, "codex"))
+    .toEqual({ input: "none", tool_choice: "none" });
 });
 
-test("keeps other active tools usable", async () => {
-  const { result } = await runStandardPayload(
-    { input: "search with read available" },
-    standardModel,
-    ["read"],
-  );
-
-  expect(result).toEqual({
-    input: "search with read available",
-    tools: [{ type: "web_search_preview" }],
-  });
-});
-
-test("fails closed on a local web_search conflict even with tool_choice none", () => {
-  const channel = standardConfig.channels[0];
-  const payload = { input: "no tools", tool_choice: "none" };
-  expect(() => prepareNativePayload(
-    payload,
-    standardModel,
-    channel,
-    ["web_search"],
-  )).toThrow("Capability Conflict");
-
-  const pi = createPi(["web_search"]);
-  const capture: { called?: boolean; options?: any } = {};
-  installNativeResponsesWebSearch(pi, standardConfig, "/tmp/config.json", {
-    standard: nativeAdapter(capture) as any,
-  });
-  expect(() => pi.providers[0].config.streamSimple(standardModel, {}, {
-    onPayload: async () => undefined,
-  })).toThrow("Capability Conflict");
-  expect(capture.called ?? false).toBe(false);
-});
-
-test("rejects a runtime without active-tool inspection", () => {
-  const pi = createPi([], false);
-  installNativeResponsesWebSearch(pi, standardConfig, "/tmp/config.json", {
-    standard: (() => ({})) as any,
-  });
-
-  expect(pi.providers).toEqual([]);
-  expect(pi.commands.has("native-web-search")).toBe(true);
-});
-
-test("rejects a runtime without the provider payload callback before native streaming", () => {
-  const pi = createPi();
-  const capture: { called?: boolean; options?: any } = {};
-  installNativeResponsesWebSearch(pi, standardConfig, "/tmp/config.json", {
-    standard: nativeAdapter(capture) as any,
-  });
-
-  expect(() => pi.providers[0].config.streamSimple(standardModel, {}, {}))
-    .toThrow("provider payload callback is required");
-  expect(capture.called ?? false).toBe(false);
-});
-
-test("status reports a missing payload callback after the runtime check", async () => {
-  const pi = createPi();
-  const capture: { called?: boolean; options?: any } = {};
-  installNativeResponsesWebSearch(pi, standardConfig, "/tmp/config.json", {
-    standard: nativeAdapter(capture) as any,
-  });
-  expect(() => pi.providers[0].config.streamSimple(standardModel, {}, {}))
-    .toThrow("provider payload callback is required");
-
-  const notifications: string[] = [];
-  await pi.commands.get("native-web-search")?.handler("", {
-    model: standardModel,
-    ui: {
-      notify(message: string) {
-        notifications.push(message);
-      },
-    },
-  });
-  expect(notifications[0]).toContain("runtime payload callback is missing");
-});
-
-test("reports a clear Standard endpoint rejection and preserves onResponse", async () => {
-  const pi = createPi();
-  const capture: { called?: boolean; options?: any } = {};
-  let responseCallbackCalls = 0;
-  installNativeResponsesWebSearch(pi, standardConfig, "/tmp/config.json", {
-    standard: nativeAdapter(capture) as any,
-  });
-  pi.providers[0].config.streamSimple(standardModel, {}, {
-    onPayload: async () => undefined,
-    onResponse: async () => {
-      responseCallbackCalls += 1;
-    },
-  });
-
-  await capture.options.onResponse({ status: 200, headers: {} }, standardModel);
-  expect(responseCallbackCalls).toBe(1);
-  await expect(capture.options.onResponse({ status: 403, headers: {} }, standardModel))
-    .rejects.toThrow("standard Responses endpoint rejected hosted web search (HTTP 403)");
-});
-
-test("registers a Codex provider with its configured transport", () => {
-  const pi = createPi();
-  const capture: { options?: any } = {};
-  installNativeResponsesWebSearch(pi, codexConfig, "/tmp/config.json", {
-    codex: nativeAdapter(capture) as any,
-  });
-
-  expect(pi.providers).toHaveLength(1);
-  expect(pi.providers[0].name).toBe("codex-channel");
-  expect(pi.providers[0].config.api).toBe("openai-codex-responses");
-  expect(pi.providers[0].config.streamSimple).toBeFunction();
-});
-
-test("Codex composes payload/response callbacks and leaves response text to the native adapter", async () => {
-  const pi = createPi();
-  const capture: { called?: boolean; options?: any } = {};
+test("does not declare native search on the parent request or reject the local tool", async () => {
+  const { pi, capture } = setup();
   let payloadCallbackCalls = 0;
   let responseCallbackCalls = 0;
-  installNativeResponsesWebSearch(pi, codexConfig, "/tmp/config.json", {
-    codex: nativeAdapter(capture) as any,
-  });
-
-  const stream = pi.providers[0].config.streamSimple(codexModel, {}, {
-    transport: "sse",
+  const stream = pi.providers[0].config.streamSimple(model, { messages: [], tools: [] }, {
     onPayload: async (payload: any) => {
       payloadCallbackCalls += 1;
       return { ...payload, temperature: 0 };
@@ -359,180 +252,148 @@ test("Codex composes payload/response callbacks and leaves response text to the 
       responseCallbackCalls += 1;
     },
   });
-  const result = await capture.options.onPayload(
-    { input: "latest news", tools: [{ type: "function", name: "read" }] },
-    codexModel,
-  );
-  await capture.options.onResponse({ status: 200, headers: {} }, codexModel);
+  const payload = await capture.calls[0].options.onPayload({ input: "x" }, model);
+  await capture.calls[0].options.onResponse({ status: 200, headers: {} }, model);
 
-  expect(stream).toEqual({ type: "fake-stream" });
+  expect(stream).toBeDefined();
   expect(payloadCallbackCalls).toBe(1);
   expect(responseCallbackCalls).toBe(1);
-  expect(capture.options.transport).toBe("websocket");
-  expect(result).toEqual({
-    input: "latest news",
-    temperature: 0,
-    tools: [
-      { type: "function", name: "read" },
-      { type: "web_search" },
-    ],
-  });
+  expect(payload).toEqual({ input: "x", temperature: 0 });
+  expect(capture.calls[0].options.transport).toBe("sse");
 });
 
-test("Codex does not add search when tool choice is none and there is no conflict", async () => {
-  const pi = createPi();
-  const capture: { options?: any } = {};
-  installNativeResponsesWebSearch(pi, codexConfig, "/tmp/config.json", {
-    codex: nativeAdapter(capture) as any,
-  });
-  pi.providers[0].config.streamSimple(codexModel, {}, {
-    onPayload: async (payload: any) => ({ ...payload, tool_choice: "none" }),
-  });
+test("surfaces authentication and nested response failures", async () => {
+  const authFailure = setup();
+  const auth = {
+    getApiKeyAndHeaders: async () => ({ ok: false, error: "not signed in" }),
+  };
+  await expect(authFailure.pi.tools[0].execute(
+    "1",
+    { query: "latest" },
+    undefined,
+    undefined,
+    toolContext(model, auth),
+  )).rejects.toThrow("not signed in");
 
-  const result = await capture.options.onPayload({ input: "no tools" }, codexModel);
-  expect(result).toEqual({ input: "no tools", tool_choice: "none" });
+  const failed = setup(assistantResult({
+    stopReason: "error",
+    errorMessage: "endpoint rejected",
+  }));
+  await expect(failed.pi.tools[0].execute(
+    "1",
+    { query: "latest" },
+    undefined,
+    undefined,
+    toolContext(model, failed.modelRegistry),
+  )).rejects.toThrow("endpoint rejected");
 });
 
-test("rejects a Codex model that does not match the configured prefix", () => {
-  const pi = createPi();
-  const capture: { options?: any } = {};
-  installNativeResponsesWebSearch(pi, codexConfig, "/tmp/config.json", {
-    codex: nativeAdapter(capture) as any,
+test("fails closed when the Codex adapter is unavailable", () => {
+  const notifications: string[] = [];
+  const pi: any = {
+    tools: [],
+    providers: [],
+    registerTool(tool: unknown) { this.tools.push(tool); },
+    registerProvider(name: string, config: unknown) { this.providers.push({ name, config }); },
+    registerCommand(name: string, command: any) { this.command = { name, ...command }; },
+  };
+  installNativeResponsesWebSearch(pi, config, "/tmp/config", {});
+  pi.command.handler("", {
+    model,
+    ui: { notify(message: string) { notifications.push(message); } },
   });
-  expect(() => pi.providers[0].config.streamSimple({ ...codexModel, id: "o3-mini" }, {}, {
-    onPayload: async () => undefined,
-  })).toThrow("does not match");
+
+  expect(pi.tools).toHaveLength(0);
+  expect(notifications[0]).toContain("adapter is unavailable");
 });
 
-test("selects the correct endpoint-specific declaration", async () => {
-  const standard = await runStandardPayload({ input: "standard" });
-  expect(standard.result).toEqual({
-    input: "standard",
-    tools: [{ type: "web_search_preview" }],
+test("reports configured status and model mismatch", async () => {
+  const { pi } = setup();
+  const notifications: string[] = [];
+  await pi.commands.get("native-web-search")?.handler("", {
+    model: { ...model, id: "o3-mini" },
+    ui: { notify(message: string) { notifications.push(message); } },
   });
 
-  const pi = createPi();
-  const capture: { options?: any } = {};
-  installNativeResponsesWebSearch(pi, codexConfig, "/tmp/config.json", {
-    codex: nativeAdapter(capture) as any,
-  });
-  pi.providers[0].config.streamSimple(codexModel, {}, {
-    onPayload: async () => undefined,
-  });
-  const result = await capture.options.onPayload({ input: "codex" }, codexModel);
-  expect(result).toEqual({ input: "codex", tools: [{ type: "web_search" }] });
+  expect(notifications[0]).toContain("model prefix does not match");
+  expect(formatStatus(config, model, "/tmp/config")).toContain(
+    "codex/gpt- -> Codex Responses (sse) -> enabled; model matches (tool registration pending)",
+  );
 });
 
-test("passes every supported Codex transport without URL inference", () => {
+test("reports a registered tool for a matching model", async () => {
+  const { pi } = setup();
+  const notifications: string[] = [];
+  await pi.commands.get("native-web-search")?.handler("", {
+    model,
+    ui: { notify(message: string) { notifications.push(message); } },
+  });
+
+  expect(notifications[0]).toContain("enabled; model matches; tool registered");
+});
+
+test("supports every configured Codex transport", async () => {
   for (const transport of ["sse", "websocket", "websocket-cached", "auto"] as const) {
-    const provider = `codex-${transport}`;
-    const config = normalizeConfig({
-      channels: [{ provider, endpoint: "codex", enabled: true, transport }],
-    });
-    const pi = createPi();
-    const capture: { options?: any } = {};
-    installNativeResponsesWebSearch(pi, config, "/tmp/config.json", {
-      codex: nativeAdapter(capture) as any,
-    });
-    pi.providers[0].config.streamSimple({
-      provider,
-      id: "gpt-5-codex",
-      api: "openai-codex-responses",
-    }, {}, { onPayload: async () => undefined });
-
-    expect(capture.options.transport).toBe(transport);
+    const { pi, capture, modelRegistry } = setup(assistantResult(), transport);
+    await pi.tools[0].execute(
+      "1",
+      { query: "latest" },
+      undefined,
+      undefined,
+      toolContext(model, modelRegistry),
+    );
+    expect(capture.calls[0].options.transport).toBe(transport);
   }
 });
 
-test("reports the configured endpoint, transport, and current match state", async () => {
-  const pi = createPi(["read"]);
-  const capture: { options?: any } = {};
-  installNativeResponsesWebSearch(pi, codexConfig, "/tmp/config.json", {
-    codex: nativeAdapter(capture) as any,
-  });
-  const notifications: string[] = [];
-
-  await pi.commands.get("native-web-search")?.handler("", {
-    model: codexModel,
-    ui: {
-      notify(message: string) {
-        notifications.push(message);
-      },
-    },
-  });
-
-  expect(notifications[0]).toContain(
-    "codex-channel/gpt- -> Codex Responses (websocket) -> enabled; model matches",
-  );
-  expect(notifications[0]).toContain("config: /tmp/config.json");
-});
-
-test("status distinguishes a capability conflict and an incompatible endpoint", () => {
-  const conflict = formatStatus(
-    standardConfig,
-    standardModel,
-    "/tmp/config.json",
-    ["web_search"],
-    { payloadCallback: "available", activeTools: "available" },
-  );
-  const incompatible = formatStatus(
-    standardConfig,
-    {
-      provider: "openai",
-      id: "gpt-4.1",
-      api: "openai-completions",
-    },
-    "/tmp/config.json",
-    [],
-    { payloadCallback: "available", activeTools: "available" },
-  );
-
-  expect(conflict).toContain("Capability Conflict");
-  expect(incompatible).toContain("not Standard Responses");
-});
-
-test("rejects malformed, unsupported, or duplicate enabled channel configuration", () => {
-  expect(() => normalizeConfig({ channels: "openai" })).toThrow(
-    "config.channels must be an array",
-  );
-  expect(() => normalizeConfig({
-    channels: [{ provider: "openai", endpoint: "other" }],
-  })).toThrow("endpoint must be \"standard\" or \"codex\"");
-  expect(() => normalizeConfig({
-    channels: [{ provider: "openai", transport: "udp" }],
-  })).toThrow("transport must be one of");
-  expect(() => normalizeConfig({
+test("allows disabled Standard entries while requiring enabled channels to be Codex", () => {
+  const normalized = normalizeConfig({
     channels: [
-      { provider: "openai", enabled: true },
-      { provider: "openai", enabled: true },
-    ],
-  })).toThrow("duplicate enabled provider");
-  expect(() => normalizeConfig({
-    channels: [
-      { provider: "openai", enabled: true },
+      { provider: "legacy", endpoint: "standard", enabled: false },
       { provider: "codex", endpoint: "codex", enabled: true },
     ],
-  })).toThrow("one enabled Dedicated Provider Channel");
-});
-
-test("does not synthesize source data or rewrite endpoint text", async () => {
-  const payload = { input: "plain assistant text", metadata: { keep: true } };
-  const { result } = await runStandardPayload(payload);
-
-  expect(result).toEqual({
-    input: "plain assistant text",
-    metadata: { keep: true },
-    tools: [{ type: "web_search_preview" }],
   });
-  expect(result).not.toHaveProperty("sources");
-  expect(result).not.toHaveProperty("search_results");
+
+  expect(normalized.channels[0]).toMatchObject({
+    provider: "legacy",
+    endpoint: "standard",
+    enabled: false,
+  });
+  expect(normalized.channels[1].endpoint).toBe("codex");
 });
 
-test("payload preparation is a no-op for an unsupported payload", () => {
-  expect(prepareNativePayload(
-    null,
-    standardModel,
-    standardConfig.channels[0],
-    [],
-  )).toBeNull();
+test("removes an externally injected native search declaration from the parent request", async () => {
+  const { pi, capture } = setup();
+  pi.providers[0].config.streamSimple(model, { messages: [], tools: [] }, {
+    onPayload: async (payload: any) => ({
+      ...payload,
+      tools: [
+        { type: "function", name: "read" },
+        { type: "web_search" },
+      ],
+    }),
+  });
+
+  const payload = await capture.calls[0].options.onPayload({ input: "x" }, model);
+
+  expect(payload).toEqual({
+    input: "x",
+    tools: [{ type: "function", name: "read" }],
+  });
+});
+
+test("preserves parent HTTP response callback semantics", async () => {
+  const { pi, capture } = setup();
+  let callbackCalls = 0;
+  pi.providers[0].config.streamSimple(model, { messages: [], tools: [] }, {
+    onResponse: async () => {
+      callbackCalls += 1;
+    },
+  });
+
+  await expect(capture.calls[0].options.onResponse(
+    { status: 500, headers: {} },
+    model,
+  )).resolves.toBeUndefined();
+  expect(callbackCalls).toBe(1);
 });

@@ -1,8 +1,6 @@
 # Native Responses Web Search
 
-A minimal Pi extension that enables Standard or Codex Responses native hosted web search on explicitly configured provider channels.
-
-It does not register a local `web_search` tool, add prompt instructions, execute searches, or copy search results into Pi context. The provider returns its normal assistant text; the extension only adds the native Responses capability to the request payload.
+A Pi extension that overlays an explicitly configured provider channel and exposes a local `web_search` tool. The active channel for local behavior must use the Codex Responses endpoint. Each tool call runs a small, independent Codex Responses request; its hosted request contains `{ "type": "web_search" }`, and only the returned assistant text is given back to Pi.
 
 ## Install
 
@@ -12,90 +10,38 @@ cp index.ts ~/.pi/agent/extensions/native-responses-web-search.ts
 cp native-responses-web-search.example.json ~/.pi/agent/native-responses-web-search.json
 ```
 
-After changing the configuration, run:
-
-```text
-/reload
-```
-
-Show the read-only status:
-
-```text
-/native-web-search
-```
+Run `/reload` after configuration changes. Use `/native-web-search` for status.
 
 ## Configuration
 
-Default path:
-
-```text
-~/.pi/agent/native-responses-web-search.json
-```
-
-Override it with:
-
-```bash
-export PI_NATIVE_RESPONSES_WEB_SEARCH_CONFIG=/path/to/native-responses-web-search.json
-```
-
-Example:
+Default path: `~/.pi/agent/native-responses-web-search.json`. Override it with `PI_NATIVE_RESPONSES_WEB_SEARCH_CONFIG`.
 
 ```json
 {
   "enabled": true,
   "transport": "auto",
-  "channels": [
-    {
-      "provider": "openai",
-      "endpoint": "standard",
-      "modelPrefix": "gpt-",
-      "enabled": true
-    },
-    {
-      "provider": "codex-channel",
-      "endpoint": "codex",
-      "transport": "websocket-cached",
-      "modelPrefix": "gpt-",
-      "enabled": false
-    }
-  ]
+  "channels": [{
+    "provider": "codex-channel",
+    "endpoint": "codex",
+    "transport": "websocket-cached",
+    "modelPrefix": "gpt-",
+    "enabled": true
+  }]
 }
 ```
 
-A channel is disabled unless its own `enabled` value is explicitly `true`. Only one channel may be enabled at a time; change the endpoint or transport in the file and run `/reload`. The configured provider must already have the desired Responses models, base URL, and authentication. The extension registers an overlay for that provider without supplying `models`, `baseUrl`, or `apiKey`, so the existing catalogue and credentials remain authoritative.
+A channel needs its own `enabled: true`; only one enabled channel is supported. The provider must already contain the desired models, base URL, and credentials. The overlay supplies none of those fields, preserving provider catalogue/authentication. `modelPrefix` is optional. The configured provider ID is reserved for this extension.
 
-Reserve the configured provider ID for this extension. Do not use the same provider ID with another provider shim such as `cpa-codex-ws`. Provider ownership is a channel-level configuration/deployment contract: this plugin does not reliably detect or prevent another shim from registering the same provider later.
+## Behavior
 
-`modelPrefix` is optional; when omitted, all models on the dedicated provider channel that use the selected Responses API match. A model on the channel that does not match the prefix is rejected before the native request is created, so keep unrelated models on a different provider channel.
+The plugin registers `web_search` with a query string parameter and a concise usage hint. It validates the active model and obtains credentials through Pi's model registry. The nested request uses the configured Codex transport, `toolChoice: "required"`, the incoming abort signal, no session ID, and a minimal context containing only a search instruction and query. Its payload callback appends the Codex native declaration. Nested errors and cancellation are surfaced; citations are not synthesized.
 
-## Endpoint and transport
+Parent provider requests retain their existing payload and response callbacks, but never receive a native web-search declaration and never conflict with the local tool. Enabled channels must use the Codex Responses endpoint; disabled Standard entries are ignored and may remain in the configuration.
 
-`endpoint` selects the adapter explicitly:
+No third-party dependency or `pi-ai` change is required. The tool uses the current active model; it does not silently select another Codex model. If the active model does not match the configured provider or prefix, the tool fails with a clear error.
 
-- `standard` uses the `openai-responses` model API and appends `{ "type": "web_search_preview" }`.
-- `codex` uses the `openai-codex-responses` model API and appends `{ "type": "web_search" }`.
+## Smoke test
 
-Codex `transport` accepts `sse`, `websocket`, `websocket-cached`, or `auto`. A channel value overrides the top-level default, which is `auto`. The configured value is passed directly to Pi's native Codex adapter; this plugin does not infer a protocol from the URL or implement a fallback transport.
+Configure a Codex channel, reload, and ask a current-information question. Confirm the model calls local `web_search`, the nested request uses `{ "type": "web_search" }` and the configured transport, and the parent request has no native web-search declaration.
 
-## Request behavior
-
-Existing tools and payload fields are retained. An existing native web-search declaration is not duplicated. A request with `"tool_choice": "none"` is left unchanged. Existing `onPayload` and `onResponse` callbacks are preserved for both adapters; the native capability is added after the existing payload callback.
-
-The model still decides whether to search. No search is forced for ordinary prompts, and no search action, query, result snippet, or unused source is added to later model-visible context. The endpoint's assistant text is returned unchanged. The plugin does not create citations or a source list when the endpoint does not return one.
-
-## Failure hardening
-
-The runtime must provide `ExtensionAPI.getActiveTools()` and the provider `onPayload` callback. If either capability is missing, the channel is reported as unavailable and the request fails closed instead of silently losing the safety checks. The payload callback is verified on the first provider call; before that, status reports that the capability check is pending and still fails closed if it is absent.
-
-If the current active tool list contains a local `web_search`, the request reports `Capability Conflict` and is not sent. The plugin never removes, renames, or disables that local tool. HTTP endpoint rejection is surfaced as an error for the current turn; the plugin does not switch credentials, alter configuration, permanently disable the channel, or implement a fallback search provider.
-
-Use `/native-web-search` after `/reload` to distinguish configuration errors, model/API mismatches, active-tool conflicts, and runtime capability failures.
-
-## Manual smoke test
-
-1. Configure a provider whose Standard model uses `api: "openai-responses"` and whose endpoint supports `web_search_preview`.
-2. Enable the Standard channel, run `/reload`, then `/native-web-search` and confirm the channel reports a matching model.
-3. Ask a current-information question and verify the provider receives `{ "type": "web_search_preview" }`.
-4. Configure a separate provider channel whose model uses `api: "openai-codex-responses"`, enable the Codex channel with an explicit transport, and reload.
-5. Verify the Codex endpoint receives `{ "type": "web_search" }` over the configured transport.
-6. Ask a normal coding question and verify no local `web_search` tool or extra prompt text appears.
+Skipped: citation synthesis and search-result injection; add only if Pi later requires structured source metadata.
