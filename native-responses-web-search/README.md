@@ -64,7 +64,7 @@ Example:
 
 A channel is disabled unless its own `enabled` value is explicitly `true`. Only one channel may be enabled at a time; change the endpoint or transport in the file and run `/reload`. The configured provider must already have the desired Responses models, base URL, and authentication. The extension registers an overlay for that provider without supplying `models`, `baseUrl`, or `apiKey`, so the existing catalogue and credentials remain authoritative.
 
-Reserve the configured provider ID for this extension. Do not use the same provider ID with another provider shim such as `cpa-codex-ws`. After reload, the plugin checks the registered stream owner when the runtime exposes that registration; an ownership conflict leaves the channel unavailable instead of sending a request through the wrong adapter. Provider ownership is a channel-level deployment contract because Pi does not expose a pre-registration owner query.
+Reserve the configured provider ID for this extension. Do not use the same provider ID with another provider shim such as `cpa-codex-ws`. Provider ownership is a channel-level configuration/deployment contract: this plugin does not reliably detect or prevent another shim from registering the same provider later.
 
 `modelPrefix` is optional; when omitted, all models on the dedicated provider channel that use the selected Responses API match. A model on the channel that does not match the prefix is rejected before the native request is created, so keep unrelated models on a different provider channel.
 

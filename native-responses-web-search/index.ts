@@ -66,7 +66,6 @@ export type RuntimeCapabilityState = "unknown" | "available" | "unavailable";
 export interface RuntimeStatus {
   payloadCallback: RuntimeCapabilityState;
   activeTools: RuntimeCapabilityState;
-  providerOwnership: RuntimeCapabilityState;
 }
 
 export interface StreamAdapters {
@@ -103,19 +102,13 @@ const TRANSPORTS = new Set<Transport>([
 const DEFAULT_RUNTIME_STATUS: RuntimeStatus = {
   payloadCallback: "unknown",
   activeTools: "unknown",
-  providerOwnership: "unknown",
-};
-const INITIAL_RUNTIME_STATUS: RuntimeStatus = {
-  ...DEFAULT_RUNTIME_STATUS,
-  // No request is allowed until session_start confirms the provider owner.
-  providerOwnership: "unavailable",
 };
 
 type JsonObject = Record<string, unknown>;
 
 type PluginAPI = Pick<
   ExtensionAPI,
-  "getActiveTools" | "on" | "registerCommand" | "registerProvider"
+  "getActiveTools" | "registerCommand" | "registerProvider"
 >;
 
 function isObject(value: unknown): value is JsonObject {
@@ -297,17 +290,6 @@ export function addNativeWebSearch(
   };
 }
 
-export function augmentPayloadForModel(
-  payload: unknown,
-  model: ModelIdentity | undefined,
-  channels: readonly NormalizedWebSearchChannel[],
-): unknown {
-  const channel = channels.find((candidate) =>
-    matchesChannel(model, candidate),
-  );
-  return channel ? addNativeWebSearch(payload, channel.endpoint) : payload;
-}
-
 export function prepareNativePayload(
   payload: unknown,
   model: ModelIdentity | undefined,
@@ -315,14 +297,13 @@ export function prepareNativePayload(
   activeTools: readonly string[],
 ): unknown {
   if (!matchesChannel(model, channel)) return payload;
-  if (!isObject(payload) || isToolChoiceNone(payload.tool_choice)) {
-    return payload;
-  }
+  if (!isObject(payload)) return payload;
   if (activeTools.includes("web_search")) {
     throw new Error(
       "Capability Conflict: an active local web_search tool conflicts with native hosted web search",
     );
   }
+  if (isToolChoiceNone(payload.tool_choice)) return payload;
   return addNativeWebSearch(payload, channel.endpoint);
 }
 
@@ -347,9 +328,6 @@ function currentModelStatus(
   }
   if (activeTools.includes("web_search")) {
     return "unavailable; Capability Conflict with active local web_search";
-  }
-  if (runtime.providerOwnership === "unavailable") {
-    return "unavailable; Dedicated Provider Conflict";
   }
   if (runtime.payloadCallback === "unavailable") {
     return "unavailable; runtime payload callback is missing";
@@ -433,11 +411,6 @@ function providerConfig(
       context: Context,
       options?: SimpleStreamOptions,
     ) => {
-      if (runtime.providerOwnership === "unavailable") {
-        throw new Error(
-          "Dedicated Provider Conflict: another provider shim owns this channel",
-        );
-      }
       if (!matchesChannel(model, channel)) {
         throw new Error(
           `[native-responses-web-search] ${model.provider}/${model.id} does not match ` +
@@ -448,6 +421,12 @@ function providerConfig(
         runtime.payloadCallback = "unavailable";
         throw new Error(
           "Runtime capability unavailable: provider payload callback is required for native web search",
+        );
+      }
+      const activeTools = getActiveToolsOrThrow(pi, runtime);
+      if (activeTools.includes("web_search")) {
+        throw new Error(
+          "Capability Conflict: an active local web_search tool conflicts with native hosted web search",
         );
       }
       const existingOnPayload = options.onPayload;
@@ -548,7 +527,7 @@ export function installNativeResponsesWebSearch(
   configPath = CONFIG_PATH,
   adapters: StreamAdapters = {},
 ): void {
-  const runtime: RuntimeStatus = { ...INITIAL_RUNTIME_STATUS };
+  const runtime: RuntimeStatus = { ...DEFAULT_RUNTIME_STATUS };
   const activeChannels = getActiveChannels(config);
 
   if (activeChannels.length > 0 && typeof pi.getActiveTools !== "function") {
@@ -563,10 +542,6 @@ export function installNativeResponsesWebSearch(
   }
 
   const [channel] = activeChannels;
-  let ownedProviderConfig: {
-    channel: NormalizedWebSearchChannel;
-    config: ReturnType<typeof providerConfig>;
-  } | undefined;
   if (channel) {
     const nativeStream = channel.endpoint === "codex"
       ? adapters.codex
@@ -576,50 +551,10 @@ export function installNativeResponsesWebSearch(
         `${channel.endpoint} Responses adapter is unavailable; no native stream was loaded`,
       );
     }
-    const config = providerConfig(channel, nativeStream, pi, runtime);
-    pi.registerProvider(channel.provider, config);
-    ownedProviderConfig = { channel, config };
-  }
-
-  if (ownedProviderConfig) {
-    pi.on("session_start", (_event, ctx) => {
-      const getRegisteredProviderConfig =
-        ctx.modelRegistry?.getRegisteredProviderConfig;
-      const getRegisteredNativeProvider =
-        ctx.modelRegistry?.getRegisteredNativeProvider;
-      if (
-        typeof getRegisteredProviderConfig !== "function" &&
-        typeof getRegisteredNativeProvider !== "function"
-      ) {
-        runtime.providerOwnership = "unavailable";
-        return;
-      }
-
-      const { channel, config } = ownedProviderConfig;
-      const registered = typeof getRegisteredProviderConfig === "function"
-        ? getRegisteredProviderConfig.call(
-            ctx.modelRegistry,
-            channel.provider,
-          )
-        : undefined;
-      const native = typeof getRegisteredNativeProvider === "function"
-        ? getRegisteredNativeProvider.call(ctx.modelRegistry, channel.provider)
-        : undefined;
-      if (!registered && !native) {
-        runtime.providerOwnership = "unavailable";
-        return;
-      }
-      if (
-        (registered &&
-          (registered.api !== config.api ||
-            registered.streamSimple !== config.streamSimple)) ||
-        (native && native.streamSimple !== config.streamSimple)
-      ) {
-        runtime.providerOwnership = "unavailable";
-        return;
-      }
-      runtime.providerOwnership = "available";
-    });
+    pi.registerProvider(
+      channel.provider,
+      providerConfig(channel, nativeStream, pi, runtime),
+    );
   }
 
   registerStatusCommand(pi, config, configPath, runtime);
