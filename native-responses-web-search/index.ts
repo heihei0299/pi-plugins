@@ -68,6 +68,7 @@ export interface RuntimeStatus {
 }
 
 export interface StreamAdapters {
+  standard?: NativeStreamSimple;
   codex?: NativeStreamSimple;
 }
 
@@ -82,6 +83,7 @@ export const DEFAULT_CONFIG: NormalizedPluginConfig = {
 };
 
 const STANDARD_WEB_SEARCH_TOOL = { type: "web_search_preview" } as const;
+const STANDARD_RESPONSES_API = "openai-responses" as const;
 const CODEX_RESPONSES_API = "openai-codex-responses" as const;
 const CODEX_WEB_SEARCH_TOOL = { type: "web_search" } as const;
 const NATIVE_WEB_SEARCH_TYPES = new Set([
@@ -192,11 +194,6 @@ export function normalizeConfig(value: unknown): NormalizedPluginConfig {
   const activeProviders = new Set<string>();
   for (const channel of channels) {
     if (!channel.enabled) continue;
-    if (channel.endpoint !== "codex") {
-      throw new Error(
-        "config enabled channel endpoint must be \"codex\" for local web_search",
-      );
-    }
     if (activeProviders.has(channel.provider)) {
       throw new Error(
         `config.channels contains duplicate enabled provider ${JSON.stringify(channel.provider)}`,
@@ -232,13 +229,18 @@ export function getActiveChannels(
   return config.channels.filter((channel) => channel.enabled);
 }
 
+function apiForEndpoint(endpoint: ResponsesEndpoint):
+  typeof STANDARD_RESPONSES_API | typeof CODEX_RESPONSES_API {
+  return endpoint === "standard" ? STANDARD_RESPONSES_API : CODEX_RESPONSES_API;
+}
+
 export function matchesChannel(
   model: ModelIdentity | undefined,
   channel: NormalizedWebSearchChannel,
 ): boolean {
   return (
     model?.provider === channel.provider &&
-    model.api === CODEX_RESPONSES_API &&
+    model.api === apiForEndpoint(channel.endpoint) &&
     typeof model.id === "string" &&
     (channel.modelPrefix === "" || model.id.startsWith(channel.modelPrefix))
   );
@@ -300,8 +302,8 @@ function currentModelStatus(
   if (!globallyEnabled || !channel.enabled) return "disabled";
   if (!model) return "enabled; no active model";
   if (model.provider !== channel.provider) return "enabled; model not selected";
-  if (model.api !== CODEX_RESPONSES_API) {
-    return "unavailable; model is not Codex Responses";
+  if (model.api !== apiForEndpoint(channel.endpoint)) {
+    return `unavailable; model is not ${channel.endpoint === "standard" ? "Standard" : "Codex"} Responses`;
   }
   if (typeof model.id !== "string") return "enabled; model id unavailable";
   if (channel.modelPrefix && !model.id.startsWith(channel.modelPrefix)) {
@@ -379,7 +381,7 @@ function registerLocalWebSearch(
       const model = ctx?.model as Model<any> | undefined;
       if (!matchesChannel(model, channel)) {
         throw new Error(
-          "web_search model does not match the configured Codex channel",
+          "web_search model does not match the configured Responses channel",
         );
       }
       if (!ctx?.modelRegistry || typeof ctx.modelRegistry.getApiKeyAndHeaders !== "function") {
@@ -408,10 +410,12 @@ function registerLocalWebSearch(
       }, {
         apiKey: auth.apiKey,
         ...(auth.headers ? { headers: auth.headers } : {}),
-        transport: channel.transport,
+        ...(channel.endpoint === "codex"
+          ? { transport: channel.transport }
+          : {}),
         toolChoice: "required",
         ...(requestSignal ? { signal: requestSignal } : {}),
-        onPayload: async (payload) => addNativeWebSearch(payload, "codex"),
+        onPayload: async (payload) => addNativeWebSearch(payload, channel.endpoint),
       });
 
       const result = await stream.result();
@@ -439,7 +443,7 @@ function providerConfig(
   nativeStream: NativeStreamSimple,
 ) {
   return {
-    api: CODEX_RESPONSES_API,
+    api: apiForEndpoint(channel.endpoint),
     streamSimple: (
       model: Model<any>,
       context: Context,
@@ -456,7 +460,9 @@ function providerConfig(
       const existingOnPayload = options?.onPayload;
       return nativeStream(model, context, {
         ...(options ?? {}),
-        transport: channel.transport,
+        ...(channel.endpoint === "codex"
+          ? { transport: channel.transport }
+          : {}),
         onPayload: async (payload, payloadModel) => {
           const result = typeof existingOnPayload === "function"
             ? await existingOnPayload(payload, payloadModel)
@@ -519,14 +525,16 @@ export function installNativeResponsesWebSearch(
   const [channel] = activeChannels;
 
   if (channel) {
-    const nativeStream = adapters.codex;
+    const nativeStream = channel.endpoint === "standard"
+      ? adapters.standard
+      : adapters.codex;
     if (!nativeStream) {
       registerStatusCommand(
         pi,
         config,
         configPath,
         { ...runtime, toolRegistration: "unavailable" },
-        "Codex Responses adapter is unavailable; no native stream was loaded",
+        `${channel.endpoint === "standard" ? "Standard" : "Codex"} Responses adapter is unavailable; no native stream was loaded`,
       );
       return;
     }
@@ -568,7 +576,11 @@ export default async function nativeResponsesWebSearch(pi: ExtensionAPI) {
   const activeChannels = getActiveChannels(config);
   const adapters: StreamAdapters = {};
   try {
-    if (activeChannels.length > 0) {
+    if (activeChannels.some((channel) => channel.endpoint === "standard")) {
+      adapters.standard = (await import("@earendil-works/pi-ai/api/openai-responses"))
+        .streamSimple as NativeStreamSimple;
+    }
+    if (activeChannels.some((channel) => channel.endpoint === "codex")) {
       adapters.codex = (await import("@earendil-works/pi-ai/api/openai-codex-responses"))
         .streamSimple as NativeStreamSimple;
     }
@@ -579,7 +591,7 @@ export default async function nativeResponsesWebSearch(pi: ExtensionAPI) {
       config,
       configPath,
       { ...DEFAULT_RUNTIME_STATUS, toolRegistration: "unavailable" },
-      `Codex Responses adapter unavailable; ${message}`,
+      `Responses adapter unavailable; ${message}`,
     );
     return;
   }

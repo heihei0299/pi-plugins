@@ -146,17 +146,75 @@ test("does not register a tool when the plugin is disabled", () => {
   expect(pi.providers).toHaveLength(0);
 });
 
-test("requires enabled channels to use the Codex endpoint", () => {
-  expect(() => normalizeConfig({
-    channels: [{ provider: "openai", endpoint: "standard", enabled: true }],
-  })).toThrow("endpoint must be \"codex\"");
+test("accepts an enabled Standard Responses channel", () => {
+  const normalized = normalizeConfig({
+    channels: [{ provider: "cpa", endpoint: "standard", enabled: true }],
+  });
 
+  expect(normalized.channels[0]).toMatchObject({
+    provider: "cpa",
+    endpoint: "standard",
+    enabled: true,
+  });
+});
+
+test("limits configuration to one enabled provider channel", () => {
   expect(() => normalizeConfig({
     channels: [
       { provider: "codex", endpoint: "codex", enabled: true },
       { provider: "other", endpoint: "codex", enabled: true },
     ],
   })).toThrow("one enabled Dedicated Provider Channel");
+});
+
+test("registers and runs local search through Standard Responses", async () => {
+  const standardModel = {
+    provider: "cpa",
+    id: "gpt-5.6-luna",
+    api: "openai-responses",
+  };
+  const standardConfig = normalizeConfig({
+    channels: [{
+      provider: "cpa",
+      endpoint: "standard",
+      modelPrefix: "gpt-",
+      enabled: true,
+    }],
+  });
+  const tools: any[] = [];
+  const providers: any[] = [];
+  const capture: any = {};
+  const pi: any = {
+    registerTool(tool: any) { tools.push(tool); },
+    registerProvider(name: string, value: any) { providers.push({ name, value }); },
+    registerCommand() {},
+  };
+  const adapter = (_model: any, context: any, options: any) => {
+    capture.context = context;
+    capture.options = options;
+    return { result: async () => assistantResult() } as any;
+  };
+
+  installNativeResponsesWebSearch(pi, standardConfig, "/tmp/config", {
+    standard: adapter as any,
+  } as any);
+  const result = await tools[0].execute(
+    "1",
+    { query: "latest news" },
+    undefined,
+    undefined,
+    {
+      model: standardModel,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "key" }),
+      },
+    },
+  );
+  const payload = await capture.options.onPayload({ input: "latest news" });
+
+  expect(providers[0].value.api).toBe("openai-responses");
+  expect(result.content).toEqual([{ type: "text", text: "answer" }]);
+  expect(payload.tools).toEqual([{ type: "web_search_preview" }]);
 });
 
 test("validates query and model before resolving auth", async () => {
@@ -346,7 +404,7 @@ test("supports every configured Codex transport", async () => {
   }
 });
 
-test("allows disabled Standard entries while requiring enabled channels to be Codex", () => {
+test("allows disabled Standard entries alongside an enabled channel", () => {
   const normalized = normalizeConfig({
     channels: [
       { provider: "legacy", endpoint: "standard", enabled: false },
