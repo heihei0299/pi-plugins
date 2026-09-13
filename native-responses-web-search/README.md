@@ -79,9 +79,17 @@ Codex `transport` accepts `sse`, `websocket`, `websocket-cached`, or `auto`. A c
 
 ## Request behavior
 
-Existing tools and payload fields are retained. An existing native web-search declaration is not duplicated. A request with `"tool_choice": "none"` is left unchanged. Existing `onPayload` and `onResponse` callbacks are preserved; Codex's adapter runs the existing payload callback before adding its declaration.
+Existing tools and payload fields are retained. An existing native web-search declaration is not duplicated. A request with `"tool_choice": "none"` is left unchanged. Existing `onPayload` and `onResponse` callbacks are preserved for both adapters; the native capability is added after the existing payload callback.
 
-The model still decides whether to search. No search is forced for ordinary prompts, and no search action, query, result snippet, or unused source is added to later model-visible context. The endpoint's assistant text is returned unchanged.
+The model still decides whether to search. No search is forced for ordinary prompts, and no search action, query, result snippet, or unused source is added to later model-visible context. The endpoint's assistant text is returned unchanged. The plugin does not create citations or a source list when the endpoint does not return one.
+
+## Failure hardening
+
+The runtime must provide `ExtensionAPI.getActiveTools()` and the provider `onPayload` callback. If either capability is missing, the channel is reported as unavailable and the request fails closed instead of silently losing the safety checks.
+
+If the current active tool list contains a local `web_search`, the request reports `Capability Conflict` and is not sent. The plugin never removes, renames, or disables that local tool. HTTP endpoint rejection is surfaced as an error for the current turn; the plugin does not switch credentials, alter configuration, permanently disable the channel, or implement a fallback search provider.
+
+Use `/native-web-search` after `/reload` to distinguish configuration errors, model/API mismatches, active-tool conflicts, and runtime capability failures.
 
 ## Manual smoke test
 

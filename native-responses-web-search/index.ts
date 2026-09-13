@@ -3,10 +3,10 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import type {
+  AssistantMessageEventStream,
   Context,
   Model,
   SimpleStreamOptions,
-  StreamFunction,
 } from "@earendil-works/pi-ai";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -14,10 +14,11 @@ import { join } from "node:path";
 
 export type ResponsesEndpoint = "standard" | "codex";
 export type Transport = "sse" | "websocket" | "websocket-cached" | "auto";
-export type CodexStreamSimple = StreamFunction<
-  "openai-codex-responses",
-  SimpleStreamOptions
->;
+export type NativeStreamSimple = (
+  model: Model<any>,
+  context: Context,
+  options?: SimpleStreamOptions,
+) => AssistantMessageEventStream;
 
 export interface WebSearchChannelConfig {
   /** Existing Pi provider/channel id reserved for this plugin. */
@@ -60,6 +61,18 @@ export interface ModelIdentity {
   api?: string;
 }
 
+export type RuntimeCapabilityState = "unknown" | "available" | "unavailable";
+
+export interface RuntimeStatus {
+  payloadCallback: RuntimeCapabilityState;
+  activeTools: RuntimeCapabilityState;
+}
+
+export interface StreamAdapters {
+  standard?: NativeStreamSimple;
+  codex?: NativeStreamSimple;
+}
+
 const CONFIG_PATH =
   process.env.PI_NATIVE_RESPONSES_WEB_SEARCH_CONFIG ||
   join(homedir(), ".pi", "agent", "native-responses-web-search.json");
@@ -70,8 +83,8 @@ export const DEFAULT_CONFIG: NormalizedPluginConfig = {
   channels: [],
 };
 
-const STANDARD_RESPONSES_API = "openai-responses";
-const CODEX_RESPONSES_API = "openai-codex-responses";
+const STANDARD_RESPONSES_API = "openai-responses" as const;
+const CODEX_RESPONSES_API = "openai-codex-responses" as const;
 const STANDARD_WEB_SEARCH_TOOL = { type: "web_search_preview" } as const;
 const CODEX_WEB_SEARCH_TOOL = { type: "web_search" } as const;
 const NATIVE_WEB_SEARCH_TYPES = new Set([
@@ -86,12 +99,16 @@ const TRANSPORTS = new Set<Transport>([
   "websocket-cached",
   "auto",
 ]);
+const DEFAULT_RUNTIME_STATUS: RuntimeStatus = {
+  payloadCallback: "unknown",
+  activeTools: "unknown",
+};
 
 type JsonObject = Record<string, unknown>;
 
 type PluginAPI = Pick<
   ExtensionAPI,
-  "on" | "registerCommand" | "registerProvider"
+  "getActiveTools" | "on" | "registerCommand" | "registerProvider"
 >;
 
 function isObject(value: unknown): value is JsonObject {
@@ -207,7 +224,9 @@ export function getActiveChannels(
   return config.channels.filter((channel) => channel.enabled);
 }
 
-function apiForEndpoint(endpoint: ResponsesEndpoint): string {
+function apiForEndpoint(
+  endpoint: ResponsesEndpoint,
+): typeof STANDARD_RESPONSES_API | typeof CODEX_RESPONSES_API {
   return endpoint === "codex" ? CODEX_RESPONSES_API : STANDARD_RESPONSES_API;
 }
 
@@ -277,10 +296,30 @@ export function augmentPayloadForModel(
   return channel ? addNativeWebSearch(payload, channel.endpoint) : payload;
 }
 
+export function prepareNativePayload(
+  payload: unknown,
+  model: ModelIdentity | undefined,
+  channel: NormalizedWebSearchChannel,
+  activeTools: readonly string[],
+): unknown {
+  if (!matchesChannel(model, channel)) return payload;
+  if (!isObject(payload) || isToolChoiceNone(payload.tool_choice)) {
+    return payload;
+  }
+  if (activeTools.includes("web_search")) {
+    throw new Error(
+      "Capability Conflict: an active local web_search tool conflicts with native hosted web search",
+    );
+  }
+  return addNativeWebSearch(payload, channel.endpoint);
+}
+
 function currentModelStatus(
   model: ModelIdentity | undefined,
   channel: NormalizedWebSearchChannel,
   globallyEnabled: boolean,
+  activeTools: readonly string[],
+  runtime: RuntimeStatus,
 ): string {
   if (!globallyEnabled || !channel.enabled) return "disabled";
   if (!model) return "enabled; no active model";
@@ -294,13 +333,26 @@ function currentModelStatus(
   if (channel.modelPrefix && !model.id.startsWith(channel.modelPrefix)) {
     return "enabled; model prefix does not match";
   }
-  return "enabled; model matches";
+  if (activeTools.includes("web_search")) {
+    return "unavailable; Capability Conflict with active local web_search";
+  }
+  if (runtime.payloadCallback === "unavailable") {
+    return "unavailable; runtime payload callback is missing";
+  }
+  if (runtime.activeTools === "unavailable") {
+    return "unavailable; runtime active-tool inspection is missing";
+  }
+  return runtime.payloadCallback === "unknown"
+    ? "enabled; model matches (runtime check pending)"
+    : "enabled; model matches";
 }
 
 export function formatStatus(
   config: NormalizedPluginConfig,
   model?: ModelIdentity,
   configPath = CONFIG_PATH,
+  activeTools: readonly string[] = [],
+  runtime: RuntimeStatus = DEFAULT_RUNTIME_STATUS,
 ): string {
   const lines = [
     `Native Responses web search: ${config.enabled ? "enabled" : "disabled"}`,
@@ -317,106 +369,220 @@ export function formatStatus(
       ? `Codex Responses (${channel.transport})`
       : "Standard Responses";
     lines.push(
-      `${channel.provider}/${channel.modelPrefix || "*"} -> ${endpoint} -> ${currentModelStatus(model, channel, config.enabled)}`,
+      `${channel.provider}/${channel.modelPrefix || "*"} -> ${endpoint} -> ${currentModelStatus(model, channel, config.enabled, activeTools, runtime)}`,
     );
   }
   return lines.join("\n");
 }
 
-function codexProviderConfig(
+function getActiveToolsOrThrow(
+  pi: PluginAPI,
+  runtime: RuntimeStatus,
+): readonly string[] {
+  if (typeof pi.getActiveTools !== "function") {
+    runtime.activeTools = "unavailable";
+    throw new Error(
+      "Runtime capability unavailable: active-tool inspection is required to detect local web_search conflicts",
+    );
+  }
+
+  try {
+    const activeTools = pi.getActiveTools();
+    if (!Array.isArray(activeTools) || activeTools.some((name) => typeof name !== "string")) {
+      runtime.activeTools = "unavailable";
+      throw new Error("runtime returned an invalid active-tool list");
+    }
+    runtime.activeTools = "available";
+    return activeTools;
+  } catch (error: unknown) {
+    runtime.activeTools = "unavailable";
+    if (error instanceof Error && error.message.startsWith("runtime returned")) {
+      throw error;
+    }
+    throw new Error(
+      `Runtime capability unavailable: active-tool inspection failed (${String(error)})`,
+    );
+  }
+}
+
+function providerConfig(
   channel: NormalizedWebSearchChannel,
-  codexStream: CodexStreamSimple,
+  nativeStream: NativeStreamSimple,
+  pi: PluginAPI,
+  runtime: RuntimeStatus,
 ) {
   return {
-    api: CODEX_RESPONSES_API,
+    api: apiForEndpoint(channel.endpoint),
     streamSimple: (
       model: Model<any>,
       context: Context,
       options?: SimpleStreamOptions,
     ) => {
-      if (!matchesChannel(model, channel)) {
-        throw new Error(
-          `[native-responses-web-search] ${model.provider}/${model.id} does not match ` +
-            `the configured Codex channel model prefix ${JSON.stringify(channel.modelPrefix)}`,
-        );
-      }
-
-      return codexStream(model as Model<"openai-codex-responses">, context, {
+      return nativeStream(model, context, {
         ...options,
-        // The configured channel owns transport selection. No URL inspection
-        // or protocol fallback is performed by this plugin.
-        transport: channel.transport,
+        ...(channel.endpoint === "codex"
+          ? { transport: channel.transport }
+          : {}),
         onPayload: async (payload, payloadModel) => {
-          const existingPayload = await options?.onPayload?.(
+          if (typeof options?.onPayload !== "function") {
+            runtime.payloadCallback = "unavailable";
+            throw new Error(
+              "Runtime capability unavailable: provider payload callback is required for native web search",
+            );
+          }
+          runtime.payloadCallback = "available";
+
+          const existingPayload = await options.onPayload(
             payload,
             payloadModel,
           );
-          return addNativeWebSearch(
-            existingPayload === undefined ? payload : existingPayload,
-            "codex",
+          const currentPayload = existingPayload === undefined
+            ? payload
+            : existingPayload;
+          if (!matchesChannel(payloadModel, channel)) return currentPayload;
+
+          return prepareNativePayload(
+            currentPayload,
+            payloadModel,
+            channel,
+            getActiveToolsOrThrow(pi, runtime),
           );
+        },
+        onResponse: async (response, responseModel) => {
+          await options?.onResponse?.(response, responseModel);
+          if (response.status >= 400) {
+            throw new Error(
+              `[native-responses-web-search] ${channel.endpoint} Responses endpoint rejected hosted web search (HTTP ${response.status})`,
+            );
+          }
         },
       });
     },
   };
 }
 
-export function installNativeResponsesWebSearch(
+function registerStatusCommand(
   pi: PluginAPI,
   config: NormalizedPluginConfig,
-  configPath = CONFIG_PATH,
-  codexStream?: CodexStreamSimple,
+  configPath: string,
+  runtime: RuntimeStatus,
+  unavailableReason?: string,
 ): void {
-  const activeChannels = getActiveChannels(config);
-
-  // No models, base URL, or credentials are supplied: the existing provider
-  // catalogue and authentication remain the source of truth for each channel.
-  for (const channel of activeChannels) {
-    if (channel.endpoint === "codex") {
-      if (!codexStream) {
-        throw new Error(
-          "Codex Responses adapter is unavailable; no native stream was loaded",
-        );
-      }
-      pi.registerProvider(
-        channel.provider,
-        codexProviderConfig(channel, codexStream),
-      );
-    } else {
-      pi.registerProvider(channel.provider, { api: STANDARD_RESPONSES_API });
-    }
-  }
-
-  const standardChannels = activeChannels.filter(
-    (channel) => channel.endpoint === "standard",
-  );
-  if (standardChannels.length > 0) {
-    pi.on("before_provider_request", (event, ctx) => {
-      const payload = augmentPayloadForModel(
-        event.payload,
-        ctx.model,
-        standardChannels,
-      );
-      return payload === event.payload ? undefined : payload;
-    });
-  }
-
   pi.registerCommand("native-web-search", {
     description: "Show native Responses web search channel status",
     handler: async (_args, ctx: ExtensionCommandContext) => {
-      ctx.ui.notify(formatStatus(config, ctx.model, configPath), "info");
+      let activeTools: readonly string[] = [];
+      try {
+        activeTools = getActiveToolsOrThrow(pi, runtime);
+      } catch {
+        // formatStatus reports the capability state recorded by the helper.
+      }
+      const status = formatStatus(
+        config,
+        ctx.model,
+        configPath,
+        activeTools,
+        runtime,
+      );
+      ctx.ui.notify(
+        unavailableReason ? `${status}\nstatus: unavailable; ${unavailableReason}` : status,
+        unavailableReason ? "error" : "info",
+      );
     },
   });
 }
 
+function registerConfigErrorStatus(
+  pi: PluginAPI,
+  configPath: string,
+  error: unknown,
+): void {
+  const message = error instanceof Error ? error.message : String(error);
+  pi.registerCommand("native-web-search", {
+    description: "Show native Responses web search configuration status",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(
+        [
+          "Native Responses web search: unavailable",
+          `config: ${configPath}`,
+          `status: configuration error; ${message}`,
+        ].join("\n"),
+        "error",
+      );
+    },
+  });
+}
+
+export function installNativeResponsesWebSearch(
+  pi: PluginAPI,
+  config: NormalizedPluginConfig,
+  configPath = CONFIG_PATH,
+  adapters: StreamAdapters = {},
+): void {
+  const runtime: RuntimeStatus = { ...DEFAULT_RUNTIME_STATUS };
+  const activeChannels = getActiveChannels(config);
+
+  if (activeChannels.length > 0 && typeof pi.getActiveTools !== "function") {
+    registerStatusCommand(
+      pi,
+      config,
+      configPath,
+      { ...runtime, activeTools: "unavailable" },
+      "runtime active-tool inspection is required",
+    );
+    return;
+  }
+
+  for (const channel of activeChannels) {
+    const nativeStream = channel.endpoint === "codex"
+      ? adapters.codex
+      : adapters.standard;
+    if (!nativeStream) {
+      throw new Error(
+        `${channel.endpoint} Responses adapter is unavailable; no native stream was loaded`,
+      );
+    }
+    pi.registerProvider(
+      channel.provider,
+      providerConfig(channel, nativeStream, pi, runtime),
+    );
+  }
+
+  registerStatusCommand(pi, config, configPath, runtime);
+}
+
 export default async function nativeResponsesWebSearch(pi: ExtensionAPI) {
-  const config = await loadConfig();
-  const hasCodexChannel = getActiveChannels(config).some(
-    (channel) => channel.endpoint === "codex",
-  );
-  const codexStream = hasCodexChannel
-    ? (await import("@earendil-works/pi-ai/api/openai-codex-responses"))
-        .streamSimple
-    : undefined;
-  installNativeResponsesWebSearch(pi, config, CONFIG_PATH, codexStream);
+  const configPath = CONFIG_PATH;
+  let config: NormalizedPluginConfig;
+  try {
+    config = await loadConfig(configPath);
+  } catch (error: unknown) {
+    registerConfigErrorStatus(pi, configPath, error);
+    return;
+  }
+
+  const activeChannels = getActiveChannels(config);
+  const adapters: StreamAdapters = {};
+  try {
+    if (activeChannels.some((channel) => channel.endpoint === "standard")) {
+      adapters.standard = (await import("@earendil-works/pi-ai/api/openai-responses"))
+        .streamSimple as NativeStreamSimple;
+    }
+    if (activeChannels.some((channel) => channel.endpoint === "codex")) {
+      adapters.codex = (await import("@earendil-works/pi-ai/api/openai-codex-responses"))
+        .streamSimple as NativeStreamSimple;
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    registerStatusCommand(
+      pi,
+      config,
+      configPath,
+      { ...DEFAULT_RUNTIME_STATUS },
+      `Responses adapter unavailable; ${message}`,
+    );
+    return;
+  }
+
+  installNativeResponsesWebSearch(pi, config, configPath, adapters);
 }
