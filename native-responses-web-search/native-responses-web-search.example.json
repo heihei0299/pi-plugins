@@ -1,10 +1,19 @@
 {
   "enabled": true,
+  "transport": "auto",
   "channels": [
     {
       "provider": "openai",
+      "endpoint": "standard",
       "modelPrefix": "gpt-",
       "enabled": true
+    },
+    {
+      "provider": "codex-channel",
+      "endpoint": "codex",
+      "transport": "websocket-cached",
+      "modelPrefix": "gpt-",
+      "enabled": false
     }
   ]
 }

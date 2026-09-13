@@ -6,7 +6,7 @@ Pi extensions monorepo. Each directory is self-contained; see its own README.
 - `pi-plan-mode/` — planning-only variant of Pi plan mode
 - `pi-fff-minimal/` — low-context fork of `@ff-labs/pi-fff`
 - `cpa-codex-ws/` — CPA GPT channels via Pi native Codex Responses WebSocket transport
-- `native-responses-web-search/` — opt-in Standard Responses native hosted web search channel
+- `native-responses-web-search/` — opt-in Standard/Codex Responses native hosted web search channels
 - `cpa-plugin-muse-spark/` — CLIProxyAPI v7 native plugin for `muse-spark-1.3-contributor`
 
 ## Design rule
