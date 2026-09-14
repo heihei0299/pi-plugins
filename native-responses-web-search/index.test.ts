@@ -45,7 +45,7 @@ function assistantResult(
   };
 }
 
-function setup(result = assistantResult(), transport = "sse") {
+function pluginHarness(result: Record<string, unknown> = assistantResult()) {
   const tools: any[] = [];
   const providers: Array<{ name: string; config: any }> = [];
   const commands = new Map<string, { handler: any }>();
@@ -68,6 +68,11 @@ function setup(result = assistantResult(), transport = "sse") {
     capture.calls.push({ model: adapterModel, context, options });
     return { result: async () => result } as any;
   };
+  return { pi, tools, providers, capture, adapter };
+}
+
+function setup(result = assistantResult(), transport = "sse") {
+  const h = pluginHarness(result);
   const channelConfig = normalizeConfig({
     transport,
     channels: [{
@@ -77,10 +82,10 @@ function setup(result = assistantResult(), transport = "sse") {
       enabled: true,
     }],
   });
-  installNativeResponsesWebSearch(pi, channelConfig, "/tmp/config", {
-    codex: adapter as any,
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: h.adapter as any,
   });
-  return { pi, capture, modelRegistry: authRegistry() };
+  return { pi: h.pi, capture: h.capture, modelRegistry: authRegistry() };
 }
 
 function authRegistry() {
@@ -337,19 +342,9 @@ function searchRegistry() {
 }
 
 function standaloneSetup(registry = searchRegistry()) {
-  const tools: any[] = [];
-  const capture: { calls: any[] } = { calls: [] };
-  const pi: any = {
-    registerTool(tool: any) { tools.push(tool); },
-    registerProvider() {},
-    registerCommand() {},
-  };
-  const adapter = (model: any, context: any, options: any) => {
-    capture.calls.push({ model, context, options });
-    return { result: async () => assistantResult() } as any;
-  };
+  const h = pluginHarness();
   installNativeResponsesWebSearch(
-    pi,
+    h.pi,
     normalizeConfig({
       channels: [{
         provider: "cpa",
@@ -359,9 +354,9 @@ function standaloneSetup(registry = searchRegistry()) {
       }],
     }),
     "/tmp/config",
-    { standard: adapter as any },
+    { standard: h.adapter as any },
   );
-  return { tools, capture, registry };
+  return { tools: h.tools, capture: h.capture, registry };
 }
 
 test("runs web_search from any model through the configured backend model", async () => {
@@ -427,6 +422,54 @@ test("rejects an empty backend model in a channel", () => {
       enabled: true,
     }],
   })).toThrow("model must be a non-empty string");
+});
+
+test("fails clearly when the model registry does not support model lookup", async () => {
+  const { tools, registry } = standaloneSetup({
+    ...searchRegistry(),
+    find: undefined,
+  } as any);
+
+  await expect(tools[0].execute(
+    "1",
+    { query: "latest news" },
+    undefined,
+    undefined,
+    toolContext({ ...searchBackendModel, id: "gemini-3.8-flash-high" }, registry),
+  )).rejects.toThrow("does not support model lookup");
+});
+
+test("reports standalone status with the backend model", async () => {
+  const notifications: string[] = [];
+  const pi: any = {
+    registerTool() {},
+    registerProvider() {},
+    registerCommand(name: string, command: { handler: any }) {
+      pi.commands = { ...pi.commands, [name]: command };
+    },
+    commands: {},
+  };
+  installNativeResponsesWebSearch(
+    pi,
+    normalizeConfig({
+      channels: [{
+        provider: "cpa",
+        endpoint: "standard",
+        modelPrefix: "gpt-5.6-luna",
+        model: "gpt-5.6-luna",
+        enabled: true,
+      }],
+    }),
+    "/tmp/config",
+    { standard: (() => ({ result: async () => assistantResult() })) as any },
+  );
+  await pi.commands["native-web-search"].handler("", {
+    model: { provider: "cpa", id: "gemini-3.8-flash-high", api: "openai-responses" },
+    ui: { notify(message: string) { notifications.push(message); } },
+  });
+
+  expect(notifications[0]).toContain("standalone; backend cpa/gpt-5.6-luna");
+  expect(notifications[0]).not.toContain("model prefix does not match");
 });
 
 test("does not declare native search on the parent request or reject the local tool", async () => {

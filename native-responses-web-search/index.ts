@@ -340,6 +340,14 @@ function currentModelStatus(
   runtime: RuntimeStatus,
 ): string {
   if (!globallyEnabled || !channel.enabled) return "disabled";
+  if (channel.model) {
+    if (runtime.toolRegistration === "unavailable") {
+      return "unavailable; web_search tool registration failed";
+    }
+    return runtime.toolRegistration === "available"
+      ? `standalone; backend ${channel.provider}/${channel.model}; tool registered`
+      : `standalone; backend ${channel.provider}/${channel.model} (tool registration pending)`;
+  }
   if (!model) return "enabled; no active model";
   if (model.provider !== channel.provider) return "enabled; model not selected";
   if (model.api !== apiForEndpoint(channel.endpoint)) {

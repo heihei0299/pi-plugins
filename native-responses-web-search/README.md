@@ -55,7 +55,7 @@ Only one channel may be enabled at a time. An enabled channel must match the act
 
 Set `model` on a channel to make `web_search` a standalone tool: nested search requests then always run through that exact model (resolved from the provider registry, with its own credentials) regardless of which model is active. Without `model`, the active model must match the channel. The backend model must exist in the provider registry and use the channel's Responses API.
 
-The configured provider must already contain the desired model, base URL, and credentials. The overlay supplies none of those fields, preserving the provider catalogue and authentication. Reserve the configured provider ID for this extension and do not share it with another provider shim.
+The configured provider must already contain the desired model, base URL, and credentials. The overlay supplies none of those fields, preserving the provider catalogue and authentication. Reserve the configured provider ID for this extension and do not share it with another provider shim. Models of the configured provider that fall outside the channel (different API or model prefix) keep the default streaming behavior; the overlay passes them through unchanged instead of rejecting them.
 
 ## Behavior
 
@@ -74,7 +74,7 @@ Parent provider requests expose only the local `web_search` function tool. They 
 
 ## Failure handling
 
-Use `/native-web-search` to distinguish configuration errors, missing Responses adapters, model/API mismatches, and tool registration failures. The tool uses the current active model and does not silently select another one.
+Use `/native-web-search` to distinguish configuration errors, missing Responses adapters, model/API mismatches, and tool registration failures. Without a channel `model`, the tool uses the current active model and does not silently select another one; with `model` set, nested requests always use the configured backend model.
 
 No third-party search service or `pi-ai` source change is required. The extension directory must have its `@earendil-works/pi-ai` dependency installed; copying only `index.ts` is not sufficient for runtime adapter imports.
 
