@@ -27,6 +27,11 @@ export interface WebSearchChannelConfig {
   endpoint?: ResponsesEndpoint;
   /** Only models with this prefix use local web search. Empty means all models. */
   modelPrefix?: string;
+  /**
+   * Backend model id for nested search requests. When set, web_search works
+   * from any active model; when unset, the active model must match the channel.
+   */
+  model?: string;
   /** Must be explicitly true to opt in this channel. */
   enabled?: boolean;
   /** Codex transport. */
@@ -45,6 +50,7 @@ export interface NormalizedWebSearchChannel {
   provider: string;
   endpoint: ResponsesEndpoint;
   modelPrefix: string;
+  model: string;
   enabled: boolean;
   transport: Transport;
 }
@@ -144,6 +150,12 @@ function readTransport(value: unknown, fallback: Transport, label: string): Tran
   );
 }
 
+function readChannelModel(value: unknown, label: string): string {
+  if (value === undefined) return "";
+  if (typeof value === "string" && value.trim() !== "") return value.trim();
+  throw new Error(`${label} must be a non-empty string`);
+}
+
 export function normalizeConfig(value: unknown): NormalizedPluginConfig {
   if (!isObject(value)) {
     throw new Error("native-responses-web-search config must be a JSON object");
@@ -178,6 +190,10 @@ export function normalizeConfig(value: unknown): NormalizedPluginConfig {
         `config.channels[${index}].endpoint`,
       ),
       modelPrefix: modelPrefix ?? "",
+      model: readChannelModel(
+        rawChannel.model,
+        `config.channels[${index}].model`,
+      ),
       enabled: readBoolean(
         rawChannel.enabled,
         false,
@@ -244,6 +260,30 @@ export function matchesChannel(
     typeof model.id === "string" &&
     (channel.modelPrefix === "" || model.id.startsWith(channel.modelPrefix))
   );
+}
+
+/** Standalone tool mode: the channel names the backend model explicitly. */
+function resolveChannelModel(
+  registry: {
+    find?: (provider: string, modelId: string) => Model<any> | undefined;
+  },
+  channel: NormalizedWebSearchChannel,
+): Model<any> {
+  if (typeof registry.find !== "function") {
+    throw new Error("web_search model registry does not support model lookup");
+  }
+  const resolved = registry.find(channel.provider, channel.model);
+  if (!resolved) {
+    throw new Error(
+      `web_search model ${channel.provider}/${channel.model} is not present in the model registry`,
+    );
+  }
+  if (resolved.api !== apiForEndpoint(channel.endpoint)) {
+    throw new Error(
+      `web_search model ${channel.provider}/${channel.model} does not use the configured ${channel.endpoint} Responses API`,
+    );
+  }
+  return resolved;
 }
 
 function isToolChoiceNone(value: unknown): boolean {
@@ -377,15 +417,17 @@ function registerLocalWebSearch(
       if (!query) {
         throw new Error("web_search query must be a non-empty string");
       }
+      if (!ctx?.modelRegistry || typeof ctx.modelRegistry.getApiKeyAndHeaders !== "function") {
+        throw new Error("web_search model registry is unavailable");
+      }
 
-      const model = ctx?.model as Model<any> | undefined;
-      if (!matchesChannel(model, channel)) {
+      let model = ctx?.model as Model<any> | undefined;
+      if (channel.model) {
+        model = resolveChannelModel(ctx.modelRegistry, channel);
+      } else if (!matchesChannel(model, channel)) {
         throw new Error(
           "web_search model does not match the configured Responses channel",
         );
-      }
-      if (!ctx?.modelRegistry || typeof ctx.modelRegistry.getApiKeyAndHeaders !== "function") {
-        throw new Error("web_search model registry is unavailable");
       }
 
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -450,11 +492,10 @@ function providerConfig(
       options?: SimpleStreamOptions,
     ) => {
       if (!matchesChannel(model, channel)) {
-        throw new Error(
-          `[native-responses-web-search] ${model.provider}/${model.id} does not match ` +
-            `the configured Codex channel ${channel.provider}/${channel.modelPrefix || "*"} ` +
-            "(provider, API, or model prefix mismatch)",
-        );
+        // The host dispatches every same-API model of this provider here, but
+        // the channel only owns its prefix; everything else keeps the default
+        // behavior (no transport override, no payload rewriting).
+        return nativeStream(model, context, options);
       }
 
       const existingOnPayload = options?.onPayload;

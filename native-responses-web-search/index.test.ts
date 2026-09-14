@@ -297,6 +297,138 @@ test("does not duplicate an existing native declaration or mutate the payload", 
     .toEqual({ input: "none", tool_choice: "none" });
 });
 
+test("passes non-matching models through to the adapter unchanged", () => {
+  const { pi, capture } = setup();
+  const otherModel = { ...model, id: "gemini-3.8-flash-high" };
+  const options = { onResponse: async () => {} };
+
+  const stream = pi.providers[0].config.streamSimple(
+    otherModel,
+    { messages: [], tools: [] },
+    options,
+  );
+
+  expect(stream).toBeDefined();
+  expect(capture.calls).toHaveLength(1);
+  expect(capture.calls[0].model).toBe(otherModel);
+  expect(capture.calls[0].options).toBe(options);
+});
+
+const searchBackendModel = {
+  provider: "cpa",
+  id: "gpt-5.6-luna",
+  api: "openai-responses",
+};
+
+function searchRegistry() {
+  const authFor: string[] = [];
+  return {
+    authFor,
+    find(provider: string, id: string) {
+      return provider === searchBackendModel.provider && id === searchBackendModel.id
+        ? { ...searchBackendModel }
+        : undefined;
+    },
+    getApiKeyAndHeaders: async (model: { id: string }) => {
+      authFor.push(model.id);
+      return { ok: true, apiKey: `key-for-${model.id}` };
+    },
+  };
+}
+
+function standaloneSetup(registry = searchRegistry()) {
+  const tools: any[] = [];
+  const capture: { calls: any[] } = { calls: [] };
+  const pi: any = {
+    registerTool(tool: any) { tools.push(tool); },
+    registerProvider() {},
+    registerCommand() {},
+  };
+  const adapter = (model: any, context: any, options: any) => {
+    capture.calls.push({ model, context, options });
+    return { result: async () => assistantResult() } as any;
+  };
+  installNativeResponsesWebSearch(
+    pi,
+    normalizeConfig({
+      channels: [{
+        provider: "cpa",
+        endpoint: "standard",
+        model: "gpt-5.6-luna",
+        enabled: true,
+      }],
+    }),
+    "/tmp/config",
+    { standard: adapter as any },
+  );
+  return { tools, capture, registry };
+}
+
+test("runs web_search from any model through the configured backend model", async () => {
+  const { tools, capture, registry } = standaloneSetup();
+  const gemini = {
+    provider: "cpa",
+    id: "gemini-3.8-flash-high",
+    api: "openai-responses",
+  };
+
+  const result = await tools[0].execute(
+    "1",
+    { query: "latest news" },
+    undefined,
+    undefined,
+    toolContext(gemini, registry),
+  );
+
+  expect(result.content).toEqual([{ type: "text", text: "answer" }]);
+  expect(capture.calls[0].model).toMatchObject({
+    provider: "cpa",
+    id: "gpt-5.6-luna",
+  });
+  expect(registry.authFor).toEqual(["gpt-5.6-luna"]);
+});
+
+test("fails clearly when the configured backend model is not in the registry", async () => {
+  const { tools, registry } = standaloneSetup({
+    ...searchRegistry(),
+    find: () => undefined,
+  });
+
+  await expect(tools[0].execute(
+    "1",
+    { query: "latest news" },
+    undefined,
+    undefined,
+    toolContext({ ...searchBackendModel, id: "gemini-3.8-flash-high" }, registry),
+  )).rejects.toThrow("not present in the model registry");
+});
+
+test("fails clearly when the configured backend model uses another API", async () => {
+  const { tools, registry } = standaloneSetup({
+    ...searchRegistry(),
+    find: () => ({ ...searchBackendModel, api: "openai-completions" }),
+  });
+
+  await expect(tools[0].execute(
+    "1",
+    { query: "latest news" },
+    undefined,
+    undefined,
+    toolContext({ ...searchBackendModel, id: "gemini-3.8-flash-high" }, registry),
+  )).rejects.toThrow("does not use the configured");
+});
+
+test("rejects an empty backend model in a channel", () => {
+  expect(() => normalizeConfig({
+    channels: [{
+      provider: "cpa",
+      endpoint: "standard",
+      model: "  ",
+      enabled: true,
+    }],
+  })).toThrow("model must be a non-empty string");
+});
+
 test("does not declare native search on the parent request or reject the local tool", async () => {
   const { pi, capture } = setup();
   let payloadCallbackCalls = 0;

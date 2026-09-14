@@ -37,6 +37,7 @@ Default path: `~/.pi/agent/native-responses-web-search.json`. Override it with `
       "provider": "cpa",
       "endpoint": "standard",
       "modelPrefix": "gpt-5.6-luna",
+      "model": "gpt-5.6-luna",
       "enabled": true
     },
     {
@@ -51,6 +52,8 @@ Default path: `~/.pi/agent/native-responses-web-search.json`. Override it with `
 ```
 
 Only one channel may be enabled at a time. An enabled channel must match the active model's provider, API, and optional model prefix. Standard channels require `openai-responses`; Codex channels require `openai-codex-responses`. Disabled entries may remain in the configuration.
+
+Set `model` on a channel to make `web_search` a standalone tool: nested search requests then always run through that exact model (resolved from the provider registry, with its own credentials) regardless of which model is active. Without `model`, the active model must match the channel. The backend model must exist in the provider registry and use the channel's Responses API.
 
 The configured provider must already contain the desired model, base URL, and credentials. The overlay supplies none of those fields, preserving the provider catalogue and authentication. Reserve the configured provider ID for this extension and do not share it with another provider shim.
 
