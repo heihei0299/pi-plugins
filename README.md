@@ -7,7 +7,22 @@ Pi extensions monorepo. Each directory is self-contained; see its own README.
 - `pi-fff-minimal/` — low-context fork of `@ff-labs/pi-fff`
 - `cpa-codex-ws/` — CPA GPT channels via Pi native Codex Responses WebSocket transport
 - `native-responses-web-search/` — opt-in Standard/Codex Responses native hosted web search channels
-- `cpa-plugin-muse-spark/` — CLIProxyAPI v7 native plugin for `muse-spark-1.3-contributor`
+
+## Install as a Pi package
+
+The repository root is a Pi package. Install it from Git and Pi will discover all TypeScript extensions declared in `package.json`:
+
+```bash
+pi install git:<host>/<owner>/pi-plugins
+```
+
+For a local checkout:
+
+```bash
+pi install /absolute/path/to/pi-plugins
+```
+
+The package installs the FFF runtime dependencies automatically. Pi's core extension packages remain peer dependencies supplied by Pi.
 
 ## Design rule
 
