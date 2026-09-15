@@ -4,7 +4,6 @@ Pi extensions monorepo. Each directory is self-contained; see its own README.
 
 - `pi-locked-subagents/` — config-locked subagents (`subagent(agent, task)`)
 - `pi-plan-mode/` — planning-only variant of Pi plan mode
-- `pi-fff-minimal/` — low-context fork of `@ff-labs/pi-fff`
 - `cpa-codex-ws/` — CPA GPT channels via Pi native Codex Responses WebSocket transport
 - `native-responses-web-search/` — opt-in Standard/Codex Responses native hosted web search channels
 
@@ -22,7 +21,7 @@ For a local checkout:
 pi install /absolute/path/to/pi-plugins
 ```
 
-The package installs the FFF runtime dependencies automatically. Pi's core extension packages remain peer dependencies supplied by Pi.
+Pi's core extension packages remain peer dependencies supplied by Pi.
 
 ## Design rule
 

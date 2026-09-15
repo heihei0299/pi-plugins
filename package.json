@@ -9,14 +9,9 @@
     "extensions": [
       "./cpa-codex-ws/cpa-codex-ws.ts",
       "./native-responses-web-search/index.ts",
-      "./pi-fff-minimal/src/index.ts",
       "./pi-locked-subagents/index.ts",
       "./pi-plan-mode/index.ts"
     ]
-  },
-  "dependencies": {
-    "@ff-labs/fff-bun": "0.10.6",
-    "@ff-labs/fff-node": "0.10.6"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "0.85.1",

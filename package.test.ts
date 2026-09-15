@@ -17,14 +17,9 @@ test("declares the repository as a Pi package with every extension", () => {
   expect(manifest.pi.extensions).toEqual([
     "./cpa-codex-ws/cpa-codex-ws.ts",
     "./native-responses-web-search/index.ts",
-    "./pi-fff-minimal/src/index.ts",
     "./pi-locked-subagents/index.ts",
     "./pi-plan-mode/index.ts",
   ]);
-  expect(manifest.dependencies).toMatchObject({
-    "@ff-labs/fff-bun": "0.10.6",
-    "@ff-labs/fff-node": "0.10.6",
-  });
   expect(manifest.peerDependencies).toMatchObject({
     "@earendil-works/pi-agent-core": "0.85.1",
     "@earendil-works/pi-ai": "0.85.1",
