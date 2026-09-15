@@ -19,6 +19,9 @@
  * Execution is handed back to the normal agent.
  */
 
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -30,15 +33,16 @@ interface PlanState {
   toolsBeforePlanMode?: string[];
 }
 
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "questionnaire"];
+const PLAN_MODE_CONFIG_PATH = join(homedir(), ".pi", "agent", "plan-mode.json");
+const DEFAULT_PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "questionnaire"];
 const PLAN_MODE_DISABLED_TOOLS = new Set<string>(["edit", "write"]);
 
 const PLAN_PROMPT = `[PLAN MODE ACTIVE]
 You are in Plan Mode: read-only exploration for implementation planning.
 
 Restrictions:
-- Built-in edit and write tools are disabled.
-- Other active tools remain available.
+- Only tools in the configured Plan Mode tool list are active.
+- Built-in edit and write tools are always disabled.
 - Bash is restricted to an allowlist of read-only commands.
 - Do not mutate project or system state.
 - Do not execute the implementation.
@@ -46,7 +50,7 @@ Restrictions:
 - For ordinary questions, respond directly without a "Plan:" header.
 
 Explore enough code to understand call paths, data flow, tests, constraints, risks, and verification needs.
-Ask clarifying questions with the questionnaire tool when necessary.
+Ask clarifying questions with the questionnaire tool when it is available.
 
 When explicitly asked, create an implementation-ready numbered plan under a "Plan:" header:
 
@@ -81,6 +85,64 @@ function uniqueToolNames(names: string[]): string[] {
   return [...new Set(names)];
 }
 
+function defaultPlanModeTools(): string[] {
+  return [...DEFAULT_PLAN_MODE_TOOLS];
+}
+
+function isMissingFile(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function isToolName(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim() === value;
+}
+
+function loadConfiguredPlanModeTools(warn: (message: string) => void): string[] {
+  let content: string;
+  try {
+    content = readFileSync(PLAN_MODE_CONFIG_PATH, "utf8");
+  } catch (error) {
+    if (isMissingFile(error)) return defaultPlanModeTools();
+    warn(`Could not read ${PLAN_MODE_CONFIG_PATH}; using the default Plan Mode tools.`);
+    return defaultPlanModeTools();
+  }
+
+  let config: unknown;
+  try {
+    config = JSON.parse(content);
+  } catch {
+    warn(`Invalid JSON in ${PLAN_MODE_CONFIG_PATH}; using the default Plan Mode tools.`);
+    return defaultPlanModeTools();
+  }
+
+  const configuredTools =
+    config && typeof config === "object" && !Array.isArray(config)
+      ? (config as { tools?: unknown }).tools
+      : undefined;
+  if (
+    !Array.isArray(configuredTools) ||
+    configuredTools.length === 0 ||
+    !configuredTools.every(isToolName)
+  ) {
+    warn(`Invalid tools in ${PLAN_MODE_CONFIG_PATH}; using the default Plan Mode tools.`);
+    return defaultPlanModeTools();
+  }
+
+  const disabledTools = configuredTools.filter((name) => PLAN_MODE_DISABLED_TOOLS.has(name));
+  if (disabledTools.length > 0) {
+    warn(`Ignoring disabled Plan Mode tools: ${uniqueToolNames(disabledTools).join(", ")}.`);
+  }
+
+  const tools = uniqueToolNames(
+    configuredTools.filter((name) => !PLAN_MODE_DISABLED_TOOLS.has(name)),
+  );
+  if (tools.length === 0) {
+    warn(`No usable tools configured in ${PLAN_MODE_CONFIG_PATH}; using the default Plan Mode tools.`);
+    return defaultPlanModeTools();
+  }
+  return tools;
+}
+
 export default function planModeExtension(pi: ExtensionAPI): void {
   let planModeEnabled = false;
   let planRequestPending = false;
@@ -99,18 +161,11 @@ export default function planModeExtension(pi: ExtensionAPI): void {
     );
   }
 
-  function getPlanModeTools(activeToolNames: string[]): string[] {
-    return uniqueToolNames([
-      ...activeToolNames.filter((name) => !PLAN_MODE_DISABLED_TOOLS.has(name)),
-      ...PLAN_MODE_TOOLS,
-    ]);
-  }
-
-  function enablePlanModeTools(): void {
+  function enablePlanModeTools(ctx: ExtensionContext): void {
     if (toolsBeforePlanMode === undefined) {
       toolsBeforePlanMode = pi.getActiveTools();
     }
-    pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
+    pi.setActiveTools(loadConfiguredPlanModeTools((message) => ctx.ui.notify(message, "warning")));
   }
 
   function restoreNormalModeTools(): void {
@@ -130,7 +185,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
   function enterPlanMode(ctx: ExtensionContext): void {
     planModeEnabled = true;
     planRequestPending = false;
-    enablePlanModeTools();
+    enablePlanModeTools(ctx);
     updateStatus(ctx);
     persistState();
     ctx.ui.notify("Plan mode enabled. Built-in write tools disabled.", "info");
@@ -305,7 +360,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
     }
 
     if (planModeEnabled) {
-      enablePlanModeTools();
+      enablePlanModeTools(ctx);
     }
     updateStatus(ctx);
   });

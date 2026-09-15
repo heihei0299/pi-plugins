@@ -23,8 +23,8 @@ This follows Pi's official extension-directory layout: `~/.pi/agent/extensions/*
 - snapshot of the active tool set before entering Plan Mode
 - exact restoration of the pre-plan tool set on exit/handoff
 - disables built-in `edit` / `write` while planning
-- preserves other active tools
-- adds the standard planning tools: `read`, `bash`, `grep`, `find`, `ls`, `questionnaire`
+- uses a configurable Plan Mode tool list
+- uses the standard planning tools by default: `read`, `bash`, `grep`, `find`, `ls`, `questionnaire`
 - read-only bash allowlist
 - hidden `[PLAN MODE ACTIVE]` context only while the mode is enabled
 - stale Plan Mode context cleanup after exit
@@ -61,6 +61,20 @@ Shortcut:
 Ctrl+Alt+P
 ```
 
+## Tool configuration
+
+Plan Mode reads its tool list from `~/.pi/agent/plan-mode.json` every time it is entered:
+
+```json
+{
+  "tools": ["read", "bash", "grep", "find", "ls", "questionnaire"]
+}
+```
+
+The configured list replaces the active tool list while Plan Mode is active. Duplicate names are removed while preserving order. Unknown tool names are ignored by Pi. `edit` and `write` are always filtered out, and `bash` remains restricted to the read-only allowlist.
+
+If the file is missing, the default list is used. Invalid or unreadable configuration falls back to the default list with a warning. Changes take effect the next time Plan Mode is entered. The extension does not create the file automatically.
+
 ## Install
 
 ```bash
@@ -83,8 +97,8 @@ normal mode
 /plan
     │
     ├── snapshot current tools
-    ├── remove edit/write
-    ├── add read-only planning tools
+    ├── load the configured tool list
+    ├── filter edit/write
     ├── restrict bash
     └── inject Plan Mode instructions
     │
@@ -109,4 +123,4 @@ There is no plugin-level plan length limit.
 
 Plan Mode disables built-in `edit` / `write` and filters `bash` through a read-only allowlist.
 
-As in Pi's official example, other already-active custom extension tools remain available. If a custom tool can mutate state, Plan Mode does not automatically make that custom tool read-only.
+Any configured custom tool is active as-is. If it can mutate state, Plan Mode does not automatically make that custom tool read-only.
