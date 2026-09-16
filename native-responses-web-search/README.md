@@ -2,7 +2,7 @@
 
 A Pi extension that exposes a local `web_search` tool backed by a nested Standard or Codex Responses request. The configured endpoint selects the adapter and native hosted-search declaration:
 
-- `standard` → `openai-responses` → `{ "type": "web_search_preview" }`
+- `standard` → `openai-responses` → `web_search` or `web_search_preview` (default: `web_search_preview`)
 - `codex` → `openai-codex-responses` → `{ "type": "web_search" }`
 
 ## Install
@@ -36,6 +36,7 @@ Default path: `~/.pi/agent/native-responses-web-search.json`. Override it with `
     {
       "provider": "cpa",
       "endpoint": "standard",
+      "nativeTool": "web_search",
       "modelPrefix": "gpt-5.6-luna",
       "model": "gpt-5.6-luna",
       "enabled": true
@@ -52,6 +53,8 @@ Default path: `~/.pi/agent/native-responses-web-search.json`. Override it with `
 ```
 
 Only one channel may be enabled at a time. An enabled channel must match the active model's provider, API, and optional model prefix. Standard channels require `openai-responses`; Codex channels require `openai-codex-responses`. Disabled entries may remain in the configuration.
+
+`nativeTool` is optional for Standard channels. It can be `web_search` or `web_search_preview`; omitted Standard values default to `web_search_preview` for compatibility. Codex channels always use `web_search`, and invalid endpoint/tool combinations fail closed instead of falling back.
 
 Set `model` on a channel to make `web_search` a standalone tool: nested search requests then always run through that exact model (resolved from the provider registry, with its own credentials) regardless of which model is active. Without `model`, the active model must match the channel. The backend model must exist in the provider registry and use the channel's Responses API.
 
@@ -80,10 +83,10 @@ No third-party search service or `pi-ai` source change is required. The extensio
 
 ## Smoke test
 
-1. Install the whole directory and run `pnpm install --prod --ignore-scripts` inside it.
+1. Install the whole directory and run `pnpm install --prod --ignore-scripts` inside it. This is the standalone copy flow; the root Pi package has a separate install flow.
 2. Configure one enabled channel whose provider/API matches the active model.
 3. Reload Pi and run `/native-web-search`.
-4. Confirm the status reports `model matches; tool registered`.
+4. Confirm the status reports the configured endpoint, native tool, and `model matches; tool registered`.
 5. Ask a current-information question and confirm the model calls local `web_search`.
-6. Confirm the nested request uses `web_search_preview` for Standard or `web_search` for Codex.
+6. Confirm the nested request uses the selected Standard `nativeTool` or `web_search` for Codex.
 7. Confirm ordinary coding questions do not automatically call the search tool.

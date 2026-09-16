@@ -163,6 +163,40 @@ test("accepts an enabled Standard Responses channel", () => {
   });
 });
 
+test("normalizes endpoint-specific native web-search tool choices", () => {
+  expect(normalizeConfig({
+    channels: [{ provider: "standard", endpoint: "standard", enabled: true }],
+  }).channels[0].nativeTool).toBe("web_search_preview");
+  expect(normalizeConfig({
+    channels: [{
+      provider: "modern",
+      endpoint: "standard",
+      nativeTool: "web_search",
+      enabled: true,
+    }],
+  }).channels[0].nativeTool).toBe("web_search");
+  expect(normalizeConfig({
+    channels: [{ provider: "codex", endpoint: "codex", enabled: true }],
+  }).channels[0].nativeTool).toBe("web_search");
+});
+
+test("rejects unsupported native web-search tool choices", () => {
+  expect(() => normalizeConfig({
+    channels: [{
+      provider: "standard",
+      endpoint: "standard",
+      nativeTool: "unknown",
+    }],
+  })).toThrow("nativeTool must be web_search or web_search_preview");
+  expect(() => normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      nativeTool: "web_search_preview",
+    }],
+  })).toThrow("nativeTool must be web_search for the codex endpoint");
+});
+
 test("limits configuration to one enabled provider channel", () => {
   expect(() => normalizeConfig({
     channels: [
@@ -220,6 +254,45 @@ test("registers and runs local search through Standard Responses", async () => {
   expect(providers[0].value.api).toBe("openai-responses");
   expect(result.content).toEqual([{ type: "text", text: "answer" }]);
   expect(payload.tools).toEqual([{ type: "web_search_preview" }]);
+});
+
+test("uses the configured Standard native tool in nested requests", async () => {
+  const standardModel = {
+    provider: "cpa",
+    id: "gpt-5.6-luna",
+    api: "openai-responses",
+  };
+  const h = pluginHarness();
+  installNativeResponsesWebSearch(
+    h.pi,
+    normalizeConfig({
+      channels: [{
+        provider: "cpa",
+        endpoint: "standard",
+        nativeTool: "web_search",
+        modelPrefix: "gpt-",
+        enabled: true,
+      }],
+    }),
+    "/tmp/config",
+    { standard: h.adapter as any },
+  );
+
+  await h.tools[0].execute(
+    "1",
+    { query: "latest news" },
+    undefined,
+    undefined,
+    {
+      model: standardModel,
+      modelRegistry: authRegistry(),
+    },
+  );
+  const payload = await h.capture.calls[0].options.onPayload({
+    input: "latest news",
+  });
+
+  expect(payload.tools).toEqual([{ type: "web_search" }]);
 });
 
 test("validates query and model before resolving auth", async () => {
@@ -540,6 +613,22 @@ test("fails closed when the Codex adapter is unavailable", () => {
   expect(notifications[0]).toContain("adapter is unavailable");
 });
 
+test("reports the configured native web-search tool in status", () => {
+  const standardConfig = normalizeConfig({
+    channels: [{
+      provider: "cpa",
+      endpoint: "standard",
+      nativeTool: "web_search",
+      enabled: true,
+    }],
+  });
+
+  const status = formatStatus(standardConfig, undefined, "/tmp/config");
+  expect(status).toContain("Native web search tool: enabled");
+  expect(status).not.toContain("Codex web search tool:");
+  expect(status).toContain("cpa/* -> Standard Responses (web_search)");
+});
+
 test("reports configured status and model mismatch", async () => {
   const { pi } = setup();
   const notifications: string[] = [];
@@ -550,7 +639,7 @@ test("reports configured status and model mismatch", async () => {
 
   expect(notifications[0]).toContain("model prefix does not match");
   expect(formatStatus(config, model, "/tmp/config")).toContain(
-    "codex/gpt- -> Codex Responses (sse) -> enabled; model matches (tool registration pending)",
+    "codex/gpt- -> Codex Responses (sse, web_search) -> enabled; model matches (tool registration pending)",
   );
 });
 

@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export type ResponsesEndpoint = "standard" | "codex";
+export type NativeWebSearchTool = "web_search" | "web_search_preview";
 export type Transport = "sse" | "websocket" | "websocket-cached" | "auto";
 export type NativeStreamSimple = (
   model: Model<any>,
@@ -23,8 +24,10 @@ export type NativeStreamSimple = (
 export interface WebSearchChannelConfig {
   /** Existing Pi provider/channel id reserved for this plugin. */
   provider: string;
-  /** Responses endpoint. Enabled channels must use Codex for local web search. */
+  /** Responses endpoint used for the nested local web search request. */
   endpoint?: ResponsesEndpoint;
+  /** Native hosted-search declaration used by the nested request. */
+  nativeTool?: NativeWebSearchTool;
   /** Only models with this prefix use local web search. Empty means all models. */
   modelPrefix?: string;
   /**
@@ -49,6 +52,7 @@ export interface PluginConfig {
 export interface NormalizedWebSearchChannel {
   provider: string;
   endpoint: ResponsesEndpoint;
+  nativeTool: NativeWebSearchTool;
   modelPrefix: string;
   model: string;
   enabled: boolean;
@@ -88,10 +92,10 @@ export const DEFAULT_CONFIG: NormalizedPluginConfig = {
   channels: [],
 };
 
-const STANDARD_WEB_SEARCH_TOOL = { type: "web_search_preview" } as const;
+const WEB_SEARCH_PREVIEW_TOOL = { type: "web_search_preview" } as const;
+const WEB_SEARCH_TOOL = { type: "web_search" } as const;
 const STANDARD_RESPONSES_API = "openai-responses" as const;
 const CODEX_RESPONSES_API = "openai-codex-responses" as const;
-const CODEX_WEB_SEARCH_TOOL = { type: "web_search" } as const;
 const NATIVE_WEB_SEARCH_TYPES = new Set([
   "web_search",
   "web_search_2025_08_26",
@@ -150,6 +154,22 @@ function readTransport(value: unknown, fallback: Transport, label: string): Tran
   );
 }
 
+function readNativeTool(
+  value: unknown,
+  endpoint: ResponsesEndpoint,
+  label: string,
+): NativeWebSearchTool {
+  const defaultTool = endpoint === "standard" ? "web_search_preview" : "web_search";
+  if (value === undefined) return defaultTool;
+  if (value !== "web_search" && value !== "web_search_preview") {
+    throw new Error(`${label} must be web_search or web_search_preview`);
+  }
+  if (endpoint === "codex" && value !== "web_search") {
+    throw new Error(`${label} must be web_search for the codex endpoint`);
+  }
+  return value;
+}
+
 function readChannelModel(value: unknown, label: string): string {
   if (value === undefined) return "";
   if (typeof value === "string" && value.trim() !== "") return value.trim();
@@ -182,12 +202,18 @@ export function normalizeConfig(value: unknown): NormalizedPluginConfig {
     if (modelPrefix !== undefined && typeof modelPrefix !== "string") {
       throw new Error(`config.channels[${index}].modelPrefix must be a string`);
     }
+    const endpoint = readEndpoint(
+      rawChannel.endpoint,
+      `config.channels[${index}].endpoint`,
+    );
 
     return {
       provider: provider.trim(),
-      endpoint: readEndpoint(
-        rawChannel.endpoint,
-        `config.channels[${index}].endpoint`,
+      endpoint,
+      nativeTool: readNativeTool(
+        rawChannel.nativeTool,
+        endpoint,
+        `config.channels[${index}].nativeTool`,
       ),
       modelPrefix: modelPrefix ?? "",
       model: readChannelModel(
@@ -308,6 +334,8 @@ function removeNativeWebSearch(payload: unknown): unknown {
 export function addNativeWebSearch(
   payload: unknown,
   endpoint: ResponsesEndpoint = "codex",
+  nativeTool: NativeWebSearchTool =
+    endpoint === "standard" ? "web_search_preview" : "web_search",
 ): unknown {
   if (!isObject(payload) || isToolChoiceNone(payload.tool_choice)) {
     return payload;
@@ -325,9 +353,9 @@ export function addNativeWebSearch(
     ...payload,
     tools: [
       ...tools,
-      endpoint === "standard"
-        ? { ...STANDARD_WEB_SEARCH_TOOL }
-        : { ...CODEX_WEB_SEARCH_TOOL },
+      nativeTool === "web_search"
+        ? { ...WEB_SEARCH_TOOL }
+        : { ...WEB_SEARCH_PREVIEW_TOOL },
     ],
   };
 }
@@ -372,7 +400,7 @@ export function formatStatus(
   runtime: RuntimeStatus = DEFAULT_RUNTIME_STATUS,
 ): string {
   const lines = [
-    `Codex web search tool: ${config.enabled ? "enabled" : "disabled"}`,
+    `Native web search tool: ${config.enabled ? "enabled" : "disabled"}`,
     `config: ${configPath}`,
   ];
 
@@ -383,8 +411,8 @@ export function formatStatus(
 
   for (const channel of config.channels) {
     const endpoint = channel.endpoint === "codex"
-      ? `Codex Responses (${channel.transport})`
-      : "Standard Responses";
+      ? `Codex Responses (${channel.transport}, ${channel.nativeTool})`
+      : `Standard Responses (${channel.nativeTool})`;
     lines.push(
       `${channel.provider}/${channel.modelPrefix || "*"} -> ${endpoint} -> ${currentModelStatus(model, channel, config.enabled, runtime)}`,
     );
@@ -465,7 +493,8 @@ function registerLocalWebSearch(
           : {}),
         toolChoice: "required",
         ...(requestSignal ? { signal: requestSignal } : {}),
-        onPayload: async (payload) => addNativeWebSearch(payload, channel.endpoint),
+        onPayload: async (payload) =>
+          addNativeWebSearch(payload, channel.endpoint, channel.nativeTool),
       });
 
       const result = await stream.result();
@@ -531,7 +560,7 @@ function registerStatusCommand(
   unavailableReason?: string,
 ): void {
   pi.registerCommand("native-web-search", {
-    description: "Show Codex web search tool status",
+    description: "Show native web search tool status",
     handler: async (_args, ctx: ExtensionCommandContext) => {
       const status = formatStatus(config, ctx.model, configPath, runtime);
       ctx.ui.notify(
@@ -549,11 +578,11 @@ function registerConfigErrorStatus(
 ): void {
   const message = error instanceof Error ? error.message : String(error);
   pi.registerCommand("native-web-search", {
-    description: "Show Codex web search tool configuration status",
+    description: "Show native web search tool configuration status",
     handler: async (_args, _ctx) => {
       _ctx.ui.notify(
         [
-          "Codex web search tool: unavailable",
+          "Native web search tool: unavailable",
           `config: ${configPath}`,
           `status: configuration error; ${message}`,
         ].join("\n"),
