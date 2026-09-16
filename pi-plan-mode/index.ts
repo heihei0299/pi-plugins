@@ -12,18 +12,19 @@
  * - persisted plan-mode state
  *
  * Intentionally omitted:
+ * - post-plan execution/refinement workflow
  * - todo extraction / [DONE:n]
  * - execution state machine
  * - execution progress widget
  *
- * Execution is handed back to the normal agent.
+ * Plan output is the end of this extension's responsibility.
  */
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
+import type { TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import { isSafeCommand } from "./utils.ts";
@@ -38,7 +39,7 @@ const DEFAULT_PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "question
 const PLAN_MODE_DISABLED_TOOLS = new Set<string>(["edit", "write"]);
 
 const PLAN_PROMPT = `[PLAN MODE ACTIVE]
-You are in Plan Mode: read-only exploration for implementation planning.
+You are in Plan Mode: read-only exploration for professional implementation planning.
 
 Restrictions:
 - Only tools in the configured Plan Mode tool list are active.
@@ -49,37 +50,28 @@ Restrictions:
 - Only create a Plan when the user explicitly asks for a plan, outline, steps, implementation approach, or to refine an existing plan.
 - For ordinary questions, respond directly without a "Plan:" header.
 
-Explore enough code to understand call paths, data flow, tests, constraints, risks, and verification needs.
-Ask clarifying questions with the questionnaire tool when it is available.
+Before planning, restate the user's goal, scope, and success criteria so the plan solves the right problem. Then explore enough of the repository to understand the current implementation, direct callers, call paths, data flow, relevant tests, project instructions, and applicable ADRs.
 
-When explicitly asked, create an implementation-ready numbered plan under a "Plan:" header:
+For a non-trivial task, explain why the current implementation is insufficient and the root cause. Distinguish repository evidence from proposed decisions, assumptions, and open questions. Do not invent files, symbols, APIs, behavior, test results, or constraints. Ask clarifying questions with the questionnaire tool when a missing fact would change the interface, data, security, scope, or acceptance criteria; otherwise record the assumption.
+
+When explicitly asked, create an implementation-ready numbered plan under a "Plan:" header. A professional plan should cover:
+- Goal, scope, and success criteria.
+- Current state and repository evidence, including relevant paths, symbols, call paths, and affected boundaries.
+- Why the current implementation is insufficient and the root cause.
+- Proposed design and the decisions or invariants that must remain true.
+- Scope and non-goals.
+- Ordered implementation steps with their behavior, dependencies, change boundaries, and tests.
+- Tests and verification, including the highest useful test seam, commands, and expected observations.
+- Compatibility and migration impact when interfaces, state, configuration, or data formats change.
+- Risks, edge cases, assumptions, alternatives when material, and unresolved questions.
+- Acceptance criteria that describe observable outcomes.
+
+Keep the plan as small as the task allows. Prefer existing abstractions and the smallest correct change over speculative generality. Do not claim that any check passed unless it was actually run.
 
 Plan:
 1. First step
 2. Second step
 ...`;
-
-function isAssistantMessage(message: AgentMessage): message is AssistantMessage {
-  return message.role === "assistant" && Array.isArray(message.content);
-}
-
-function getTextContent(message: AssistantMessage): string {
-  return message.content
-    .filter((block): block is TextContent => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
-}
-
-function extractPlan(message: string): string | null {
-  const header = /^\s*\*{0,2}Plan:\*{0,2}\s*$/gim;
-  const matches = [...message.matchAll(header)];
-  const last = matches.at(-1);
-  if (!last || last.index === undefined) return null;
-
-  const body = message.slice(last.index + last[0].length).trim();
-  if (!body || !/^\s*\d+[.)]\s+/m.test(body)) return null;
-  return `Plan:\n${body}`;
-}
 
 function uniqueToolNames(names: string[]): string[] {
   return [...new Set(names)];
@@ -145,7 +137,6 @@ function loadConfiguredPlanModeTools(warn: (message: string) => void): string[] 
 
 export default function planModeExtension(pi: ExtensionAPI): void {
   let planModeEnabled = false;
-  let planRequestPending = false;
   let toolsBeforePlanMode: string[] | undefined;
 
   pi.registerFlag("plan", {
@@ -184,7 +175,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
   function enterPlanMode(ctx: ExtensionContext): void {
     planModeEnabled = true;
-    planRequestPending = false;
     enablePlanModeTools(ctx);
     updateStatus(ctx);
     persistState();
@@ -193,7 +183,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
   function exitPlanMode(ctx: ExtensionContext): void {
     planModeEnabled = false;
-    planRequestPending = false;
     restoreNormalModeTools();
     updateStatus(ctx);
     persistState();
@@ -203,23 +192,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
   function togglePlanMode(ctx: ExtensionContext): void {
     if (planModeEnabled) exitPlanMode(ctx);
     else enterPlanMode(ctx);
-  }
-
-  function handoffPlan(plan: string, ctx: ExtensionContext): void {
-    planModeEnabled = false;
-    planRequestPending = false;
-    restoreNormalModeTools();
-    updateStatus(ctx);
-    persistState();
-
-    pi.sendMessage(
-      {
-        customType: "plan-handoff",
-        content: `${plan}\n\nPlan Mode is finished. Execute this plan using the normal project workflow and active tools.`,
-        display: true,
-      },
-      { triggerTurn: true, deliverAs: "followUp" },
-    );
   }
 
   pi.registerCommand("plan", {
@@ -247,13 +219,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
   pi.registerShortcut(Key.ctrlAlt("p"), {
     description: "Toggle plan mode",
     handler: async (ctx) => togglePlanMode(ctx),
-  });
-
-  pi.on("input", async (event) => {
-    if (!planModeEnabled || event.source === "extension") return;
-
-    // ponytail: keyword intent heuristic; add an explicit plan command if natural-language detection becomes unreliable.
-    planRequestPending = /\b(plan|outline|steps|approach|refine|revise)\b|计划|规划|方案|步骤|大纲/i.test(event.text);
   });
 
   pi.on("tool_call", async (event) => {
@@ -303,44 +268,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
         display: false,
       },
     };
-  });
-
-  pi.on("agent_end", async (event, ctx) => {
-    if (!planModeEnabled || !ctx.hasUI || !planRequestPending) return;
-
-    const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
-    const plan = lastAssistant ? extractPlan(getTextContent(lastAssistant)) : null;
-    if (!plan) return;
-    planRequestPending = false;
-
-    const choice = await ctx.ui.select("Plan mode - what next?", [
-      "Execute the plan",
-      "Stay in plan mode",
-      "Refine the plan",
-      "Exit plan mode",
-    ]);
-
-    if (choice === "Execute the plan") {
-      handoffPlan(plan, ctx);
-      return;
-    }
-
-    if (choice === "Refine the plan") {
-      const refinement = await ctx.ui.editor("Refine the plan:", "");
-      if (refinement?.trim()) {
-        planRequestPending = true;
-        pi.sendMessage(
-          { customType: "plan-current", content: plan, display: true },
-          { deliverAs: "followUp" },
-        );
-        pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
-      }
-      return;
-    }
-
-    if (choice === "Exit plan mode") {
-      exitPlanMode(ctx);
-    }
   });
 
   pi.on("session_start", async (_event, ctx) => {

@@ -78,6 +78,28 @@ function assistantPlan(text = "Plan:\n1. Inspect the relevant code") {
   };
 }
 
+test("asks for a professional implementation plan grounded in repository evidence", async () => {
+  const pi = createPi();
+  planModeExtension(pi as any);
+  const ctx = createContext();
+
+  await pi.command("plan")?.handler("on", ctx);
+  const result = await pi.emit("before_agent_start", {}, ctx) as any;
+  const prompt = result.message.content as string;
+
+  expect(prompt).toMatch(/restate .*goal, scope, and success criteria/i);
+  expect(prompt).toMatch(/repository evidence/i);
+  expect(prompt).toMatch(/call paths/i);
+  expect(prompt).toMatch(/current implementation.*insufficient.*root cause/i);
+  expect(prompt).toMatch(/scope and non-goals/i);
+  expect(prompt).toMatch(/implementation steps/i);
+  expect(prompt).toMatch(/tests and verification/i);
+  expect(prompt).toMatch(/compatibility.*migration impact/i);
+  expect(prompt).toMatch(/risks/i);
+  expect(prompt).toMatch(/acceptance criteria/i);
+  expect(prompt).toContain("Do not invent");
+});
+
 test("uses the configured tools on every plan-mode entry", async () => {
   planModeConfig = JSON.stringify({ tools: ["grep", "read", "grep"] });
   const pi = createPi();
@@ -222,7 +244,7 @@ test("does not show the plan menu for an ordinary message", async () => {
   expect(ctx.ui.select).not.toHaveBeenCalled();
 });
 
-test("shows the plan menu for an explicit plan request", async () => {
+test("does not start a follow-up workflow after producing a plan", async () => {
   const pi = createPi();
   planModeExtension(pi as any);
   const ctx = createContext();
@@ -234,5 +256,5 @@ test("shows the plan menu for an explicit plan request", async () => {
   }, ctx);
   await pi.emit("agent_end", { messages: [assistantPlan()] }, ctx);
 
-  expect(ctx.ui.select).toHaveBeenCalledTimes(1);
+  expect(ctx.ui.select).not.toHaveBeenCalled();
 });

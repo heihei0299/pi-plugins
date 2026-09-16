@@ -2,7 +2,7 @@
 
 A planning-only variant of Pi's official `examples/extensions/plan-mode`.
 
-It keeps the official Plan Mode mechanics for read-only exploration and state/tool handling, but deliberately stops at plan handoff. Execution tracking belongs to the normal agent, project skills, or a separate subagent extension.
+It provides a safe, read-only exploration mode for producing professional implementation plans. Plan output is the end of the extension's responsibility; implementation and execution belong to the normal agent or developer.
 
 ## Structure
 
@@ -21,30 +21,37 @@ This follows Pi's official extension-directory layout: `~/.pi/agent/extensions/*
 - `--plan` startup flag
 - `/plan` toggle and `Ctrl+Alt+P`
 - snapshot of the active tool set before entering Plan Mode
-- exact restoration of the pre-plan tool set on exit/handoff
+- exact restoration of the pre-plan tool set on exit
 - disables built-in `edit` / `write` while planning
 - uses a configurable Plan Mode tool list
 - uses the standard planning tools by default: `read`, `bash`, `grep`, `find`, `ls`, `questionnaire`
 - read-only bash allowlist
 - hidden `[PLAN MODE ACTIVE]` context only while the mode is enabled
 - stale Plan Mode context cleanup after exit
-- text-only extraction from the final assistant message
+- professional implementation-plan instructions
 - session persistence for enabled state and the pre-plan tool snapshot
 
 The bash helper is based on Pi's official allowlist and keeps an extra fail-closed rule: for `&&`, `||`, `;`, and pipelines, every segment must independently match the read-only allowlist.
 
-## Deliberate differences
+## Plan output
 
-The following official execution features are intentionally **not** included:
+When the user explicitly asks for a plan, Plan Mode first explores the relevant repository with its read-only tools, then produces an implementation-ready numbered plan under a `Plan:` header.
 
-- todo extraction
-- `[DONE:n]` markers
-- execution state machine
-- execution progress widget
-- `/todos`
-- execution-state recovery
+For non-trivial work, the plan should cover:
 
-When the user chooses **Execute the plan**, this extension leaves Plan Mode, restores the exact previous tools, and sends the complete plan back to the normal agent as a follow-up turn.
+- goal, scope, and success criteria;
+- current implementation and repository evidence;
+- affected paths, symbols, call paths, and boundaries;
+- why the current implementation is insufficient and its root cause;
+- proposed design and important invariants;
+- scope and non-goals;
+- ordered implementation steps and dependencies;
+- tests, verification commands, and expected observations;
+- compatibility and migration impact when interfaces, state, configuration, or data formats change;
+- risks, assumptions, alternatives, and open questions;
+- observable acceptance criteria.
+
+The plan must distinguish confirmed repository facts from proposed decisions and assumptions. It must not invent code, APIs, constraints, or test results. It does not modify files, execute the implementation, hand the plan to another agent, or track progress.
 
 ## Commands
 
@@ -100,15 +107,18 @@ normal mode
     ├── load the configured tool list
     ├── filter edit/write
     ├── restrict bash
-    └── inject Plan Mode instructions
+    └── inject professional planning instructions
     │
     ▼
-agent produces Plan:
+read-only repository exploration
     │
-    ├── Execute ──► restore tools ──► hand plan to normal agent
-    ├── Refine  ──► remain in Plan Mode
-    ├── Stay    ──► remain in Plan Mode
-    └── Exit    ──► restore tools
+    ▼
+user explicitly requests a plan
+    │
+    ▼
+implementation-ready Plan output
+    │
+    └── /plan off ──► restore previous tools
 ```
 
 ## Context overhead
