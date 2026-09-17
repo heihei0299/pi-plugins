@@ -14,8 +14,12 @@ test("rejects commands that can mutate, execute, or span multiple lines", () => 
     "wget https://example.com/file",
     "sed -n 's/foo/bar/e' README.md",
     "sed -n '1,5p;w /tmp/output' README.md",
+    "sed -n -i 's/foo/bar/' README.md",
+    "sed -n --in-place 's/foo/bar/' README.md",
     "git diff --output=/tmp/diff",
     "git show --output /tmp/show",
+    "git diff -o /tmp/diff",
+    "git show -o/tmp/show",
     "git status && git diff --output=/tmp/diff",
     String.raw`cat README.md
 pwd`,

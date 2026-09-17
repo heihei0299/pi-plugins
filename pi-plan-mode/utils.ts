@@ -39,9 +39,11 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
   /\bsystemctl\s+(start|stop|restart|reload|enable|disable|mask|unmask)\b/i,
   /\bservice\s+\S+\s+(start|stop|restart|reload)\b/i,
   /^\s*fd\b[^\n]*(?:\s|^)(?:-x|-X|--exec(?:-batch)?)(?:\s|=|$)/i,
+  /^\s*sed\b[^\n]*(?:\s|^)(?:-i[^\s]*|--in-place)(?:=|\s|$)/i,
   /^\s*sed\b[^\n]*(?:[;\/'"])\s*(?:[0-9,$*]+)?e(?=\s|[;,\/'"]|$)/i,
   /^\s*sed\b[^\n]*(?:[;\/'"])\s*(?:[0-9,$*]+)?w(?=\s|[;,\/'"]|$)/i,
   /^\s*git\s+(?:diff|show)\b[^\n]*(?:\s|^)--output(?:=|\s|$)/i,
+  /^\s*git\s+(?:diff|show)\b[^\n]*(?:\s|^)-o(?:\s|[^\s]|$)/i,
   /\b(vim?|nano|emacs|code|subl)\b/i,
 ];
 
