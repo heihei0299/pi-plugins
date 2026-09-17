@@ -13,9 +13,20 @@ delete process.env.PI_LOCKED_SUBAGENT_DEPTH;
 const root = await mkdtemp(join(tmpdir(), "pi-locked-subagents-index-test-"));
 const workerPath = join(root, "worker");
 const configPath = join(root, "config.json");
+const mixedProtocolOutput = [
+  "not json",
+  JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      stopReason: "stop",
+    },
+  }),
+].join("\n") + "\n";
 await writeFile(
   workerPath,
-  `#!${process.execPath}\nprocess.stdout.write(JSON.stringify({type: "message_start"}) + "\\n")\n`,
+  `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(mixedProtocolOutput)})\n`,
   { mode: 0o700 },
 );
 await chmod(workerPath, 0o700);
@@ -47,7 +58,7 @@ afterAll(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-test("reports a worker without message_end as a failed subagent call", async () => {
+test("reports malformed output before a valid message_end as failed", async () => {
   let tool: any;
   lockedSubagents({
     registerTool(value: unknown) { tool = value; },
@@ -63,5 +74,5 @@ test("reports a worker without message_end as a failed subagent call", async () 
   );
 
   expect(result.isError).toBe(true);
-  expect(result.content[0].text).toContain("message_end");
+  expect(result.content[0].text).toContain("invalid JSON");
 });

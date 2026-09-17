@@ -50,6 +50,24 @@ test("fails the protocol when worker output is not valid JSON", async () => {
   expect(result.protocolError).toContain("invalid JSON");
 });
 
+test("records malformed JSON before a valid final message", async () => {
+  const event = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      stopReason: "stop",
+    },
+  });
+  const result = await runScript(
+    `process.stdout.write(${JSON.stringify(`not json\n${event}\n`)})`,
+  );
+
+  expect(result.code).toBe(0);
+  expect(result.sawValidMessageEnd).toBe(true);
+  expect(result.protocolError).toContain("invalid JSON");
+});
+
 test("stops a worker that exceeds the execution timeout", async () => {
   const result = await runScript(
     `setInterval(() => {}, 1000)`,

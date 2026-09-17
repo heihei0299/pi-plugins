@@ -105,7 +105,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           result.stopReason === "error" ||
           result.stopReason === "aborted" ||
           Boolean(result.errorMessage?.trim());
-        const protocolFailed = !result.sawValidMessageEnd;
+        const protocolFailed = !result.sawValidMessageEnd || Boolean(result.protocolError);
         if (result.code !== 0 || modelFailed || protocolFailed) {
           const failure =
             result.failureReason ||

@@ -38,6 +38,10 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
   /\b(sudo|su|kill|pkill|killall|reboot|shutdown)\b/i,
   /\bsystemctl\s+(start|stop|restart|reload|enable|disable|mask|unmask)\b/i,
   /\bservice\s+\S+\s+(start|stop|restart|reload)\b/i,
+  /^\s*fd\b[^\n]*(?:\s|^)(?:-x|-X|--exec(?:-batch)?)(?:\s|=|$)/i,
+  /^\s*sed\b[^\n]*(?:[;\/'"])\s*(?:[0-9,$*]+)?e(?=\s|[;,\/'"]|$)/i,
+  /^\s*sed\b[^\n]*(?:[;\/'"])\s*(?:[0-9,$*]+)?w(?=\s|[;,\/'"]|$)/i,
+  /^\s*git\s+(?:diff|show)\b[^\n]*(?:\s|^)--output(?:=|\s|$)/i,
   /\b(vim?|nano|emacs|code|subl)\b/i,
 ];
 
@@ -91,17 +95,15 @@ const SAFE_PATTERNS: RegExp[] = [
 ];
 
 export function isSafeCommand(command: string): boolean {
-  if (
-    !command.trim() ||
-    command.includes("\n") ||
-    command.includes("\r") ||
-    DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(command))
-  ) return false;
+  if (!command.trim() || command.includes("\n") || command.includes("\r")) return false;
 
   const segments = command
     .split(/\s*(?:&&|\|\||;|\|)\s*/)
     .map((segment) => segment.trim())
     .filter(Boolean);
 
-  return segments.length > 0 && segments.every((segment) => SAFE_PATTERNS.some((pattern) => pattern.test(segment)));
+  return segments.length > 0 && segments.every((segment) =>
+    !DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(segment)) &&
+    SAFE_PATTERNS.some((pattern) => pattern.test(segment))
+  );
 }
