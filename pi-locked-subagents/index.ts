@@ -1,10 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-  ALLOWED_ENV,
   CONFIG_PATH,
   DEFAULT_MAX_DEPTH,
-  DEPTH_ENV,
+  childEnvironment,
   currentDepth,
   loadConfig,
   loadConfigSnapshot,
@@ -80,11 +79,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
       const childDepth = depthNow + 1;
       const allowedAgents = agent.allowedAgents ?? [];
       const canDelegate = childDepth < limit && allowedAgents.length > 0 && (agent.tools?.includes("subagent") ?? false);
-      const childEnv: NodeJS.ProcessEnv = {
-        ...process.env,
-        [ALLOWED_ENV]: canDelegate ? allowedAgents.join(",") : "",
-        [DEPTH_ENV]: String(childDepth),
-      };
+      const childEnv = childEnvironment(agent, process.env, canDelegate, childDepth);
 
       try {
         const result = await runChild(
@@ -93,6 +88,8 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           ctx.cwd,
           childEnv,
           signal,
+          undefined,
+          agent.env ?? [],
         );
         const details = {
           agent: params.agent,
@@ -101,14 +98,22 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           transcriptPath: result.transcriptPath,
           exitCode: result.code,
           stopReason: result.stopReason ?? null,
+          failureReason: result.failureReason ?? null,
         };
 
         const modelFailed =
           result.stopReason === "error" ||
           result.stopReason === "aborted" ||
           Boolean(result.errorMessage?.trim());
-        if (result.code !== 0 || modelFailed) {
-          const failure = result.errorMessage?.trim() || result.stderr.trim() || result.finalOutput || "(no output)";
+        const protocolFailed = !result.sawValidMessageEnd;
+        if (result.code !== 0 || modelFailed || protocolFailed) {
+          const failure =
+            result.failureReason ||
+            result.errorMessage?.trim() ||
+            result.protocolError ||
+            result.stderr.trim() ||
+            result.finalOutput ||
+            "(no output)";
           return {
             isError: true,
             content: [{

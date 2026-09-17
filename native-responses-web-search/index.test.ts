@@ -151,6 +151,12 @@ test("does not register a tool when the plugin is disabled", () => {
   expect(pi.providers).toHaveLength(0);
 });
 
+test("requires an explicit endpoint for every channel", () => {
+  expect(() => normalizeConfig({
+    channels: [{ provider: "missing-endpoint", enabled: true }],
+  })).toThrow("endpoint must be explicitly configured as standard or codex");
+});
+
 test("accepts an enabled Standard Responses channel", () => {
   const normalized = normalizeConfig({
     channels: [{ provider: "cpa", endpoint: "standard", enabled: true }],
@@ -362,6 +368,30 @@ test("runs a nested native Codex search with auth, transport, signal, and no ses
   });
 });
 
+test("replaces an existing differently typed native declaration", () => {
+  const payload = {
+    input: "use the configured declaration",
+    tools: [{ type: "web_search" }],
+  };
+
+  expect(addNativeWebSearch(payload, "standard", "web_search_preview")).toEqual({
+    input: "use the configured declaration",
+    tools: [{ type: "web_search_preview" }],
+  });
+});
+
+test("deduplicates an existing declaration of the configured type", () => {
+  const payload = {
+    input: "use one declaration",
+    tools: [{ type: "web_search_preview" }, { type: "web_search_preview" }],
+  };
+
+  expect(addNativeWebSearch(payload, "standard", "web_search_preview")).toEqual({
+    input: "use one declaration",
+    tools: [{ type: "web_search_preview" }],
+  });
+});
+
 test("does not duplicate an existing native declaration or mutate the payload", () => {
   const payload = {
     input: "already enabled",
@@ -566,6 +596,36 @@ test("does not declare native search on the parent request or reject the local t
   expect(responseCallbackCalls).toBe(1);
   expect(payload).toEqual({ input: "x", temperature: 0 });
   expect(capture.calls[0].options.transport).toBe("sse");
+});
+
+test("uses endpoint-neutral authentication wording for Standard", async () => {
+  const h = pluginHarness();
+  const standardModel = {
+    provider: "cpa",
+    id: "gpt-5.6-luna",
+    api: "openai-responses",
+  };
+  installNativeResponsesWebSearch(
+    h.pi,
+    normalizeConfig({
+      channels: [{ provider: "cpa", endpoint: "standard", enabled: true }],
+    }),
+    "/tmp/config",
+    { standard: h.adapter as any },
+  );
+
+  const error = await h.tools[0].execute(
+    "1",
+    { query: "latest" },
+    undefined,
+    undefined,
+    toolContext(standardModel, {
+      getApiKeyAndHeaders: async () => ({ ok: true }),
+    }),
+  ).catch((value: unknown) => value as Error);
+
+  expect(error.message).toContain("configured provider");
+  expect(error.message).not.toContain("Codex");
 });
 
 test("surfaces authentication and nested response failures", async () => {

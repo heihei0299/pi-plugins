@@ -38,7 +38,6 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
   /\b(sudo|su|kill|pkill|killall|reboot|shutdown)\b/i,
   /\bsystemctl\s+(start|stop|restart|reload|enable|disable|mask|unmask)\b/i,
   /\bservice\s+\S+\s+(start|stop|restart|reload)\b/i,
-  /\bcurl\b[^\n]*(?:\s-o(?:\s|$)|\s--output(?:=|\s)|\s-O(?:\s|$)|\s--remote-name(?:\s|$))/i,
   /\b(vim?|nano|emacs|code|subl)\b/i,
 ];
 
@@ -50,7 +49,6 @@ const SAFE_PATTERNS: RegExp[] = [
   /^\s*more\b/i,
   /^\s*grep\b/i,
   /^\s*rg\b/i,
-  /^\s*find\b/i,
   /^\s*fd\b/i,
   /^\s*ls\b/i,
   /^\s*eza\b/i,
@@ -69,8 +67,6 @@ const SAFE_PATTERNS: RegExp[] = [
   /^\s*which\b/i,
   /^\s*whereis\b/i,
   /^\s*type\b/i,
-  /^\s*env\b/i,
-  /^\s*printenv\b/i,
   /^\s*uname\b/i,
   /^\s*whoami\b/i,
   /^\s*id\b/i,
@@ -89,16 +85,18 @@ const SAFE_PATTERNS: RegExp[] = [
   /^\s*yarn\s+(list|info|why|audit)\b/i,
   /^\s*node\s+--version\b/i,
   /^\s*(python|python3)\s+--version\b/i,
-  /^\s*curl\s/i,
-  /^\s*wget\s+-O\s*-/i,
   /^\s*jq\b/i,
   /^\s*sed\s+-n\b/i,
-  /^\s*awk\b/i,
   /^\s*bat\b/i,
 ];
 
 export function isSafeCommand(command: string): boolean {
-  if (!command.trim() || DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(command))) return false;
+  if (
+    !command.trim() ||
+    command.includes("\n") ||
+    command.includes("\r") ||
+    DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(command))
+  ) return false;
 
   const segments = command
     .split(/\s*(?:&&|\|\||;|\|)\s*/)

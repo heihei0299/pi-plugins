@@ -52,9 +52,9 @@ Default path: `~/.pi/agent/native-responses-web-search.json`. Override it with `
 }
 ```
 
-Only one channel may be enabled at a time. An enabled channel must match the active model's provider, API, and optional model prefix. Standard channels require `openai-responses`; Codex channels require `openai-codex-responses`. Disabled entries may remain in the configuration.
+Only one channel may be enabled at a time. Every channel must explicitly set `endpoint` to `standard` or `codex`; omitted endpoints fail closed instead of silently selecting Codex. An enabled channel must match the active model's provider, API, and optional model prefix. Standard channels require `openai-responses`; Codex channels require `openai-codex-responses`. Disabled entries may remain in the configuration.
 
-`nativeTool` is optional for Standard channels. It can be `web_search` or `web_search_preview`; omitted Standard values default to `web_search_preview` for compatibility. Codex channels always use `web_search`, and invalid endpoint/tool combinations fail closed instead of falling back.
+`nativeTool` is optional for Standard channels. It can be `web_search` or `web_search_preview`; omitted Standard values default to `web_search_preview`. Codex channels always use `web_search`, and invalid endpoint/tool combinations fail closed instead of falling back.
 
 Set `model` on a channel to make `web_search` a standalone tool: nested search requests then always run through that exact model (resolved from the provider registry, with its own credentials) regardless of which model is active. Without `model`, the active model must match the channel. The backend model must exist in the provider registry and use the channel's Responses API.
 

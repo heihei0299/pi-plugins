@@ -139,8 +139,10 @@ function readBoolean(value: unknown, fallback: boolean, label: string): boolean 
 }
 
 function readEndpoint(value: unknown, label: string): ResponsesEndpoint {
-  if (value === undefined || value === "codex") return "codex";
-  if (value === "standard") return value;
+  if (value === undefined) {
+    throw new Error(`${label} must be explicitly configured as standard or codex`);
+  }
+  if (value === "standard" || value === "codex") return value;
   throw new Error(`${label} must be \"standard\" or \"codex\"`);
 }
 
@@ -347,15 +349,22 @@ export function addNativeWebSearch(
   }
 
   const tools = currentTools ?? [];
-  if (tools.some(isNativeWebSearchTool)) return payload;
+  const configuredTool = tools.find(
+    (tool) => isObject(tool) && tool.type === nativeTool,
+  );
+  const nativeTools = tools.filter(isNativeWebSearchTool);
+  if (nativeTools.length === 1 && configuredTool !== undefined) return payload;
 
+  const declaration = configuredTool ?? (
+    nativeTool === "web_search"
+      ? { ...WEB_SEARCH_TOOL }
+      : { ...WEB_SEARCH_PREVIEW_TOOL }
+  );
   return {
     ...payload,
     tools: [
-      ...tools,
-      nativeTool === "web_search"
-        ? { ...WEB_SEARCH_TOOL }
-        : { ...WEB_SEARCH_PREVIEW_TOOL },
+      ...tools.filter((tool) => !isNativeWebSearchTool(tool)),
+      declaration,
     ],
   };
 }
@@ -471,7 +480,7 @@ function registerLocalWebSearch(
         throw new Error(`web_search authentication unavailable: ${auth.error}`);
       }
       if (!auth.apiKey) {
-        throw new Error("web_search requires an API key for the configured Codex provider");
+        throw new Error("web_search requires an API key for the configured provider");
       }
 
       const requestSignal = signal ?? ctx.signal;

@@ -31,7 +31,7 @@ This follows Pi's official extension-directory layout: `~/.pi/agent/extensions/*
 - professional implementation-plan instructions
 - session persistence for enabled state and the pre-plan tool snapshot
 
-The bash helper is based on Pi's official allowlist and keeps an extra fail-closed rule: for `&&`, `||`, `;`, and pipelines, every segment must independently match the read-only allowlist.
+The bash helper is based on Pi's official allowlist and keeps an extra fail-closed rule: for `&&`, `||`, `;`, and pipelines, every segment must independently match the read-only allowlist. It rejects multiline commands and does not allow `find`, `awk`, `env`, `printenv`, `curl`, or `wget`; use `rg`, `fd`, `cat`, and other listed read-only commands instead.
 
 ## Plan output
 

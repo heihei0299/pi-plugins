@@ -11,6 +11,8 @@ export interface AgentConfig {
   model: string;
   thinking?: Thinking;
   tools?: string[];
+  /** Parent environment variable names to pass to the child. */
+  env?: string[];
   systemPrompt?: string;
   isolate?: {
     noExtensions?: boolean;
@@ -39,6 +41,42 @@ export const DEFAULT_MAX_DEPTH = 2;
 export const ALLOWED_ENV = "PI_LOCKED_SUBAGENT_ALLOWED";
 export const DEPTH_ENV = "PI_LOCKED_SUBAGENT_DEPTH";
 
+const DEFAULT_CHILD_ENV = [
+  "HOME",
+  "PATH",
+  "SHELL",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TERM",
+  "COLORTERM",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
+  "PI_BINARY",
+  "PI_LOCKED_SUBAGENTS_CONFIG",
+  "PI_LOCKED_SUBAGENTS_RUN_DIR",
+];
+
+export function childEnvironment(
+  agent: AgentConfig,
+  parentEnv: NodeJS.ProcessEnv,
+  canDelegate: boolean,
+  depth: number,
+): NodeJS.ProcessEnv {
+  const names = new Set([...DEFAULT_CHILD_ENV, ...(agent.env ?? [])]);
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of names) {
+    if (parentEnv[name] !== undefined) env[name] = parentEnv[name];
+  }
+  env[ALLOWED_ENV] = canDelegate ? (agent.allowedAgents ?? []).join(",") : "";
+  env[DEPTH_ENV] = String(depth);
+  return env;
+}
+
 export function parseConfig(raw: string): Config {
   const parsed = JSON.parse(raw) as Config;
   if (!parsed?.agents || typeof parsed.agents !== "object") {
@@ -54,6 +92,12 @@ export function parseConfig(raw: string): Config {
     }
     if (agent.description !== undefined && typeof agent.description !== "string") {
       throw new Error(`Agent "${name}" description must be a string`);
+    }
+    if (agent.env !== undefined && (
+      !Array.isArray(agent.env) ||
+      agent.env.some((value) => typeof value !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value))
+    )) {
+      throw new Error(`Agent "${name}" env must be an array of environment variable names`);
     }
     if (agent.allowedAgents !== undefined) {
       if (!Array.isArray(agent.allowedAgents) || agent.allowedAgents.some((value) => typeof value !== "string" || !value.trim())) {
