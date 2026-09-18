@@ -15,7 +15,6 @@ test("declares the repository as a Pi package with every extension", () => {
   const manifest = readManifest();
   expect(manifest.keywords).toContain("pi-package");
   expect(manifest.pi.extensions).toEqual([
-    "./cpa-codex-ws/cpa-codex-ws.ts",
     "./native-responses-web-search/index.ts",
     "./pi-locked-subagents/index.ts",
     "./pi-plan-mode/index.ts",

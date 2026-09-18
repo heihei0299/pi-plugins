@@ -4,7 +4,6 @@ Pi extensions monorepo. Each directory is self-contained; see its own README.
 
 - `pi-locked-subagents/` — config-locked subagents (`subagent(agent, task)`)
 - `pi-plan-mode/` — planning-only variant of Pi plan mode
-- `cpa-codex-ws/` — CPA GPT channels via Pi native Codex Responses WebSocket transport
 - `native-responses-web-search/` — opt-in Standard/Codex Responses native hosted web search channels
 
 ## Install as a Pi package
