@@ -2,6 +2,7 @@
 
 Pi extensions monorepo. Each directory is self-contained; see its own README.
 
+- `jev/` — explicit typed Jev decisions through Vercel AI Gateway (`jev_evaluate`)
 - `pi-locked-subagents/` — config-locked subagents (`subagent(agent, task)`)
 - `pi-plan-mode/` — planning-only variant of Pi plan mode
 - `native-responses-web-search/` — opt-in Standard/Codex Responses native hosted web search channels

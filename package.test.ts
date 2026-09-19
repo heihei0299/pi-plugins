@@ -16,6 +16,7 @@ test("declares the repository as a Pi package with every extension", () => {
   expect(manifest.keywords).toContain("pi-package");
   expect(manifest.pi.extensions).toEqual([
     "./native-responses-web-search/index.ts",
+    "./jev/index.ts",
     "./pi-locked-subagents/index.ts",
     "./pi-plan-mode/index.ts",
   ]);
