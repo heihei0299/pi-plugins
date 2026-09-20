@@ -119,7 +119,7 @@ export function observeToolCall(
     toolCallId: event.toolCallId,
     toolName: event.toolName,
     inputChars: valueChars(event.input),
-    snapshotSequence: state.snapshots.at(-1)?.sequence,
+    afterSnapshotSequence: state.snapshots.at(-1)?.sequence,
     timestamp,
   };
   state.tools.push(record);
@@ -144,7 +144,7 @@ export function observeToolResult(
     toolName: event.toolName,
     inputChars: valueChars(event.input),
     resultChars,
-    snapshotSequence: state.snapshots.at(-1)?.sequence,
+    afterSnapshotSequence: state.snapshots.at(-1)?.sequence,
     timestamp,
   };
   state.tools.push(created);

@@ -31,7 +31,7 @@ export interface ToolRecord {
   toolName: string;
   inputChars: number;
   resultChars?: number;
-  snapshotSequence?: number;
+  afterSnapshotSequence?: number;
   timestamp: number;
 }
 

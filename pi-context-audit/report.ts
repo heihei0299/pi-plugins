@@ -27,8 +27,8 @@ export function formatToolRecords(records: readonly ToolRecord[]): string {
     "Recent large tool results",
     ...large.map((record) => {
       const resultChars = record.resultChars ?? 0;
-      const sequence = record.snapshotSequence === undefined ? "-" : `#${record.snapshotSequence}`;
-      return `- ${record.toolName} (${formatCount(resultChars)} chars, snapshot ${sequence})`;
+      const sequence = record.afterSnapshotSequence === undefined ? "-" : `#${record.afterSnapshotSequence}`;
+      return `- ${record.toolName} (${formatCount(resultChars)} chars, after ${sequence})`;
     }),
   ].join("\n");
 }
@@ -36,7 +36,7 @@ export function formatToolRecords(records: readonly ToolRecord[]): string {
 export function formatSnapshot(snapshot: ContextSnapshot, records: readonly ToolRecord[] = []): string {
   const lines = [
     "Context Audit",
-    `Estimated input: ${formatCount(snapshot.estimatedTokens)} estimated tokens`,
+    `Estimated message context: ${formatCount(snapshot.estimatedTokens)} estimated tokens`,
     snapshot.delta
       ? `Delta: ${formatSigned(snapshot.delta.estimatedTokens)} estimated tokens`
       : "Delta: first snapshot",

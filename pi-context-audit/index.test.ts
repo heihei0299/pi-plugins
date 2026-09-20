@@ -52,7 +52,8 @@ test("context audit observes context and exposes a user command without replacin
 
   await commands.get("context-audit")?.("", ctx);
   expect(notifications[0]).toContain("Context Audit");
-  expect(notifications[0]).toContain("Estimated input:");
+  expect(notifications[0]).toContain("Estimated message context:");
+  expect(notifications[0]).not.toContain("Estimated input:");
   expect(notifications[0]).toContain("user");
   expect(notifications[0]).toContain("tool");
   expect(notifications[0]).toContain("custom");
@@ -103,6 +104,7 @@ test("context audit records tool sizes without retaining tool output", async () 
   contextAuditExtension(pi as any);
 
   const ctx = { ui: { notify(message: string) { notifications.push(message); } } };
+  await handlers.get("context")?.({ type: "context", messages: [{ role: "user", content: "prompt", timestamp: 1 }] }, ctx);
   await handlers.get("tool_call")?.({
     type: "tool_call",
     toolCallId: "call-1",
@@ -121,5 +123,7 @@ test("context audit records tool sizes without retaining tool output", async () 
   await commands.get("context-audit")?.("", ctx);
   expect(notifications[0]).toContain("Recent large tool results");
   expect(notifications[0]).toContain("read");
+  expect(notifications[0]).toContain("after #1");
+  expect(notifications[0]).not.toContain("snapshot #1");
   expect(notifications[0]).not.toContain("x".repeat(100));
 });

@@ -10,4 +10,4 @@ The extension observes outgoing context messages and tool lifecycle events witho
 - `/context-audit recent` — show the bounded list of recent snapshots and estimated deltas.
 - `/context-audit reset` — clear only the audit state.
 
-Token values are deterministic estimates (`ceil(chars / 4)`), not provider-reported or exact token counts. Tool event traffic is observed for size accounting, but no LLM-callable tool is registered.
+Token values are deterministic estimates (`ceil(chars / 4)`) of observed context-message content only. They do not include system-prompt sections, serialized tool schemas, provider/request framing, or provider-reported input tokens. Use provider usage events for billing- and cache-accurate token counts. Tool event traffic is observed for size accounting, but no LLM-callable tool is registered.
