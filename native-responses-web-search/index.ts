@@ -219,7 +219,7 @@ export function normalizeConfig(value: unknown): NormalizedPluginConfig {
         endpoint,
         `config.channels[${index}].nativeTool`,
       ),
-      modelPrefix: modelPrefix ?? "",
+      modelPrefix: (modelPrefix ?? "").trim(),
       model: readChannelModel(
         rawChannel.model,
         `config.channels[${index}].model`,

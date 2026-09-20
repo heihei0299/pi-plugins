@@ -821,3 +821,17 @@ test("aborts nested search immediately if caller signal is already aborted", asy
 
   await expect(tool.execute("call-1", { query: "test" }, controller.signal, undefined, toolContext(model, authRegistry())))
     .rejects.toThrow("web_search aborted");
+});
+
+test("normalizes whitespace-only modelPrefix to empty string", () => {
+  const normalized = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "   ",
+      enabled: true,
+    }],
+  });
+  expect(normalized.channels[0].modelPrefix).toBe("");
+});
+
