@@ -40,6 +40,11 @@ const reviewPacketSchema = Type.Optional(Type.Object({
   scope: Type.String(),
 }, { additionalProperties: false }));
 
+const MAX_REVIEW_PACKET_FILES = 32;
+const MAX_REVIEW_PACKET_REQUIREMENTS = 32;
+const MAX_REVIEW_TASK_KIB = 32;
+const MAX_REVIEW_TASK_BYTES = MAX_REVIEW_TASK_KIB * 1024;
+
 function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -59,16 +64,29 @@ function reviewPacketError(value: unknown): string | null {
   }
   if ((packet.changedFiles as string[]).length === 0) return "Reviewer reviewPacket.changedFiles must not be empty.";
   if ((packet.requirements as string[]).length === 0) return "Reviewer reviewPacket.requirements must not be empty.";
+  if ((packet.changedFiles as string[]).length > MAX_REVIEW_PACKET_FILES) {
+    return `Reviewer reviewPacket.changedFiles must contain at most ${MAX_REVIEW_PACKET_FILES} entries.`;
+  }
+  if ((packet.requirements as string[]).length > MAX_REVIEW_PACKET_REQUIREMENTS) {
+    return `Reviewer reviewPacket.requirements must contain at most ${MAX_REVIEW_PACKET_REQUIREMENTS} entries.`;
+  }
   return null;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function boundedReviewTask(task: string, packet: ReviewPacket): string {
   const list = (values: string[]) => values.length ? values.map((value) => `- ${value}`).join("\n") : "- none reported";
+  const diffCommand = [
+    `git diff ${shellQuote(packet.fixedPoint)}...${shellQuote(packet.currentHead)} --`,
+    ...packet.changedFiles.map(shellQuote),
+  ].join(" ");
   return [
     "Review this bounded change only.",
     "Start from the supplied issue and diff boundary:",
-    `git diff ${packet.fixedPoint}...${packet.currentHead} --`,
-    ...packet.changedFiles.map((file) => `  ${file}`),
+    diffCommand,
     "",
     `Issue: ${packet.issue}`,
     "Requirements:",
@@ -178,12 +196,20 @@ export default function lockedSubagents(pi: ExtensionAPI) {
             details: {},
           };
         }
-        childTask = boundedReviewTask(params.task, params.reviewPacket as ReviewPacket);
+        const reviewTask = boundedReviewTask(params.task, params.reviewPacket as ReviewPacket);
+        if (Buffer.byteLength(reviewTask, "utf8") > MAX_REVIEW_TASK_BYTES) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Reviewer childTask exceeds the ${MAX_REVIEW_TASK_KIB} KiB limit.` }],
+            details: {},
+          };
+        }
+        childTask = reviewTask;
       }
 
       const childDepth = depthNow + 1;
       const allowedAgents = agent.allowedAgents ?? [];
-      const canDelegate = childDepth < limit && allowedAgents.length > 0 && (agent.tools?.includes("subagent") ?? false);
+      const canDelegate = params.agent !== "reviewer" && childDepth < limit && allowedAgents.length > 0 && (agent.tools?.includes("subagent") ?? false);
       const childEnv = childEnvironment(agent, process.env, canDelegate, childDepth);
 
       try {

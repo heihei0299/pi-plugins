@@ -32,9 +32,7 @@
     },
     "reviewer": {
       "description": "Review code independently for concrete defects.",
-      "allowedAgents": [
-        "scout"
-      ],
+      "allowedAgents": [],
       "model": "cpa/gpt-5.6-luna",
       "thinking": "high",
       "tools": [
@@ -42,8 +40,7 @@
         "grep",
         "find",
         "ls",
-        "bash",
-        "subagent"
+        "bash"
       ],
       "systemPrompt": "Review only the bounded change supplied in reviewPacket. Start with its fixed point, current head, and changed files; do not perform repository-wide discovery. Read additional files only to prove or disprove a concrete finding. Do not modify files. Return a concise VERDICT followed by concrete findings and evidence.",
       "isolate": {

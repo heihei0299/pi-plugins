@@ -28,13 +28,14 @@ await writeFile(
   workerPath,
   `#!${process.execPath}
 const task = process.argv.at(-1);
+const args = process.argv.slice(2).join(" ");
 process.stdout.write(task === "return a result"
   ? ${JSON.stringify(mixedProtocolOutput)}
   : JSON.stringify({
       type: "message_end",
       message: {
         role: "assistant",
-        content: [{ type: "text", text: task }],
+        content: [{ type: "text", text: task + "\\nArgs: " + args }],
         stopReason: "stop",
       },
     }) + "\\n");
@@ -46,7 +47,7 @@ await writeFile(configPath, JSON.stringify({
   piBinary: workerPath,
   agents: {
     worker: { model: "test/model" },
-    reviewer: { model: "test/model" },
+    reviewer: { model: "test/model", tools: ["subagent"], allowedAgents: ["worker"] },
   },
 }));
 process.env.PI_LOCKED_SUBAGENTS_CONFIG = configPath;
@@ -71,6 +72,17 @@ function createTool() {
   } as any);
   return tool;
 }
+
+const baseReviewPacket = {
+  issue: "T01 — Review Packet",
+  fixedPoint: "base123",
+  currentHead: "head456",
+  changedFiles: ["pi-locked-subagents/index.ts"],
+  requirements: ["Review only the bounded diff."],
+  checks: ["bun test pi-locked-subagents/index.test.ts"],
+  limitations: ["No live provider run."],
+  scope: "Review this issue/change only.",
+};
 
 afterAll(async () => {
   if (previousConfigPath === undefined) delete process.env.PI_LOCKED_SUBAGENTS_CONFIG;
@@ -108,14 +120,12 @@ test("passes a bounded review packet without embedding a complete diff", async (
       agent: "reviewer",
       task: "Assess the change.",
       reviewPacket: {
-        issue: "T01 — Review Packet",
-        fixedPoint: "base123",
-        currentHead: "head456",
-        changedFiles: ["pi-locked-subagents/index.ts"],
-        requirements: ["Review only the bounded diff."],
-        checks: ["bun test pi-locked-subagents/index.test.ts"],
-        limitations: ["No live provider run."],
-        scope: "Review this issue/change only.",
+        ...baseReviewPacket,
+        changedFiles: [
+          "pi-locked-subagents/index.ts",
+          "path with space/review file.ts",
+          "it's.ts",
+        ],
       },
     },
     undefined,
@@ -126,10 +136,12 @@ test("passes a bounded review packet without embedding a complete diff", async (
   expect(result.isError).not.toBe(true);
   const text = result.content[0].text;
   expect(text).toContain("Issue: T01 — Review Packet");
-  expect(text).toContain("git diff base123...head456");
+  expect(text).toContain("git diff 'base123'...'head456' -- 'pi-locked-subagents/index.ts' 'path with space/review file.ts' 'it'\\''s.ts'");
   expect(text).toContain("pi-locked-subagents/index.ts");
   expect(text).toContain("Do not perform repository-wide discovery.");
   expect(text).toContain("Assess the change.");
+  expect(text).toContain("--no-tools");
+  expect(text).not.toContain("--tools subagent");
 });
 
 test("requires a review packet for reviewer calls", async () => {
@@ -145,4 +157,59 @@ test("requires a review packet for reviewer calls", async () => {
 
   expect(result.isError).toBe(true);
   expect(result.content[0].text).toContain("reviewPacket");
+});
+
+test("rejects review packets with too many files or requirements", async () => {
+  const tool = createTool();
+  const tooManyFiles = await tool.execute(
+    "call-4",
+    {
+      agent: "reviewer",
+      task: "Review the change.",
+      reviewPacket: {
+        ...baseReviewPacket,
+        changedFiles: Array.from({ length: 33 }, (_, index) => `file-${index}.ts`),
+      },
+    },
+    undefined,
+    undefined,
+    { cwd: process.cwd() },
+  );
+  const tooManyRequirements = await tool.execute(
+    "call-5",
+    {
+      agent: "reviewer",
+      task: "Review the change.",
+      reviewPacket: {
+        ...baseReviewPacket,
+        requirements: Array.from({ length: 33 }, (_, index) => `requirement-${index}`),
+      },
+    },
+    undefined,
+    undefined,
+    { cwd: process.cwd() },
+  );
+
+  expect(tooManyFiles.isError).toBe(true);
+  expect(tooManyFiles.content[0].text).toContain("changedFiles");
+  expect(tooManyRequirements.isError).toBe(true);
+  expect(tooManyRequirements.content[0].text).toContain("requirements");
+});
+
+test("rejects a reviewer child task over 32 KiB without truncating it", async () => {
+  const tool = createTool();
+  const result = await tool.execute(
+    "call-6",
+    {
+      agent: "reviewer",
+      task: "x".repeat(32 * 1024),
+      reviewPacket: baseReviewPacket,
+    },
+    undefined,
+    undefined,
+    { cwd: process.cwd() },
+  );
+
+  expect(result.isError).toBe(true);
+  expect(result.content[0].text).toContain("32 KiB");
 });
