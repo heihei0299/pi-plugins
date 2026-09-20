@@ -7,19 +7,22 @@ A Pi extension that exposes a local `web_search` tool backed by a nested Standar
 
 ## Install
 
-Copy the whole plugin directory so its runtime dependency is available to the extension:
+Install the repository root as a Pi package. The root package installs this extension's runtime dependency and loads it with the other four extensions:
 
 ```bash
-mkdir -p ~/.pi/agent/extensions
-cp -r native-responses-web-search ~/.pi/agent/extensions/
-cd ~/.pi/agent/extensions/native-responses-web-search
-pnpm install --prod --ignore-scripts
+pi install git:<host>/<owner>/pi-plugins
 ```
 
-Copy the example configuration only when you do not already have one:
+For a local checkout:
 
 ```bash
-cp native-responses-web-search.example.json ~/.pi/agent/native-responses-web-search.json
+pi install /absolute/path/to/pi-plugins
+```
+
+From a local checkout, copy the example configuration only when you do not already have one:
+
+```bash
+cp native-responses-web-search/native-responses-web-search.example.json ~/.pi/agent/native-responses-web-search.json
 ```
 
 Run `/reload` after configuration changes. Use `/native-web-search` for status.
@@ -79,11 +82,11 @@ Parent provider requests expose only the local `web_search` function tool. They 
 
 Use `/native-web-search` to distinguish configuration errors, missing Responses adapters, model/API mismatches, and tool registration failures. Without a channel `model`, the tool uses the current active model and does not silently select another one; with `model` set, nested requests always use the configured backend model.
 
-No third-party search service or `pi-ai` source change is required. The extension directory must have its `@earendil-works/pi-ai` dependency installed; copying only `index.ts` is not sufficient for runtime adapter imports.
+No third-party search service or `pi-ai` source change is required. The root package installs the required `@earendil-works/pi-ai` runtime dependency.
 
 ## Smoke test
 
-1. Install the whole directory and run `pnpm install --prod --ignore-scripts` inside it. This is the standalone copy flow; the root Pi package has a separate install flow.
+1. Install the repository root as a Pi package.
 2. Configure one enabled channel whose provider/API matches the active model.
 3. Reload Pi and run `/native-web-search`.
 4. Confirm the status reports the configured endpoint, native tool, and `model matches; tool registered`.

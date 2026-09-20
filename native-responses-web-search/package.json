@@ -1,8 +1,0 @@
-{
-  "name": "native-responses-web-search",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@earendil-works/pi-ai": "0.85.1"
-  }
-}

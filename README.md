@@ -22,9 +22,9 @@ For a local checkout:
 pi install /absolute/path/to/pi-plugins
 ```
 
-This installs the root Pi package and loads only the extensions declared in its manifest. A local-path install references the checkout; a Git/package install manages the root package separately and does not recursively install nested package manifests. For standalone deployment of `native-responses-web-search/`, copy the whole directory and follow its README so its runtime dependency is available.
+This installs the root package, its runtime dependencies, and all five extensions declared in its manifest. A local-path install references the checkout; a Git/package install manages the root package separately.
 
-Pi's core extension packages remain peer dependencies supplied by Pi.
+Pi's other core extension packages remain peer dependencies supplied by Pi.
 
 ## Design rule
 
