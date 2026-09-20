@@ -6,7 +6,7 @@ import { join } from "node:path";
 const runDir = await mkdtemp(join(tmpdir(), "pi-locked-subagents-test-"));
 process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = runDir;
 
-const { runChild } = await import("./runner.ts");
+const { DEFAULT_RUN_LIMITS, runChild } = await import("./runner.ts");
 
 const env = { PATH: process.env.PATH ?? "" };
 
@@ -22,7 +22,7 @@ function runScript(
     process.cwd(),
     childEnv,
     undefined,
-    limits,
+    { ...DEFAULT_RUN_LIMITS, ...limits },
     sensitiveEnvNames,
   );
 }
@@ -68,49 +68,82 @@ test("records malformed JSON before a valid final message", async () => {
   expect(result.protocolError).toContain("invalid JSON");
 });
 
+test("parses multiple JSONL events across arbitrary chunks", async () => {
+  const final = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+  });
+  const output = `${JSON.stringify({ type: "message_start" })}\n${final}`;
+  const result = await runScript(
+    `const output = ${JSON.stringify(output)}; process.stdout.write(output.slice(0, 5)); setTimeout(() => process.stdout.write(output.slice(5)), 5)`,
+  );
+
+  expect(result.sawValidMessageEnd).toBe(true);
+  expect(result.finalOutput).toBe("done");
+});
+
 test("stops a worker that exceeds the execution timeout", async () => {
   const result = await runScript(
     `setInterval(() => {}, 1000)`,
-    { timeoutMs: 20, stdoutMaxBytes: 100, stderrMaxBytes: 100, transcriptMaxBytes: 100 },
+    { timeoutMs: 20, stderrMaxBytes: 100, transcriptMaxBytes: 100, parentOutputMaxBytes: 100 },
   );
 
   expect(result.failureReason).toContain("timed out");
 });
 
-test("stops a worker that exceeds the stdout limit", async () => {
+test("streams more than 1 MiB of event traffic before a valid final result", async () => {
+  const event = JSON.stringify({ type: "message_update", message: { role: "assistant", content: [] } }) + "\\n";
+  const final = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+  });
   const result = await runScript(
-    `process.stdout.write("x".repeat(64))`,
-    { timeoutMs: 1000, stdoutMaxBytes: 32, stderrMaxBytes: 100, transcriptMaxBytes: 100 },
+    `process.stdout.write(${JSON.stringify(event)}.repeat(20000)); process.stdout.write(${JSON.stringify(final)})`,
   );
 
-  expect(result.failureReason).toContain("stdout exceeded");
+  expect(result.failureReason).toBeUndefined();
+  expect(result.sawValidMessageEnd).toBe(true);
+  expect(result.finalOutput).toBe("done");
 });
 
-test("stops a worker that exceeds the stderr limit", async () => {
+test("bounds stderr without terminating a healthy worker", async () => {
+  const event = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+  });
   const result = await runScript(
-    `process.stderr.write("x".repeat(64))`,
-    { timeoutMs: 1000, stdoutMaxBytes: 100, stderrMaxBytes: 32, transcriptMaxBytes: 100 },
+    `process.stderr.write("x".repeat(64)); process.stdout.write(${JSON.stringify(event)})`,
+    { timeoutMs: 1000, stderrMaxBytes: 32, transcriptMaxBytes: 100, parentOutputMaxBytes: 100 },
   );
 
-  expect(result.failureReason).toContain("stderr exceeded");
+  expect(result.failureReason).toBeUndefined();
+  expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(32);
+  expect(result.finalOutput).toBe("done");
 });
 
-test("stops a worker before the transcript exceeds its limit", async () => {
+test("truncates the transcript archive without stopping final-state parsing", async () => {
+  const event = JSON.stringify({ type: "message_start" }) + "\\n";
+  const final = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+  });
   const result = await runScript(
-    `process.stdout.write("x".repeat(64))`,
-    { timeoutMs: 1000, stdoutMaxBytes: 100, stderrMaxBytes: 100, transcriptMaxBytes: 32 },
+    `process.stdout.write(${JSON.stringify(event)}.repeat(100)); process.stdout.write(${JSON.stringify(final)})`,
+    { timeoutMs: 1000, stderrMaxBytes: 100, transcriptMaxBytes: 32, parentOutputMaxBytes: 100 },
   );
   const transcript = await readFile(result.transcriptPath);
 
-  expect(result.failureReason).toContain("transcript exceeded");
+  expect(result.failureReason).toBeUndefined();
+  expect(result.transcriptTruncated).toBe(true);
   expect(transcript.byteLength).toBeLessThanOrEqual(32);
+  expect(result.finalOutput).toBe("done");
 });
 
 test("redacts explicitly passed credentials from the transcript", async () => {
   const secret = "super-secret-provider-key";
   const result = await runScript(
     `process.stdout.write(process.env.OPENAI_API_KEY ?? "")`,
-    { timeoutMs: 1000, stdoutMaxBytes: 100, stderrMaxBytes: 100, transcriptMaxBytes: 100 },
+    { timeoutMs: 1000, stderrMaxBytes: 100, transcriptMaxBytes: 100, parentOutputMaxBytes: 100 },
     { ...env, OPENAI_API_KEY: secret },
     ["OPENAI_API_KEY"],
   );
@@ -128,13 +161,49 @@ test("redacts explicitly passed credentials from the transcript", async () => {
   });
   const resultWithSecretFields = await runScript(
     `process.stdout.write(${JSON.stringify(event)})`,
-    { timeoutMs: 1000, stdoutMaxBytes: 1000, stderrMaxBytes: 100, transcriptMaxBytes: 1000 },
+    { timeoutMs: 1000, stderrMaxBytes: 100, transcriptMaxBytes: 1000, parentOutputMaxBytes: 1000 },
     { ...env, OPENAI_API_KEY: secret },
     ["OPENAI_API_KEY"],
   );
 
   expect(resultWithSecretFields.finalOutput).not.toContain(secret);
   expect(resultWithSecretFields.stopReason).not.toContain(secret);
+});
+
+test("projects oversized final output to the parent and keeps a complete sidecar", async () => {
+  const text = "z".repeat(2000);
+  const event = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
+  });
+  const result = await runScript(
+    `process.stdout.write(${JSON.stringify(event)})`,
+    { timeoutMs: 1000, stderrMaxBytes: 100, transcriptMaxBytes: 10000, parentOutputMaxBytes: 256 },
+  );
+
+  expect(result.projected).toBe(true);
+  expect(result.outputPath).toBeDefined();
+  expect(result.finalOutputBytes).toBe(Buffer.byteLength(text));
+  expect(result.parentOutputBytes).toBeLessThanOrEqual(256);
+  expect(result.finalOutput).toContain("[output projected:");
+  expect(result.finalOutput).toContain("Full output:");
+  expect(await readFile(result.outputPath!, "utf8")).toBe(text);
+});
+
+test("terminates an aborted worker", async () => {
+  const controller = new AbortController();
+  const promise = runChild(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"],
+    process.cwd(),
+    env,
+    controller.signal,
+    { ...DEFAULT_RUN_LIMITS, timeoutMs: 1000 },
+  );
+  setTimeout(() => controller.abort(), 20);
+  const result = await promise;
+
+  expect(result.failureReason).toContain("aborted");
 });
 
 test("accepts a valid final message_end", async () => {

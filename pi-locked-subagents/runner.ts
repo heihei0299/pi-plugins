@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { RUN_DIR, type AgentConfig } from "./config.ts";
+import { JsonlParser } from "./stream-parser.ts";
 
 const DEFAULT_SYSTEM_PROMPT =
   "You are a focused subagent. Complete the assigned task independently. " +
@@ -67,16 +68,16 @@ function assistantMessageInfo(message: unknown): AssistantMessageInfo | null {
 
 export interface RunLimits {
   timeoutMs: number;
-  stdoutMaxBytes: number;
   stderrMaxBytes: number;
   transcriptMaxBytes: number;
+  parentOutputMaxBytes: number;
 }
 
 export const DEFAULT_RUN_LIMITS: RunLimits = {
   timeoutMs: 120_000,
-  stdoutMaxBytes: 1_048_576,
-  stderrMaxBytes: 262_144,
-  transcriptMaxBytes: 1_048_576,
+  stderrMaxBytes: 256 * 1024,
+  transcriptMaxBytes: 8 * 1024 * 1024,
+  parentOutputMaxBytes: 24 * 1024,
 };
 
 const SENSITIVE_ENV_NAME = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|PRIVATE)/i;
@@ -97,6 +98,75 @@ function redactText(text: string, values: string[]): string {
   return values.reduce((result, value) => result.split(value).join("[redacted]"), text);
 }
 
+function truncateUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const bytes = Buffer.from(text);
+  if (bytes.byteLength <= maxBytes) return text;
+  let result = bytes.subarray(0, maxBytes).toString("utf8");
+  while (Buffer.byteLength(result, "utf8") > maxBytes) result = result.slice(0, -1);
+  return result;
+}
+
+function appendBoundedUtf8(current: string, chunk: string, maxBytes: number): string {
+  if (Buffer.byteLength(current, "utf8") >= maxBytes) return current;
+  return truncateUtf8(current + chunk, maxBytes);
+}
+
+function tailUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const bytes = Buffer.from(text);
+  if (bytes.byteLength <= maxBytes) return text;
+  let result = bytes.subarray(bytes.byteLength - maxBytes).toString("utf8");
+  if (result.startsWith("�")) result = result.slice(1);
+  return result;
+}
+
+function headTailProjection(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const separator = "\n...\n";
+  const available = Math.max(0, maxBytes - Buffer.byteLength(separator, "utf8"));
+  const headBytes = Math.ceil(available / 2);
+  const tailBytes = Math.floor(available / 2);
+  return `${truncateUtf8(text, headBytes)}${separator}${tailUtf8(text, tailBytes)}`;
+}
+
+function projectOutput(text: string, maxBytes: number, outputPath: string): string {
+  const originalBytes = Buffer.byteLength(text, "utf8");
+  let visibleBytes = maxBytes;
+  let projected = "";
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const marker = `[output projected: ${originalBytes} bytes → ${visibleBytes} bytes]\nFull output: ${outputPath}\n`;
+    projected = truncateUtf8(
+      marker + headTailProjection(text, maxBytes - Buffer.byteLength(marker, "utf8")),
+      maxBytes,
+    );
+    const nextVisibleBytes = Buffer.byteLength(projected, "utf8");
+    if (nextVisibleBytes === visibleBytes) return projected;
+    visibleBytes = nextVisibleBytes;
+  }
+
+  return projected;
+}
+
+export interface RunChildResult {
+  code: number | null;
+  finalOutput: string;
+  stderr: string;
+  transcriptPath: string;
+  stopReason?: string;
+  errorMessage?: string;
+  sawValidMessageEnd: boolean;
+  protocolError?: string;
+  failureReason?: string;
+  transcriptTruncated: boolean;
+  finalOutputBytes: number;
+  parentOutputBytes: number;
+  outputPath?: string;
+  projected: boolean;
+}
+
 export async function runChild(
   binary: string,
   args: string[],
@@ -105,21 +175,11 @@ export async function runChild(
   signal?: AbortSignal,
   limits: RunLimits = DEFAULT_RUN_LIMITS,
   sensitiveEnvNames: string[] = [],
-) {
+): Promise<RunChildResult> {
   await mkdir(RUN_DIR, { recursive: true, mode: 0o700 });
   const transcriptPath = join(RUN_DIR, `${Date.now()}-${randomUUID()}.jsonl`);
 
-  return new Promise<{
-    code: number | null;
-    finalOutput: string;
-    stderr: string;
-    transcriptPath: string;
-    stopReason?: string;
-    errorMessage?: string;
-    sawValidMessageEnd: boolean;
-    protocolError?: string;
-    failureReason?: string;
-  }>((resolve, reject) => {
+  return new Promise<RunChildResult>((resolve, reject) => {
     const transcript = createWriteStream(transcriptPath, { encoding: "utf8", mode: 0o600 });
     const child = spawn(binary, args, {
       cwd,
@@ -131,11 +191,8 @@ export async function runChild(
     let settled = false;
     let finalOutput = "";
     let stderr = "";
-    let stderrBytes = 0;
-    let stdoutBytes = 0;
-    let transcriptSourceBytes = 0;
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
+    let transcriptBytes = 0;
+    let transcriptTruncated = false;
     let stopReason: string | undefined;
     let errorMessage: string | undefined;
     let sawValidMessageEnd = false;
@@ -160,7 +217,27 @@ export async function runChild(
       forceKillTimer = setTimeout(() => terminate("SIGKILL"), 250);
     };
 
-    const parseLine = (line: string) => {
+    const writeTranscriptLine = (line: string, terminated: boolean) => {
+      if (transcriptTruncated) return;
+      const text = redactText(line + (terminated ? "\n" : ""), redactions);
+      const bytes = Buffer.from(text);
+      const remaining = limits.transcriptMaxBytes - transcriptBytes;
+      if (remaining <= 0) {
+        transcriptTruncated = true;
+        return;
+      }
+      if (bytes.byteLength > remaining) {
+        transcript.write(bytes.subarray(0, remaining));
+        transcriptBytes += remaining;
+        transcriptTruncated = true;
+        return;
+      }
+      transcript.write(bytes);
+      transcriptBytes += bytes.byteLength;
+    };
+
+    const parseLine = (line: string, terminated: boolean) => {
+      writeTranscriptLine(line, terminated);
       if (!line.trim()) return;
       try {
         const event = JSON.parse(line) as { type?: string; message?: unknown };
@@ -168,9 +245,9 @@ export async function runChild(
           const info = assistantMessageInfo(event.message);
           if (info) {
             sawValidMessageEnd = true;
-            if (info.text !== null) finalOutput = info.text;
-            if (info.stopReason !== undefined) stopReason = info.stopReason;
-            if (info.errorMessage !== undefined) errorMessage = info.errorMessage;
+            if (info.text !== null) finalOutput = redactText(info.text, redactions);
+            if (info.stopReason !== undefined) stopReason = redactText(info.stopReason, redactions);
+            if (info.errorMessage !== undefined) errorMessage = redactText(info.errorMessage, redactions);
           }
         }
       } catch {
@@ -178,32 +255,20 @@ export async function runChild(
       }
     };
 
+    const parser = new JsonlParser((line, terminated) => {
+      if (settled || failureReason) return;
+      parseLine(line, terminated);
+    });
+
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       if (settled || failureReason) return;
-      const bytes = Buffer.from(chunk);
-      if (stdoutBytes + bytes.byteLength > limits.stdoutMaxBytes) {
-        stop(`subagent stdout exceeded ${limits.stdoutMaxBytes} bytes`);
-        return;
-      }
-      if (transcriptSourceBytes + bytes.byteLength > limits.transcriptMaxBytes) {
-        stop(`subagent transcript exceeded ${limits.transcriptMaxBytes} bytes`);
-        return;
-      }
-      stdoutChunks.push(bytes);
-      stdoutBytes += bytes.byteLength;
-      transcriptSourceBytes += bytes.byteLength;
+      parser.push(chunk);
     });
     child.stderr.on("data", (chunk: string) => {
-      if (settled || failureReason) return;
-      const bytes = Buffer.from(chunk);
-      if (stderrBytes + bytes.byteLength > limits.stderrMaxBytes) {
-        stop(`subagent stderr exceeded ${limits.stderrMaxBytes} bytes`);
-        return;
-      }
-      stderrChunks.push(bytes);
-      stderrBytes += bytes.byteLength;
+      if (settled) return;
+      stderr = appendBoundedUtf8(stderr, chunk, limits.stderrMaxBytes);
     });
 
     const abort = () => stop("subagent aborted");
@@ -240,41 +305,53 @@ export async function runChild(
       if (forceKillTimer) clearTimeout(forceKillTimer);
       signal?.removeEventListener("abort", abort);
 
-      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
-      if (!failureReason) {
-        for (const line of stdout.split("\n")) parseLine(line);
-      }
-      const safeTranscript = Buffer.from(redactText(stdout, redactions));
-      if (safeTranscript.byteLength > limits.transcriptMaxBytes) {
-        failureReason ??= `subagent transcript exceeded ${limits.transcriptMaxBytes} bytes`;
-      }
-      const transcriptOutput = safeTranscript.subarray(0, limits.transcriptMaxBytes);
-      if (transcriptOutput.byteLength > 0) transcript.write(transcriptOutput);
+      if (!failureReason) parser.finish();
+      const finalOutputBytes = Buffer.byteLength(finalOutput, "utf8");
+      let outputPath: string | undefined;
+      let projected = false;
 
-      stderr = redactText(Buffer.concat(stderrChunks).toString("utf8"), redactions);
-      if (Buffer.byteLength(stderr, "utf8") > limits.stderrMaxBytes) {
-        stderr = Buffer.from(stderr).subarray(0, limits.stderrMaxBytes).toString("utf8");
-      }
-      finalOutput = redactText(finalOutput, redactions);
-      errorMessage = errorMessage === undefined ? undefined : redactText(errorMessage, redactions);
-      stopReason = stopReason === undefined ? undefined : redactText(stopReason, redactions);
-      transcript.end(() => {
+      const finish = async () => {
+        let parentOutput = finalOutput;
+        if (finalOutputBytes > limits.parentOutputMaxBytes) {
+          outputPath = join(RUN_DIR, `${Date.now()}-${randomUUID()}.txt`);
+          await writeFile(outputPath, finalOutput, { encoding: "utf8", mode: 0o600 });
+          parentOutput = projectOutput(finalOutput, limits.parentOutputMaxBytes, outputPath);
+          projected = true;
+        }
+
+        stderr = redactText(stderr, redactions);
+        transcript.end(() => {
+          if (settled) return;
+          settled = true;
+          if (!failureReason && !sawValidMessageEnd) {
+            protocolError ??= "worker exited without a valid message_end event";
+          }
+          resolve({
+            code,
+            finalOutput: parentOutput,
+            stderr,
+            transcriptPath,
+            stopReason,
+            errorMessage,
+            sawValidMessageEnd,
+            protocolError,
+            failureReason,
+            transcriptTruncated,
+            finalOutputBytes,
+            parentOutputBytes: Buffer.byteLength(parentOutput, "utf8"),
+            outputPath,
+            projected,
+          });
+        });
+      };
+
+      void finish().catch((err: unknown) => {
         if (settled) return;
         settled = true;
-        if (!failureReason && !sawValidMessageEnd) {
-          protocolError ??= "worker exited without a valid message_end event";
-        }
-        resolve({
-          code,
-          finalOutput,
-          stderr,
-          transcriptPath,
-          stopReason,
-          errorMessage,
-          sawValidMessageEnd,
-          protocolError,
-          failureReason,
-        });
+        transcript.destroy();
+        reject(new Error(`Failed to persist subagent output: ${err instanceof Error ? err.message : String(err)}`, {
+          cause: err,
+        }));
       });
     });
   });

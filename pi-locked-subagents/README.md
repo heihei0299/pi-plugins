@@ -61,11 +61,13 @@ The child receives a small default environment (`HOME`, `PATH`, locale/terminal 
 Each worker has these fixed defaults:
 
 - execution timeout: 120 seconds;
-- stdout limit: 1 MiB;
-- stderr limit: 256 KiB;
-- transcript limit: 1 MiB.
+- bounded stderr retained: 256 KiB;
+- transcript archive: 8 MiB;
+- parent-visible final output: 24 KiB.
 
-A timeout or output limit terminates the worker and returns a failure. Transcripts are written below `~/.pi/agent/subagent-runs` (or `PI_LOCKED_SUBAGENTS_RUN_DIR`) with restricted directory/file permissions. A worker succeeds only when it exits normally and emits a valid final `message_end` event; a zero exit code alone is not sufficient.
+Child JSONL stdout is parsed and archived incrementally, so event-stream volume is not treated as the final reviewer-result size and does not trigger the old 1 MiB stdout kill switch. When the transcript archive reaches its limit, additional lines are not archived, `transcriptTruncated` is reported, and the worker continues so its final state can still be parsed. Stderr is retained only up to its bound and does not terminate a healthy worker by itself.
+
+If the final assistant text exceeds the parent-visible limit, the complete redacted text is written to a restricted sidecar file below `~/.pi/agent/subagent-runs` (or `PI_LOCKED_SUBAGENTS_RUN_DIR`). The parent receives a bounded head/tail projection with the sidecar path, and result details include `outputPath`, `projected`, and the byte counts. Transcripts use the same restricted directory/file permissions. A worker succeeds only when it exits normally and emits a valid final `message_end` event; a zero exit code alone is not sufficient.
 
 The transcript path is included in failure details for diagnosis. Error messages do not copy the child environment or credential values.
 
