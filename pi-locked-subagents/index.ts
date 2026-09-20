@@ -18,6 +18,78 @@ import {
   truncateUtf8,
 } from "./runner.ts";
 
+type ReviewPacket = {
+  issue: string;
+  fixedPoint: string;
+  currentHead: string;
+  changedFiles: string[];
+  requirements: string[];
+  checks: string[];
+  limitations: string[];
+  scope: string;
+};
+
+const reviewPacketSchema = Type.Optional(Type.Object({
+  issue: Type.String(),
+  fixedPoint: Type.String(),
+  currentHead: Type.String(),
+  changedFiles: Type.Array(Type.String()),
+  requirements: Type.Array(Type.String()),
+  checks: Type.Array(Type.String()),
+  limitations: Type.Array(Type.String()),
+  scope: Type.String(),
+}, { additionalProperties: false }));
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function stringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(nonEmptyString);
+}
+
+function reviewPacketError(value: unknown): string | null {
+  if (!value || typeof value !== "object") return "Reviewer calls require a reviewPacket.";
+  const packet = value as Record<string, unknown>;
+  for (const field of ["issue", "fixedPoint", "currentHead", "scope"]) {
+    if (!nonEmptyString(packet[field])) return `Reviewer reviewPacket.${field} must be a non-empty string.`;
+  }
+  for (const field of ["changedFiles", "requirements", "checks", "limitations"]) {
+    if (!stringList(packet[field])) return `Reviewer reviewPacket.${field} must be an array of non-empty strings.`;
+  }
+  if ((packet.changedFiles as string[]).length === 0) return "Reviewer reviewPacket.changedFiles must not be empty.";
+  if ((packet.requirements as string[]).length === 0) return "Reviewer reviewPacket.requirements must not be empty.";
+  return null;
+}
+
+function boundedReviewTask(task: string, packet: ReviewPacket): string {
+  const list = (values: string[]) => values.length ? values.map((value) => `- ${value}`).join("\n") : "- none reported";
+  return [
+    "Review this bounded change only.",
+    "Start from the supplied issue and diff boundary:",
+    `git diff ${packet.fixedPoint}...${packet.currentHead} --`,
+    ...packet.changedFiles.map((file) => `  ${file}`),
+    "",
+    `Issue: ${packet.issue}`,
+    "Requirements:",
+    list(packet.requirements),
+    "",
+    "Verification state — checks already performed:",
+    list(packet.checks),
+    "Known limitations:",
+    list(packet.limitations),
+    "",
+    `Scope: ${packet.scope}`,
+    "Do not perform repository-wide discovery.",
+    "Read additional files only to prove or disprove a concrete finding.",
+    "Do not inline or reproduce the complete diff in the response.",
+    "Return a concise VERDICT followed by findings and evidence; do not provide an exploration diary.",
+    "",
+    "Parent task:",
+    task,
+  ].join("\n");
+}
+
 export default function lockedSubagents(pi: ExtensionAPI) {
   const startupConfig = loadConfigSnapshot();
   const depth = currentDepth();
@@ -28,6 +100,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
     "Delegate a self-contained task to a configured isolated subagent.",
     "Use the matching role directly; do not inspect the filesystem to discover subagents.",
     "Model, thinking, tools, system prompt, and policy are locked locally.",
+    "Reviewer calls must include a bounded reviewPacket with the issue, fixed/current heads, changed files, requirements, verification state, and scope.",
     catalog ? `Available subagents:\n${catalog}` : "",
   ].filter(Boolean).join("\n\n");
 
@@ -49,6 +122,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
       task: Type.String({
         description: "Complete self-contained task with enough context for independent execution.",
       }),
+      reviewPacket: reviewPacketSchema,
     }, { additionalProperties: false }),
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -94,6 +168,19 @@ export default function lockedSubagents(pi: ExtensionAPI) {
         };
       }
 
+      let childTask = params.task;
+      if (params.agent === "reviewer") {
+        const packetError = reviewPacketError(params.reviewPacket);
+        if (packetError) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: packetError }],
+            details: {},
+          };
+        }
+        childTask = boundedReviewTask(params.task, params.reviewPacket as ReviewPacket);
+      }
+
       const childDepth = depthNow + 1;
       const allowedAgents = agent.allowedAgents ?? [];
       const canDelegate = childDepth < limit && allowedAgents.length > 0 && (agent.tools?.includes("subagent") ?? false);
@@ -102,7 +189,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
       try {
         const result = await runChild(
           config.piBinary || process.env.PI_BINARY || "pi",
-          childArgs(agent, params.task, canDelegate),
+          childArgs(agent, childTask, canDelegate),
           ctx.cwd,
           childEnv,
           signal,

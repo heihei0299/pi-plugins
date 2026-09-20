@@ -80,4 +80,6 @@ Call the registered tool with a configured role and a self-contained task:
 subagent(agent="worker", task="Inspect the parser and add a focused regression test.")
 ```
 
+Calls to the configured `reviewer` role also require a `reviewPacket` containing `issue`, `fixedPoint`, `currentHead`, `changedFiles`, `requirements`, `checks`, `limitations`, and `scope`. The parent turns that packet into a bounded task: the reviewer starts with `git diff <fixedPoint>...<currentHead> -- <changedFiles>`, avoids repository-wide discovery, and reads extra files only for a concrete finding.
+
 Configuration errors, unknown roles, depth-limit violations, nonzero/aborted/timed-out workers, incomplete protocol state, and a JSONL single-line hard-limit violation return an error instead of reporting success. The transcript archive and parent-output limits are soft boundaries: a transcript over 8 MiB is truncated while parsing continues, a final output or failure diagnostic over 24 KiB is projected to a redacted sidecar, and bounded stderr alone does not fail a healthy worker.

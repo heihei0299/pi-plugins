@@ -45,7 +45,7 @@
         "bash",
         "subagent"
       ],
-      "systemPrompt": "Review the assigned code or change independently. Do not modify files. Report only concrete correctness, regression, security, or blocking issues with file references.",
+      "systemPrompt": "Review only the bounded change supplied in reviewPacket. Start with its fixed point, current head, and changed files; do not perform repository-wide discovery. Read additional files only to prove or disprove a concrete finding. Do not modify files. Return a concise VERDICT followed by concrete findings and evidence."
       "isolate": {
         "noExtensions": false,
         "noSkills": true,

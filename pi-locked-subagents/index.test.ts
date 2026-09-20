@@ -26,20 +26,37 @@ const mixedProtocolOutput = [
 ].join("\n") + "\n";
 await writeFile(
   workerPath,
-  `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(mixedProtocolOutput)})\n`,
+  `#!${process.execPath}
+const task = process.argv.at(-1);
+process.stdout.write(task === "return a result"
+  ? ${JSON.stringify(mixedProtocolOutput)}
+  : JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: task }],
+        stopReason: "stop",
+      },
+    }) + "\\n");
+`,
   { mode: 0o700 },
 );
 await chmod(workerPath, 0o700);
 await writeFile(configPath, JSON.stringify({
   piBinary: workerPath,
-  agents: { worker: { model: "test/model" } },
+  agents: {
+    worker: { model: "test/model" },
+    reviewer: { model: "test/model" },
+  },
 }));
 process.env.PI_LOCKED_SUBAGENTS_CONFIG = configPath;
 process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = root;
 
 mock.module("typebox", () => ({
   Type: {
+    Array: (items: unknown) => items,
     Object: (properties: unknown) => properties,
+    Optional: (schema: unknown) => schema,
     String: (options: unknown) => options,
   },
 }));
@@ -75,4 +92,60 @@ test("reports malformed output before a valid message_end as failed", async () =
 
   expect(result.isError).toBe(true);
   expect(result.content[0].text).toContain("invalid JSON");
+});
+
+test("passes a bounded review packet without embedding a complete diff", async () => {
+  let tool: any;
+  lockedSubagents({
+    registerTool(value: unknown) { tool = value; },
+    registerCommand() {},
+  } as any);
+
+  const result = await tool.execute(
+    "call-2",
+    {
+      agent: "reviewer",
+      task: "Assess the change.",
+      reviewPacket: {
+        issue: "T01 — Review Packet",
+        fixedPoint: "base123",
+        currentHead: "head456",
+        changedFiles: ["pi-locked-subagents/index.ts"],
+        requirements: ["Review only the bounded diff."],
+        checks: ["bun test pi-locked-subagents/index.test.ts"],
+        limitations: ["No live provider run."],
+        scope: "Review this issue/change only.",
+      },
+    },
+    undefined,
+    undefined,
+    { cwd: process.cwd() },
+  );
+
+  expect(result.isError).not.toBe(true);
+  const text = result.content[0].text;
+  expect(text).toContain("Issue: T01 — Review Packet");
+  expect(text).toContain("git diff base123...head456");
+  expect(text).toContain("pi-locked-subagents/index.ts");
+  expect(text).toContain("Do not perform repository-wide discovery.");
+  expect(text).toContain("Assess the change.");
+});
+
+test("requires a review packet for reviewer calls", async () => {
+  let tool: any;
+  lockedSubagents({
+    registerTool(value: unknown) { tool = value; },
+    registerCommand() {},
+  } as any);
+
+  const result = await tool.execute(
+    "call-3",
+    { agent: "reviewer", task: "Review the change." },
+    undefined,
+    undefined,
+    { cwd: process.cwd() },
+  );
+
+  expect(result.isError).toBe(true);
+  expect(result.content[0].text).toContain("reviewPacket");
 });
