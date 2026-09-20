@@ -3,6 +3,7 @@ import {
   addNativeWebSearch,
   formatStatus,
   installNativeResponsesWebSearch,
+  NESTED_SEARCH_TIMEOUT_MS,
   normalizeConfig,
 } from "./index.ts";
 
@@ -867,6 +868,19 @@ test("aborts nested search if authentication blocks and caller aborts", async ()
   await expect(executePromise).rejects.toThrow("web_search aborted");
 });
 
+async function withFastTimeout<T>(
+  fastTimeoutMs: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const originalTimeout = AbortSignal.timeout;
+  AbortSignal.timeout = () => originalTimeout(fastTimeoutMs);
+  try {
+    return await fn();
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+  }
+}
+
 test("times out nested search if authentication blocks and timeout expires", async () => {
   const h = pluginHarness();
   const channelConfig = normalizeConfig({
@@ -877,13 +891,9 @@ test("times out nested search if authentication blocks and timeout expires", asy
       enabled: true,
     }],
   });
-  installNativeResponsesWebSearch(
-    h.pi,
-    channelConfig,
-    "/tmp/config",
-    { codex: h.adapter as any },
-    { timeoutMs: 15 },
-  );
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: h.adapter as any,
+  });
 
   const tool = h.tools.find((t: any) => t.name === "web_search");
   const blockingRegistry = {
@@ -891,14 +901,16 @@ test("times out nested search if authentication blocks and timeout expires", asy
   };
 
   await expect(
-    tool.execute(
-      "call-1",
-      { query: "test" },
-      undefined,
-      undefined,
-      toolContext(model, blockingRegistry),
+    withFastTimeout(15, () =>
+      tool.execute(
+        "call-1",
+        { query: "test" },
+        undefined,
+        undefined,
+        toolContext(model, blockingRegistry),
+      ),
     ),
-  ).rejects.toThrow("web_search request timed out after 15 ms");
+  ).rejects.toThrow(`web_search request timed out after ${NESTED_SEARCH_TIMEOUT_MS} ms`);
 });
 
 test("aborts nested search if stream.result blocks and caller aborts", async () => {
@@ -946,25 +958,23 @@ test("times out nested search if stream.result blocks and timeout expires", asyn
       enabled: true,
     }],
   });
-  installNativeResponsesWebSearch(
-    h.pi,
-    channelConfig,
-    "/tmp/config",
-    { codex: blockingAdapter as any },
-    { timeoutMs: 15 },
-  );
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: blockingAdapter as any,
+  });
 
   const tool = h.tools.find((t: any) => t.name === "web_search");
 
   await expect(
-    tool.execute(
-      "call-1",
-      { query: "test" },
-      undefined,
-      undefined,
-      toolContext(model, authRegistry()),
+    withFastTimeout(15, () =>
+      tool.execute(
+        "call-1",
+        { query: "test" },
+        undefined,
+        undefined,
+        toolContext(model, authRegistry()),
+      ),
     ),
-  ).rejects.toThrow("web_search request timed out after 15 ms");
+  ).rejects.toThrow(`web_search request timed out after ${NESTED_SEARCH_TIMEOUT_MS} ms`);
 });
 
 test("maps underlying AbortError to caller abort error when caller aborts", async () => {
@@ -1022,25 +1032,23 @@ test("maps underlying AbortError to timeout error when timeout expires", async (
       enabled: true,
     }],
   });
-  installNativeResponsesWebSearch(
-    h.pi,
-    channelConfig,
-    "/tmp/config",
-    { codex: rejectingAdapter as any },
-    { timeoutMs: 15 },
-  );
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: rejectingAdapter as any,
+  });
 
   const tool = h.tools.find((t: any) => t.name === "web_search");
 
   await expect(
-    tool.execute(
-      "call-1",
-      { query: "test" },
-      undefined,
-      undefined,
-      toolContext(model, authRegistry()),
+    withFastTimeout(15, () =>
+      tool.execute(
+        "call-1",
+        { query: "test" },
+        undefined,
+        undefined,
+        toolContext(model, authRegistry()),
+      ),
     ),
-  ).rejects.toThrow("web_search request timed out after 15 ms");
+  ).rejects.toThrow(`web_search request timed out after ${NESTED_SEARCH_TIMEOUT_MS} ms`);
 });
 
 test("preserves non-cancellation rejection from underlying adapter", async () => {

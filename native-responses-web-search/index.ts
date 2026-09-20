@@ -446,7 +446,6 @@ function registerLocalWebSearch(
   channel: NormalizedWebSearchChannel,
   adapter: NativeStreamSimple,
   runtime: RuntimeStatus,
-  timeoutMs: number = NESTED_SEARCH_TIMEOUT_MS,
 ): void {
   pi.registerTool({
     name: "web_search",
@@ -483,7 +482,7 @@ function registerLocalWebSearch(
         throw new Error("web_search aborted");
       }
 
-      const timeoutSignal = AbortSignal.timeout(timeoutMs);
+      const timeoutSignal = AbortSignal.timeout(NESTED_SEARCH_TIMEOUT_MS);
       const requestSignal = callerSignal
         ? AbortSignal.any([callerSignal, timeoutSignal])
         : timeoutSignal;
@@ -493,7 +492,9 @@ function registerLocalWebSearch(
           throw new Error("web_search aborted");
         }
         if (timeoutSignal.aborted) {
-          throw new Error(`web_search request timed out after ${timeoutMs} ms`);
+          throw new Error(
+            `web_search request timed out after ${NESTED_SEARCH_TIMEOUT_MS} ms`,
+          );
         }
         if (requestSignal.aborted) {
           throw new Error("web_search aborted");
@@ -669,16 +670,11 @@ function registerConfigErrorStatus(
   });
 }
 
-export interface WebSearchInstallOptions {
-  timeoutMs?: number;
-}
-
 export function installNativeResponsesWebSearch(
   pi: PluginAPI,
   config: NormalizedPluginConfig,
   configPath = CONFIG_PATH,
   adapters: StreamAdapters = {},
-  options?: WebSearchInstallOptions,
 ): void {
   const runtime: RuntimeStatus = { ...DEFAULT_RUNTIME_STATUS };
   const activeChannels = getActiveChannels(config);
@@ -700,13 +696,7 @@ export function installNativeResponsesWebSearch(
     }
 
     try {
-      registerLocalWebSearch(
-        pi,
-        channel,
-        nativeStream,
-        runtime,
-        options?.timeoutMs ?? NESTED_SEARCH_TIMEOUT_MS,
-      );
+      registerLocalWebSearch(pi, channel, nativeStream, runtime);
     } catch (error: unknown) {
       runtime.toolRegistration = "unavailable";
       const message = error instanceof Error ? error.message : String(error);
