@@ -136,7 +136,7 @@ test("passes a bounded review packet without embedding a complete diff", async (
   expect(result.isError).not.toBe(true);
   const text = result.content[0].text;
   expect(text).toContain("Issue: T01 — Review Packet");
-  expect(text).toContain("git diff 'base123'...'head456' -- 'pi-locked-subagents/index.ts' 'path with space/review file.ts' 'it'\\''s.ts'");
+  expect(text).toContain("git --literal-pathspecs diff 'base123'...'head456' -- 'pi-locked-subagents/index.ts' 'path with space/review file.ts' 'it'\\''s.ts'");
   expect(text).toContain("pi-locked-subagents/index.ts");
   expect(text).toContain("Do not perform repository-wide discovery.");
   expect(text).toContain("Assess the change.");

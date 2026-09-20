@@ -80,7 +80,7 @@ function shellQuote(value: string): string {
 function boundedReviewTask(task: string, packet: ReviewPacket): string {
   const list = (values: string[]) => values.length ? values.map((value) => `- ${value}`).join("\n") : "- none reported";
   const diffCommand = [
-    `git diff ${shellQuote(packet.fixedPoint)}...${shellQuote(packet.currentHead)} --`,
+    `git --literal-pathspecs diff ${shellQuote(packet.fixedPoint)}...${shellQuote(packet.currentHead)} --`,
     ...packet.changedFiles.map(shellQuote),
   ].join(" ");
   return [
