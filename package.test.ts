@@ -22,13 +22,13 @@ test("declares the repository as a Pi package with every extension", () => {
     "./pi-context-audit/index.ts",
   ]);
   expect(manifest.peerDependencies).toMatchObject({
-    "@earendil-works/pi-agent-core": "0.85.1",
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
-    "@earendil-works/pi-tui": "0.85.1",
-    "@sinclair/typebox": "0.34.52",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     typebox: "1.3.31",
   });
+  expect(manifest.peerDependencies).not.toHaveProperty("@sinclair/typebox");
 });
 
 test("does not keep the obsolete CLIProxyAPI native plugin", () => {
