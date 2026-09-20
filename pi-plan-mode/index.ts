@@ -271,10 +271,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    if (pi.getFlag("plan") === true) {
-      planModeEnabled = true;
-    }
-
     const entries = ctx.sessionManager.getEntries();
     const state = entries
       .filter((entry: { type: string; customType?: string }) =>
@@ -284,6 +280,10 @@ export default function planModeExtension(pi: ExtensionAPI): void {
     if (state?.data) {
       planModeEnabled = state.data.enabled ?? planModeEnabled;
       toolsBeforePlanMode = state.data.toolsBeforePlanMode ?? toolsBeforePlanMode;
+    }
+
+    if (pi.getFlag("plan") === true) {
+      planModeEnabled = true;
     }
 
     if (planModeEnabled) {

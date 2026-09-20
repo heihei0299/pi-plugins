@@ -208,6 +208,29 @@ test("uses current configuration after session restore and restores previous too
   expect(pi.getActiveTools()).toEqual(["read", "write"]);
 });
 
+test("explicit --plan flag takes precedence over historical session state with enabled: false", async () => {
+  const pi = createPi();
+  pi.getFlag = (flag: string) => flag === "plan";
+  planModeExtension(pi as any);
+  const ctx = createContext(async () => "Stay in plan mode", [
+    {
+      type: "custom",
+      customType: "plan-mode",
+      data: { enabled: false, toolsBeforePlanMode: ["read", "write"] },
+    },
+  ]);
+
+  await pi.emit("session_start", {}, ctx);
+  expect(pi.getActiveTools()).toEqual([
+    "read",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+    "questionnaire",
+  ]);
+});
+
 test("uses defaults and warns when the configuration cannot be read", async () => {
   planModeReadError = Object.assign(new Error("permission denied"), { code: "EACCES" });
   const pi = createPi();
