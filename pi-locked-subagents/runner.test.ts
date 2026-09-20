@@ -252,6 +252,43 @@ test("redacts credentials containing quotes, backslashes, and newlines from tran
   expect(result.stderr).not.toContain(escapedSecret);
 });
 
+test("redacts credentials appearing as top-level and nested object keys from transcript, final output, stderr, and projected sidecar", async () => {
+  const secret = 'sec"ret\\key\nnewline';
+  const escapedSecret = JSON.stringify(secret).slice(1, -1);
+  const event = JSON.stringify({
+    type: "message_end",
+    [secret]: "top-level-secret-key-value",
+    nested: {
+      [secret]: "nested-secret-key-value",
+    },
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: `Output with key ${secret} and ${JSON.stringify({ [secret]: "val" })} ` + "x".repeat(300) }],
+      stopReason: "stop",
+    },
+  });
+  const result = await runScript(
+    `process.stderr.write("Stderr key: " + ${JSON.stringify(secret)} + " and escaped: " + ${JSON.stringify(escapedSecret)} + "\\n"); process.stdout.write(${JSON.stringify(`${event}\n`)})`,
+    { timeoutMs: 1000, stderrMaxBytes: 1000, transcriptMaxBytes: 10000, parentOutputMaxBytes: 100 },
+    { ...env, TEST_CREDENTIAL: secret },
+    ["TEST_CREDENTIAL"],
+  );
+  const transcript = await readFile(result.transcriptPath, "utf8");
+
+  expect(result.finalOutput).not.toContain(secret);
+  expect(result.finalOutput).not.toContain(escapedSecret);
+  expect(transcript).not.toContain(secret);
+  expect(transcript).not.toContain(escapedSecret);
+  expect(result.stderr).not.toContain(secret);
+  expect(result.stderr).not.toContain(escapedSecret);
+
+  expect(result.projected).toBe(true);
+  expect(result.outputPath).toBeDefined();
+  const sidecar = await readFile(result.outputPath!, "utf8");
+  expect(sidecar).not.toContain(secret);
+  expect(sidecar).not.toContain(escapedSecret);
+});
+
 test("redacts secrets before applying the stderr byte boundary", async () => {
   const secret = "boundary-secret-value";
   const prefix = "x".repeat(24);

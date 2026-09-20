@@ -26,7 +26,7 @@ test("declares the repository as a Pi package with every extension", () => {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    typebox: "1.3.31",
+    typebox: "*",
   });
   expect(manifest.peerDependencies).not.toHaveProperty("@sinclair/typebox");
 });

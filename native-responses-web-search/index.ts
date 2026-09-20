@@ -39,6 +39,8 @@ export interface WebSearchChannelConfig {
   enabled?: boolean;
   /** Codex transport. */
   transport?: Transport;
+  /** Timeout in milliseconds for nested requests. Default: 30000. */
+  timeoutMs?: number;
 }
 
 export interface PluginConfig {
@@ -59,6 +61,7 @@ export interface NormalizedWebSearchChannel {
   model: string;
   enabled: boolean;
   transport: Transport;
+  timeoutMs?: number;
 }
 
 export interface NormalizedPluginConfig {
@@ -234,6 +237,9 @@ export function normalizeConfig(value: unknown): NormalizedPluginConfig {
         transport,
         `config.channels[${index}].transport`,
       ),
+      timeoutMs: typeof rawChannel.timeoutMs === "number" && rawChannel.timeoutMs > 0
+        ? rawChannel.timeoutMs
+        : undefined,
     } satisfies NormalizedWebSearchChannel;
   });
 
@@ -482,22 +488,59 @@ function registerLocalWebSearch(
         throw new Error("web_search aborted");
       }
 
-      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+      const timeoutMs = channel.timeoutMs ?? NESTED_SEARCH_TIMEOUT_MS;
+      const timeoutSignal = AbortSignal.timeout(timeoutMs);
+      const requestSignal = callerSignal
+        ? AbortSignal.any([callerSignal, timeoutSignal])
+        : timeoutSignal;
+
+      const checkAborted = () => {
+        if (callerSignal?.aborted) {
+          throw new Error("web_search aborted");
+        }
+        if (timeoutSignal.aborted) {
+          throw new Error(`web_search request timed out after ${timeoutMs} ms`);
+        }
+      };
+
+      if (requestSignal.aborted) {
+        checkAborted();
+      }
+
+      const withBoundary = <T>(promise: Promise<T>): Promise<T> => {
+        if (requestSignal.aborted) {
+          checkAborted();
+        }
+        return new Promise<T>((resolve, reject) => {
+          const onAbort = () => {
+            requestSignal.removeEventListener("abort", onAbort);
+            try {
+              checkAborted();
+            } catch (err) {
+              reject(err);
+            }
+          };
+          requestSignal.addEventListener("abort", onAbort, { once: true });
+          promise.then(
+            (val) => {
+              requestSignal.removeEventListener("abort", onAbort);
+              resolve(val);
+            },
+            (err) => {
+              requestSignal.removeEventListener("abort", onAbort);
+              reject(err);
+            },
+          );
+        });
+      };
+
+      const auth = await withBoundary(Promise.resolve(ctx.modelRegistry.getApiKeyAndHeaders(model)));
       if (!auth.ok) {
         throw new Error(`web_search authentication unavailable: ${auth.error}`);
       }
       if (!auth.apiKey) {
         throw new Error("web_search requires an API key for the configured provider");
       }
-
-      if (callerSignal?.aborted) {
-        throw new Error("web_search aborted");
-      }
-
-      const timeoutSignal = AbortSignal.timeout(NESTED_SEARCH_TIMEOUT_MS);
-      const requestSignal = callerSignal
-        ? AbortSignal.any([callerSignal, timeoutSignal])
-        : timeoutSignal;
 
       const stream = adapter(model, {
         systemPrompt:
@@ -517,14 +560,9 @@ function registerLocalWebSearch(
           addNativeWebSearch(payload, channel.endpoint, channel.nativeTool),
       });
 
-      const result = await stream.result();
+      const result = await withBoundary(stream.result());
       if (result.stopReason === "error" || result.stopReason === "aborted" || requestSignal.aborted) {
-        if (callerSignal?.aborted) {
-          throw new Error("web_search aborted");
-        }
-        if (timeoutSignal.aborted) {
-          throw new Error(`web_search request timed out after ${NESTED_SEARCH_TIMEOUT_MS} ms`);
-        }
+        checkAborted();
         throw new Error(result.errorMessage || "web_search request failed");
       }
 

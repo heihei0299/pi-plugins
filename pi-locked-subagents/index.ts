@@ -42,8 +42,8 @@ const reviewPacketSchema = Type.Optional(Type.Object({
 
 const MAX_REVIEW_PACKET_FILES = 32;
 const MAX_REVIEW_PACKET_REQUIREMENTS = 32;
-const MAX_REVIEW_TASK_KIB = 32;
-const MAX_REVIEW_TASK_BYTES = MAX_REVIEW_TASK_KIB * 1024;
+const MAX_SUBAGENT_TASK_KIB = 32;
+const MAX_SUBAGENT_TASK_BYTES = MAX_SUBAGENT_TASK_KIB * 1024;
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
@@ -197,18 +197,18 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           };
         }
         const reviewTask = boundedReviewTask(params.task, params.reviewPacket as ReviewPacket);
-        if (Buffer.byteLength(reviewTask, "utf8") > MAX_REVIEW_TASK_BYTES) {
+        if (Buffer.byteLength(reviewTask, "utf8") > MAX_SUBAGENT_TASK_BYTES) {
           return {
             isError: true,
-            content: [{ type: "text", text: `Reviewer childTask exceeds the ${MAX_REVIEW_TASK_KIB} KiB limit.` }],
+            content: [{ type: "text", text: `Reviewer childTask exceeds the ${MAX_SUBAGENT_TASK_KIB} KiB limit.` }],
             details: {},
           };
         }
         childTask = reviewTask;
-      } else if (Buffer.byteLength(childTask, "utf8") > MAX_REVIEW_TASK_BYTES) {
+      } else if (Buffer.byteLength(childTask, "utf8") > MAX_SUBAGENT_TASK_BYTES) {
         return {
           isError: true,
-          content: [{ type: "text", text: `Subagent task exceeds the ${MAX_REVIEW_TASK_KIB} KiB limit.` }],
+          content: [{ type: "text", text: `Subagent task exceeds the ${MAX_SUBAGENT_TASK_KIB} KiB limit.` }],
           details: {},
         };
       }

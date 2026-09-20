@@ -117,7 +117,7 @@ function redactValue(value: unknown, redactions: string[]): unknown {
   if (value !== null && typeof value === "object") {
     const result: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      result[k] = redactValue(v, redactions);
+      result[redactText(k, redactions)] = redactValue(v, redactions);
     }
     return result;
   }

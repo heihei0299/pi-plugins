@@ -835,3 +835,129 @@ test("normalizes whitespace-only modelPrefix to empty string", () => {
   expect(normalized.channels[0].modelPrefix).toBe("");
 });
 
+test("aborts nested search if authentication blocks and caller aborts", async () => {
+  const h = pluginHarness();
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "gpt-",
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: h.adapter as any,
+  });
+
+  const tool = h.tools.find((t: any) => t.name === "web_search");
+  const controller = new AbortController();
+  const blockingRegistry = {
+    getApiKeyAndHeaders: () => new Promise<any>(() => {}),
+  };
+
+  const executePromise = tool.execute(
+    "call-1",
+    { query: "test" },
+    controller.signal,
+    undefined,
+    toolContext(model, blockingRegistry),
+  );
+  controller.abort();
+
+  await expect(executePromise).rejects.toThrow("web_search aborted");
+});
+
+test("times out nested search if authentication blocks and timeout expires", async () => {
+  const h = pluginHarness();
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "gpt-",
+      timeoutMs: 15,
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: h.adapter as any,
+  });
+
+  const tool = h.tools.find((t: any) => t.name === "web_search");
+  const blockingRegistry = {
+    getApiKeyAndHeaders: () => new Promise<any>(() => {}),
+  };
+
+  await expect(
+    tool.execute(
+      "call-1",
+      { query: "test" },
+      undefined,
+      undefined,
+      toolContext(model, blockingRegistry),
+    ),
+  ).rejects.toThrow("web_search request timed out after 15 ms");
+});
+
+test("aborts nested search if stream.result blocks and caller aborts", async () => {
+  const h = pluginHarness();
+  const blockingAdapter = () => ({
+    result: () => new Promise<any>(() => {}),
+  });
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "gpt-",
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: blockingAdapter as any,
+  });
+
+  const tool = h.tools.find((t: any) => t.name === "web_search");
+  const controller = new AbortController();
+
+  const executePromise = tool.execute(
+    "call-1",
+    { query: "test" },
+    controller.signal,
+    undefined,
+    toolContext(model, authRegistry()),
+  );
+  controller.abort();
+
+  await expect(executePromise).rejects.toThrow("web_search aborted");
+});
+
+test("times out nested search if stream.result blocks and timeout expires", async () => {
+  const h = pluginHarness();
+  const blockingAdapter = () => ({
+    result: () => new Promise<any>(() => {}),
+  });
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "gpt-",
+      timeoutMs: 15,
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: blockingAdapter as any,
+  });
+
+  const tool = h.tools.find((t: any) => t.name === "web_search");
+
+  await expect(
+    tool.execute(
+      "call-1",
+      { query: "test" },
+      undefined,
+      undefined,
+      toolContext(model, authRegistry()),
+    ),
+  ).rejects.toThrow("web_search request timed out after 15 ms");
+});
+
