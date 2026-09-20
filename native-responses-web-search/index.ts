@@ -626,11 +626,6 @@ export function installNativeResponsesWebSearch(
       return;
     }
 
-    pi.registerProvider(
-      channel.provider,
-      providerConfig(channel, nativeStream),
-    );
-
     try {
       registerLocalWebSearch(pi, channel, nativeStream, runtime);
     } catch (error: unknown) {
@@ -642,6 +637,24 @@ export function installNativeResponsesWebSearch(
         configPath,
         runtime,
         `web_search tool registration failed; ${message}`,
+      );
+      return;
+    }
+
+    try {
+      pi.registerProvider(
+        channel.provider,
+        providerConfig(channel, nativeStream),
+      );
+    } catch (error: unknown) {
+      runtime.toolRegistration = "unavailable";
+      const message = error instanceof Error ? error.message : String(error);
+      registerStatusCommand(
+        pi,
+        config,
+        configPath,
+        runtime,
+        `provider overlay registration failed; ${message}`,
       );
       return;
     }

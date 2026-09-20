@@ -779,3 +779,24 @@ test("preserves parent HTTP response callback semantics", async () => {
   )).resolves.toBeUndefined();
   expect(callbackCalls).toBe(1);
 });
+
+test("does not register provider overlay when tool registration fails", () => {
+  const h = pluginHarness();
+  h.pi.registerTool = () => {
+    throw new Error("Tool registration explosion");
+  };
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: h.adapter as any,
+  });
+
+  expect(h.providers.length).toBe(0);
+  const statusCmd = h.pi.commands.get("native-web-search");
+  expect(statusCmd).toBeDefined();
+});
