@@ -39,8 +39,6 @@ export interface WebSearchChannelConfig {
   enabled?: boolean;
   /** Codex transport. */
   transport?: Transport;
-  /** Timeout in milliseconds for nested requests. Default: 30000. */
-  timeoutMs?: number;
 }
 
 export interface PluginConfig {
@@ -61,7 +59,6 @@ export interface NormalizedWebSearchChannel {
   model: string;
   enabled: boolean;
   transport: Transport;
-  timeoutMs?: number;
 }
 
 export interface NormalizedPluginConfig {
@@ -237,9 +234,6 @@ export function normalizeConfig(value: unknown): NormalizedPluginConfig {
         transport,
         `config.channels[${index}].transport`,
       ),
-      timeoutMs: typeof rawChannel.timeoutMs === "number" && rawChannel.timeoutMs > 0
-        ? rawChannel.timeoutMs
-        : undefined,
     } satisfies NormalizedWebSearchChannel;
   });
 
@@ -452,6 +446,7 @@ function registerLocalWebSearch(
   channel: NormalizedWebSearchChannel,
   adapter: NativeStreamSimple,
   runtime: RuntimeStatus,
+  timeoutMs: number = NESTED_SEARCH_TIMEOUT_MS,
 ): void {
   pi.registerTool({
     name: "web_search",
@@ -488,7 +483,6 @@ function registerLocalWebSearch(
         throw new Error("web_search aborted");
       }
 
-      const timeoutMs = channel.timeoutMs ?? NESTED_SEARCH_TIMEOUT_MS;
       const timeoutSignal = AbortSignal.timeout(timeoutMs);
       const requestSignal = callerSignal
         ? AbortSignal.any([callerSignal, timeoutSignal])
@@ -500,6 +494,9 @@ function registerLocalWebSearch(
         }
         if (timeoutSignal.aborted) {
           throw new Error(`web_search request timed out after ${timeoutMs} ms`);
+        }
+        if (requestSignal.aborted) {
+          throw new Error("web_search aborted");
         }
       };
 
@@ -524,10 +521,26 @@ function registerLocalWebSearch(
           promise.then(
             (val) => {
               requestSignal.removeEventListener("abort", onAbort);
+              if (requestSignal.aborted) {
+                try {
+                  checkAborted();
+                } catch (abortErr) {
+                  reject(abortErr);
+                  return;
+                }
+              }
               resolve(val);
             },
             (err) => {
               requestSignal.removeEventListener("abort", onAbort);
+              if (requestSignal.aborted) {
+                try {
+                  checkAborted();
+                } catch (abortErr) {
+                  reject(abortErr);
+                  return;
+                }
+              }
               reject(err);
             },
           );
@@ -656,11 +669,16 @@ function registerConfigErrorStatus(
   });
 }
 
+export interface WebSearchInstallOptions {
+  timeoutMs?: number;
+}
+
 export function installNativeResponsesWebSearch(
   pi: PluginAPI,
   config: NormalizedPluginConfig,
   configPath = CONFIG_PATH,
   adapters: StreamAdapters = {},
+  options?: WebSearchInstallOptions,
 ): void {
   const runtime: RuntimeStatus = { ...DEFAULT_RUNTIME_STATUS };
   const activeChannels = getActiveChannels(config);
@@ -682,7 +700,13 @@ export function installNativeResponsesWebSearch(
     }
 
     try {
-      registerLocalWebSearch(pi, channel, nativeStream, runtime);
+      registerLocalWebSearch(
+        pi,
+        channel,
+        nativeStream,
+        runtime,
+        options?.timeoutMs ?? NESTED_SEARCH_TIMEOUT_MS,
+      );
     } catch (error: unknown) {
       runtime.toolRegistration = "unavailable";
       const message = error instanceof Error ? error.message : String(error);

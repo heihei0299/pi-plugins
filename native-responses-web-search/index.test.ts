@@ -874,13 +874,16 @@ test("times out nested search if authentication blocks and timeout expires", asy
       provider: "codex",
       endpoint: "codex",
       modelPrefix: "gpt-",
-      timeoutMs: 15,
       enabled: true,
     }],
   });
-  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
-    codex: h.adapter as any,
-  });
+  installNativeResponsesWebSearch(
+    h.pi,
+    channelConfig,
+    "/tmp/config",
+    { codex: h.adapter as any },
+    { timeoutMs: 15 },
+  );
 
   const tool = h.tools.find((t: any) => t.name === "web_search");
   const blockingRegistry = {
@@ -940,13 +943,16 @@ test("times out nested search if stream.result blocks and timeout expires", asyn
       provider: "codex",
       endpoint: "codex",
       modelPrefix: "gpt-",
-      timeoutMs: 15,
       enabled: true,
     }],
   });
-  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
-    codex: blockingAdapter as any,
-  });
+  installNativeResponsesWebSearch(
+    h.pi,
+    channelConfig,
+    "/tmp/config",
+    { codex: blockingAdapter as any },
+    { timeoutMs: 15 },
+  );
 
   const tool = h.tools.find((t: any) => t.name === "web_search");
 
@@ -959,5 +965,111 @@ test("times out nested search if stream.result blocks and timeout expires", asyn
       toolContext(model, authRegistry()),
     ),
   ).rejects.toThrow("web_search request timed out after 15 ms");
+});
+
+test("maps underlying AbortError to caller abort error when caller aborts", async () => {
+  const h = pluginHarness();
+  const rejectingAdapter = (_model: any, _context: any, options: any) => ({
+    result: () =>
+      new Promise<any>((_, reject) => {
+        options.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted", "AbortError"));
+        });
+      }),
+  });
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "gpt-",
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: rejectingAdapter as any,
+  });
+
+  const tool = h.tools.find((t: any) => t.name === "web_search");
+  const controller = new AbortController();
+
+  const executePromise = tool.execute(
+    "call-1",
+    { query: "test" },
+    controller.signal,
+    undefined,
+    toolContext(model, authRegistry()),
+  );
+  controller.abort();
+
+  await expect(executePromise).rejects.toThrow("web_search aborted");
+});
+
+test("maps underlying AbortError to timeout error when timeout expires", async () => {
+  const h = pluginHarness();
+  const rejectingAdapter = (_model: any, _context: any, options: any) => ({
+    result: () =>
+      new Promise<any>((_, reject) => {
+        options.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted", "AbortError"));
+        });
+      }),
+  });
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "gpt-",
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(
+    h.pi,
+    channelConfig,
+    "/tmp/config",
+    { codex: rejectingAdapter as any },
+    { timeoutMs: 15 },
+  );
+
+  const tool = h.tools.find((t: any) => t.name === "web_search");
+
+  await expect(
+    tool.execute(
+      "call-1",
+      { query: "test" },
+      undefined,
+      undefined,
+      toolContext(model, authRegistry()),
+    ),
+  ).rejects.toThrow("web_search request timed out after 15 ms");
+});
+
+test("preserves non-cancellation rejection from underlying adapter", async () => {
+  const h = pluginHarness();
+  const failingAdapter = () => ({
+    result: () => Promise.reject(new Error("network failure")),
+  });
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "gpt-",
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: failingAdapter as any,
+  });
+
+  const tool = h.tools.find((t: any) => t.name === "web_search");
+
+  await expect(
+    tool.execute(
+      "call-1",
+      { query: "test" },
+      undefined,
+      undefined,
+      toolContext(model, authRegistry()),
+    ),
+  ).rejects.toThrow("network failure");
 });
 
