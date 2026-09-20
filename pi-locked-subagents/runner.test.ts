@@ -1,10 +1,12 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const runDir = await mkdtemp(join(tmpdir(), "pi-locked-subagents-test-"));
+const configPath = join(runDir, "locked-subagents.json");
 process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = runDir;
+process.env.PI_LOCKED_SUBAGENTS_CONFIG = configPath;
 
 const { DEFAULT_RUN_LIMITS, projectParentOutput, runChild } = await import("./runner.ts");
 
@@ -29,6 +31,7 @@ function runScript(
 
 afterAll(async () => {
   delete process.env.PI_LOCKED_SUBAGENTS_RUN_DIR;
+  delete process.env.PI_LOCKED_SUBAGENTS_CONFIG;
   await rm(runDir, { recursive: true, force: true });
 });
 
@@ -266,6 +269,41 @@ test("terminates an aborted worker", async () => {
   const result = await promise;
 
   expect(result.failureReason).toContain("aborted");
+});
+
+test("bounds the actual subagent tool failure result and exposes its diagnostic sidecar", async () => {
+  const workerPath = join(runDir, "failure-worker.mjs");
+  const errorMessage = "error-diagnostic-".repeat(3000);
+  await writeFile(workerPath, `#!/usr/bin/env node\nprocess.stderr.write("s".repeat(300_000)); process.stdout.write(${JSON.stringify(JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [], stopReason: "error", errorMessage },
+  }))})`, { mode: 0o700 });
+  await writeFile(configPath, JSON.stringify({
+    piBinary: workerPath,
+    agents: { worker: { model: "test/model" } },
+  }));
+
+  const { default: lockedSubagents } = await import("./index.ts");
+  let registeredTool: any;
+  lockedSubagents({
+    registerTool(tool: any) { registeredTool = tool; },
+    registerCommand() {},
+  } as any);
+
+  const result = await registeredTool.execute(
+    "call-1",
+    { agent: "worker", task: "produce a failure" },
+    undefined,
+    undefined,
+    { cwd: process.cwd() },
+  );
+  const content = result.content[0].text;
+  const diagnosticPath = result.details.diagnosticPath;
+
+  expect(result.isError).toBe(true);
+  expect(Buffer.byteLength(content, "utf8")).toBeLessThanOrEqual(DEFAULT_RUN_LIMITS.parentOutputMaxBytes);
+  expect(diagnosticPath).toBeTruthy();
+  expect(await readFile(diagnosticPath, "utf8")).toBe(errorMessage);
 });
 
 test("accepts a valid final message_end", async () => {

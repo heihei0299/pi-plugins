@@ -80,4 +80,4 @@ Call the registered tool with a configured role and a self-contained task:
 subagent(agent="worker", task="Inspect the parser and add a focused regression test.")
 ```
 
-If configuration cannot be loaded, the requested role is unknown, the depth limit is reached, the worker protocol is incomplete, or the worker exits/times out/exceeds an output limit, the tool returns an error instead of reporting success.
+Configuration errors, unknown roles, depth-limit violations, nonzero/aborted/timed-out workers, incomplete protocol state, and a JSONL single-line hard-limit violation return an error instead of reporting success. The transcript archive and parent-output limits are soft boundaries: a transcript over 8 MiB is truncated while parsing continues, a final output or failure diagnostic over 24 KiB is projected to a redacted sidecar, and bounded stderr alone does not fail a healthy worker.
