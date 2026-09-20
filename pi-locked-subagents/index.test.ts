@@ -63,6 +63,15 @@ mock.module("typebox", () => ({
 
 const { default: lockedSubagents } = await import("./index.ts");
 
+function createTool() {
+  let tool: any;
+  lockedSubagents({
+    registerTool(value: unknown) { tool = value; },
+    registerCommand() {},
+  } as any);
+  return tool;
+}
+
 afterAll(async () => {
   if (previousConfigPath === undefined) delete process.env.PI_LOCKED_SUBAGENTS_CONFIG;
   else process.env.PI_LOCKED_SUBAGENTS_CONFIG = previousConfigPath;
@@ -76,11 +85,7 @@ afterAll(async () => {
 });
 
 test("reports malformed output before a valid message_end as failed", async () => {
-  let tool: any;
-  lockedSubagents({
-    registerTool(value: unknown) { tool = value; },
-    registerCommand() {},
-  } as any);
+  const tool = createTool();
 
   const result = await tool.execute(
     "call-1",
@@ -95,11 +100,7 @@ test("reports malformed output before a valid message_end as failed", async () =
 });
 
 test("passes a bounded review packet without embedding a complete diff", async () => {
-  let tool: any;
-  lockedSubagents({
-    registerTool(value: unknown) { tool = value; },
-    registerCommand() {},
-  } as any);
+  const tool = createTool();
 
   const result = await tool.execute(
     "call-2",
@@ -132,11 +133,7 @@ test("passes a bounded review packet without embedding a complete diff", async (
 });
 
 test("requires a review packet for reviewer calls", async () => {
-  let tool: any;
-  lockedSubagents({
-    registerTool(value: unknown) { tool = value; },
-    registerCommand() {},
-  } as any);
+  const tool = createTool();
 
   const result = await tool.execute(
     "call-3",
