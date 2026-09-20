@@ -22,7 +22,6 @@ export interface ContextSnapshot {
   assistant: ContextBucket;
   tool: ContextBucket;
   custom: ContextBucket;
-  customTypes: Record<string, ContextBucket>;
   delta?: ContextDelta;
 }
 

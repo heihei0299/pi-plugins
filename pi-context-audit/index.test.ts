@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import contextAuditExtension from "./index.ts";
+import { createContextSnapshot } from "./collector.ts";
 
 type Handler = (event: any, ctx: any) => unknown;
 
@@ -127,3 +128,12 @@ test("context audit records tool sizes without retaining tool output", async () 
   expect(notifications[0]).not.toContain("snapshot #1");
   expect(notifications[0]).not.toContain("x".repeat(100));
 });
+
+test("snapshot does not retain customTypes mapping", () => {
+  const snapshot = createContextSnapshot([
+    { role: "custom", customType: "my-type", content: "hello" },
+  ], 0, undefined);
+  expect((snapshot as any).customTypes).toBeUndefined();
+  expect(snapshot.custom.chars).toBe(5);
+});
+

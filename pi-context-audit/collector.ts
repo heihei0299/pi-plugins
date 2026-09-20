@@ -22,13 +22,6 @@ function bucketForRole(message: { role?: unknown }, buckets: {
   return buckets.custom;
 }
 
-function customType(message: { role?: unknown; customType?: unknown }): string {
-  if (typeof message.customType === "string" && message.customType.length > 0) {
-    return message.customType;
-  }
-  return typeof message.role === "string" ? message.role : "unknown";
-}
-
 function deltaFor(current: ContextSnapshot, previous: ContextSnapshot | undefined) {
   if (!previous) return undefined;
   return {
@@ -57,20 +50,13 @@ export function createContextSnapshot(
     tool: emptyBucket(),
     custom: emptyBucket(),
   };
-  const customTypes: Record<string, ContextBucket> = {};
 
   for (const value of messages) {
     const message = value && typeof value === "object"
-      ? value as { role?: unknown; customType?: unknown; content?: unknown }
+      ? value as { role?: unknown; content?: unknown }
       : {};
     const chars = messageChars(message);
     addMessage(bucketForRole(message, buckets), chars);
-
-    if (message.role === "custom") {
-      const type = customType(message);
-      const bucket = customTypes[type] ?? (customTypes[type] = emptyBucket());
-      addMessage(bucket, chars);
-    }
   }
 
   const totalChars = Object.values(buckets).reduce((total, bucket) => total + bucket.chars, 0);
@@ -80,7 +66,6 @@ export function createContextSnapshot(
     totalChars,
     estimatedTokens: estimateTokens(totalChars),
     ...buckets,
-    customTypes,
   };
   const delta = deltaFor(snapshot, previous);
   if (delta) snapshot.delta = delta;
