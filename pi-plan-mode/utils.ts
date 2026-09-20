@@ -98,6 +98,7 @@ const SAFE_PATTERNS: RegExp[] = [
 
 export function isSafeCommand(command: string): boolean {
   if (!command.trim() || command.includes("\n") || command.includes("\r")) return false;
+  if (/(?<!&)&(?!&)/.test(command)) return false;
 
   const segments = command
     .split(/\s*(?:&&|\|\||;|\|)\s*/)

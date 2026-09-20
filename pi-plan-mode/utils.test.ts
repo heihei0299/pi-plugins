@@ -21,6 +21,8 @@ test("rejects commands that can mutate, execute, or span multiple lines", () => 
     "git diff -o /tmp/diff",
     "git show -o/tmp/show",
     "git status && git diff --output=/tmp/diff",
+    "cat README.md & sed -i 's/old/new/' README.md",
+    "cat README.md &",
     String.raw`cat README.md
 pwd`,
   ]) {
