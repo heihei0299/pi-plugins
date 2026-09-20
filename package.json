@@ -10,7 +10,8 @@
       "./native-responses-web-search/index.ts",
       "./jev/index.ts",
       "./pi-locked-subagents/index.ts",
-      "./pi-plan-mode/index.ts"
+      "./pi-plan-mode/index.ts",
+      "./pi-context-audit/index.ts"
     ]
   },
   "peerDependencies": {

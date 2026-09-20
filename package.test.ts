@@ -19,6 +19,7 @@ test("declares the repository as a Pi package with every extension", () => {
     "./jev/index.ts",
     "./pi-locked-subagents/index.ts",
     "./pi-plan-mode/index.ts",
+    "./pi-context-audit/index.ts",
   ]);
   expect(manifest.peerDependencies).toMatchObject({
     "@earendil-works/pi-agent-core": "0.85.1",
