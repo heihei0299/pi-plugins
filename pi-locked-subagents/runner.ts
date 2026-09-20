@@ -98,7 +98,11 @@ function redactText(text: string, values: string[]): string {
   return values.reduce((result, value) => result.split(value).join("[redacted]"), text);
 }
 
-function truncateUtf8(text: string, maxBytes: number): string {
+function maxValueBytes(values: readonly string[]): number {
+  return values.reduce((max, value) => Math.max(max, Buffer.byteLength(value, "utf8")), 0);
+}
+
+export function truncateUtf8(text: string, maxBytes: number): string {
   if (maxBytes <= 0) return "";
   const bytes = Buffer.from(text);
   if (bytes.byteLength <= maxBytes) return text;
@@ -150,6 +154,40 @@ function projectOutput(text: string, maxBytes: number, outputPath: string): stri
   return projected;
 }
 
+export interface ParentOutputProjection {
+  text: string;
+  originalBytes: number;
+  parentOutputBytes: number;
+  outputPath?: string;
+  projected: boolean;
+}
+
+export async function projectParentOutput(
+  text: string,
+  maxBytes: number,
+): Promise<ParentOutputProjection> {
+  const originalBytes = Buffer.byteLength(text, "utf8");
+  if (originalBytes <= maxBytes) {
+    return {
+      text,
+      originalBytes,
+      parentOutputBytes: originalBytes,
+      projected: false,
+    };
+  }
+
+  const outputPath = join(RUN_DIR, `${Date.now()}-${randomUUID()}.txt`);
+  await writeFile(outputPath, text, { encoding: "utf8", mode: 0o600 });
+  const projected = projectOutput(text, maxBytes, outputPath);
+  return {
+    text: projected,
+    originalBytes,
+    parentOutputBytes: Buffer.byteLength(projected, "utf8"),
+    outputPath,
+    projected: true,
+  };
+}
+
 export interface RunChildResult {
   code: number | null;
   finalOutput: string;
@@ -163,6 +201,7 @@ export interface RunChildResult {
   transcriptTruncated: boolean;
   finalOutputBytes: number;
   parentOutputBytes: number;
+  parentOutputMaxBytes: number;
   outputPath?: string;
   projected: boolean;
 }
@@ -200,6 +239,7 @@ export async function runChild(
     let failureReason: string | undefined;
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
     const redactions = redactionValues(env, sensitiveEnvNames);
+    const stderrCaptureMaxBytes = limits.stderrMaxBytes + maxValueBytes(redactions);
 
     const terminate = (signalName: "SIGTERM" | "SIGKILL" = "SIGTERM") => {
       try {
@@ -268,7 +308,7 @@ export async function runChild(
     });
     child.stderr.on("data", (chunk: string) => {
       if (settled) return;
-      stderr = appendBoundedUtf8(stderr, chunk, limits.stderrMaxBytes);
+      stderr = appendBoundedUtf8(stderr, chunk, stderrCaptureMaxBytes);
     });
 
     const abort = () => stop("subagent aborted");
@@ -307,19 +347,10 @@ export async function runChild(
 
       if (!failureReason) parser.finish();
       const finalOutputBytes = Buffer.byteLength(finalOutput, "utf8");
-      let outputPath: string | undefined;
-      let projected = false;
 
       const finish = async () => {
-        let parentOutput = finalOutput;
-        if (finalOutputBytes > limits.parentOutputMaxBytes) {
-          outputPath = join(RUN_DIR, `${Date.now()}-${randomUUID()}.txt`);
-          await writeFile(outputPath, finalOutput, { encoding: "utf8", mode: 0o600 });
-          parentOutput = projectOutput(finalOutput, limits.parentOutputMaxBytes, outputPath);
-          projected = true;
-        }
-
-        stderr = redactText(stderr, redactions);
+        const parentOutput = await projectParentOutput(finalOutput, limits.parentOutputMaxBytes);
+        stderr = truncateUtf8(redactText(stderr, redactions), limits.stderrMaxBytes);
         transcript.end(() => {
           if (settled) return;
           settled = true;
@@ -328,7 +359,7 @@ export async function runChild(
           }
           resolve({
             code,
-            finalOutput: parentOutput,
+            finalOutput: parentOutput.text,
             stderr,
             transcriptPath,
             stopReason,
@@ -338,9 +369,10 @@ export async function runChild(
             failureReason,
             transcriptTruncated,
             finalOutputBytes,
-            parentOutputBytes: Buffer.byteLength(parentOutput, "utf8"),
-            outputPath,
-            projected,
+            parentOutputBytes: parentOutput.parentOutputBytes,
+            parentOutputMaxBytes: limits.parentOutputMaxBytes,
+            outputPath: parentOutput.outputPath,
+            projected: parentOutput.projected,
           });
         });
       };

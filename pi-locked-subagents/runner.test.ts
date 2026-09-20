@@ -6,7 +6,7 @@ import { join } from "node:path";
 const runDir = await mkdtemp(join(tmpdir(), "pi-locked-subagents-test-"));
 process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = runDir;
 
-const { DEFAULT_RUN_LIMITS, runChild } = await import("./runner.ts");
+const { DEFAULT_RUN_LIMITS, projectParentOutput, runChild } = await import("./runner.ts");
 
 const env = { PATH: process.env.PATH ?? "" };
 
@@ -168,6 +168,32 @@ test("redacts explicitly passed credentials from the transcript", async () => {
 
   expect(resultWithSecretFields.finalOutput).not.toContain(secret);
   expect(resultWithSecretFields.stopReason).not.toContain(secret);
+});
+
+test("redacts secrets before applying the stderr byte boundary", async () => {
+  const secret = "boundary-secret-value";
+  const prefix = "x".repeat(24);
+  const result = await runScript(
+    `process.stderr.write(${JSON.stringify(`${prefix}${secret.slice(0, 8)}`)}); setTimeout(() => process.stderr.write(${JSON.stringify(`${secret.slice(8)}-tail`)}), 5)`,
+    { timeoutMs: 1000, stderrMaxBytes: 32, transcriptMaxBytes: 100, parentOutputMaxBytes: 100 },
+    { ...env, TEST_SECRET: secret },
+    ["TEST_SECRET"],
+  );
+
+  expect(result.stderr).not.toContain(secret);
+  expect(result.stderr).not.toContain(secret.slice(0, 8));
+  expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(32);
+});
+
+test("projects an already-redacted diagnostic to a bounded parent result", async () => {
+  const diagnostic = "diagnostic-secret-value-".repeat(200);
+  const projection = await projectParentOutput(diagnostic, 256);
+
+  expect(projection.projected).toBe(true);
+  expect(projection.text).toContain("[output projected:");
+  expect(projection.outputPath).toBeDefined();
+  expect(Buffer.byteLength(projection.text)).toBeLessThanOrEqual(256);
+  expect(await readFile(projection.outputPath!, "utf8")).toBe(diagnostic);
 });
 
 test("projects oversized final output to the parent and keeps a complete sidecar", async () => {

@@ -10,7 +10,13 @@ import {
   maxDepth,
 } from "./config.ts";
 import { agentCatalog, agentNames, compactDescription } from "./registry.ts";
-import { childArgs, runChild } from "./runner.ts";
+import {
+  DEFAULT_RUN_LIMITS,
+  childArgs,
+  projectParentOutput,
+  runChild,
+  truncateUtf8,
+} from "./runner.ts";
 
 export default function lockedSubagents(pi: ExtensionAPI) {
   const startupConfig = loadConfigSnapshot();
@@ -52,7 +58,13 @@ export default function lockedSubagents(pi: ExtensionAPI) {
       } catch (err) {
         return {
           isError: true,
-          content: [{ type: "text", text: `Cannot load ${CONFIG_PATH}: ${err instanceof Error ? err.message : String(err)}` }],
+          content: [{
+            type: "text",
+            text: truncateUtf8(
+              `Cannot load ${CONFIG_PATH}: ${err instanceof Error ? err.message : String(err)}`,
+              DEFAULT_RUN_LIMITS.parentOutputMaxBytes,
+            ),
+          }],
           details: {},
         };
       }
@@ -61,7 +73,13 @@ export default function lockedSubagents(pi: ExtensionAPI) {
       if (!agent) {
         return {
           isError: true,
-          content: [{ type: "text", text: `Unknown subagent "${params.agent}". Available: ${Object.keys(config.agents).join(", ")}` }],
+          content: [{
+            type: "text",
+            text: truncateUtf8(
+              `Unknown subagent "${params.agent}". Available: ${Object.keys(config.agents).join(", ")}`,
+              DEFAULT_RUN_LIMITS.parentOutputMaxBytes,
+            ),
+          }],
           details: {},
         };
       }
@@ -101,6 +119,7 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           parentOutputBytes: result.parentOutputBytes,
           outputPath: result.outputPath ?? null,
           projected: result.projected,
+          diagnosticPath: null as string | null,
           exitCode: result.code,
           stopReason: result.stopReason ?? null,
           failureReason: result.failureReason ?? null,
@@ -119,11 +138,22 @@ export default function lockedSubagents(pi: ExtensionAPI) {
             result.stderr.trim() ||
             result.finalOutput ||
             "(no output)";
+          const header = `Subagent "${params.agent}" failed (exit=${result.code}, stop=${result.stopReason ?? "unknown"}, reason=${result.failureReason ?? "subagent failure"}).`;
+          const suffix = `\n\nTranscript: ${result.transcriptPath}\n\n`;
+          const diagnosticBudget = Math.max(
+            0,
+            result.parentOutputMaxBytes - Buffer.byteLength(header + suffix, "utf8"),
+          );
+          const diagnostic = await projectParentOutput(failure, diagnosticBudget);
+          details.diagnosticPath = diagnostic.outputPath ?? null;
           return {
             isError: true,
             content: [{
               type: "text",
-              text: `Subagent "${params.agent}" failed (exit=${result.code}, stop=${result.stopReason ?? "unknown"}).\n${failure}\nTranscript: ${result.transcriptPath}`,
+              text: truncateUtf8(
+                `${header}${suffix}${diagnostic.text}`,
+                result.parentOutputMaxBytes,
+              ),
             }],
             details,
           };
@@ -134,14 +164,29 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           details,
         };
       } catch (err) {
-        return {
-          isError: true,
-          content: [{
-            type: "text",
-            text: `Subagent "${params.agent}" execution failed: ${err instanceof Error ? err.message : String(err)}`,
-          }],
-          details: { agent: params.agent, lockedModel: agent.model },
-        };
+        const failure = `Subagent "${params.agent}" execution failed: ${err instanceof Error ? err.message : String(err)}`;
+        try {
+          const diagnostic = await projectParentOutput(failure, DEFAULT_RUN_LIMITS.parentOutputMaxBytes);
+          return {
+            isError: true,
+            content: [{ type: "text", text: diagnostic.text }],
+            details: {
+              agent: params.agent,
+              lockedModel: agent.model,
+              diagnosticPath: diagnostic.outputPath ?? null,
+              projected: diagnostic.projected,
+            },
+          };
+        } catch {
+          return {
+            isError: true,
+            content: [{
+              type: "text",
+              text: truncateUtf8(failure, DEFAULT_RUN_LIMITS.parentOutputMaxBytes),
+            }],
+            details: { agent: params.agent, lockedModel: agent.model },
+          };
+        }
       }
     },
   });
