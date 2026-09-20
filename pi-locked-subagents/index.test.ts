@@ -1,4 +1,4 @@
-import { afterAll, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, expect, mock, test } from "bun:test";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,6 +52,11 @@ await writeFile(configPath, JSON.stringify({
 }));
 process.env.PI_LOCKED_SUBAGENTS_CONFIG = configPath;
 process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = root;
+
+beforeEach(() => {
+  process.env.PI_LOCKED_SUBAGENTS_CONFIG = configPath;
+  process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = root;
+});
 
 mock.module("typebox", () => ({
   Type: {
@@ -213,3 +218,21 @@ test("rejects a reviewer child task over 32 KiB without truncating it", async ()
   expect(result.isError).toBe(true);
   expect(result.content[0].text).toContain("32 KiB");
 });
+
+test("rejects a regular worker task over 32 KiB before spawning", async () => {
+  const tool = createTool();
+  const result = await tool.execute(
+    "call-7",
+    {
+      agent: "worker",
+      task: "x".repeat(32 * 1024 + 1),
+    },
+    undefined,
+    undefined,
+    { cwd: process.cwd() },
+  );
+
+  expect(result.isError).toBe(true);
+  expect(result.content[0].text).toContain("32 KiB");
+});
+

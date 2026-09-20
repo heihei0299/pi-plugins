@@ -205,6 +205,12 @@ export default function lockedSubagents(pi: ExtensionAPI) {
           };
         }
         childTask = reviewTask;
+      } else if (Buffer.byteLength(childTask, "utf8") > MAX_REVIEW_TASK_BYTES) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Subagent task exceeds the ${MAX_REVIEW_TASK_KIB} KiB limit.` }],
+          details: {},
+        };
       }
 
       const childDepth = depthNow + 1;
