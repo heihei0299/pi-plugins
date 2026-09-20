@@ -49,6 +49,8 @@ export interface PluginConfig {
   channels?: WebSearchChannelConfig[];
 }
 
+export const NESTED_SEARCH_TIMEOUT_MS = 30_000;
+
 export interface NormalizedWebSearchChannel {
   provider: string;
   endpoint: ResponsesEndpoint;
@@ -475,6 +477,11 @@ function registerLocalWebSearch(
         );
       }
 
+      const callerSignal = signal ?? ctx.signal;
+      if (callerSignal?.aborted) {
+        throw new Error("web_search aborted");
+      }
+
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
       if (!auth.ok) {
         throw new Error(`web_search authentication unavailable: ${auth.error}`);
@@ -483,10 +490,14 @@ function registerLocalWebSearch(
         throw new Error("web_search requires an API key for the configured provider");
       }
 
-      const requestSignal = signal ?? ctx.signal;
-      if (requestSignal?.aborted) {
+      if (callerSignal?.aborted) {
         throw new Error("web_search aborted");
       }
+
+      const timeoutSignal = AbortSignal.timeout(NESTED_SEARCH_TIMEOUT_MS);
+      const requestSignal = callerSignal
+        ? AbortSignal.any([callerSignal, timeoutSignal])
+        : timeoutSignal;
 
       const stream = adapter(model, {
         systemPrompt:
@@ -501,13 +512,19 @@ function registerLocalWebSearch(
           ? { transport: channel.transport }
           : {}),
         toolChoice: "required",
-        ...(requestSignal ? { signal: requestSignal } : {}),
+        signal: requestSignal,
         onPayload: async (payload) =>
           addNativeWebSearch(payload, channel.endpoint, channel.nativeTool),
       });
 
       const result = await stream.result();
-      if (result.stopReason === "error" || result.stopReason === "aborted") {
+      if (result.stopReason === "error" || result.stopReason === "aborted" || requestSignal.aborted) {
+        if (callerSignal?.aborted) {
+          throw new Error("web_search aborted");
+        }
+        if (timeoutSignal.aborted) {
+          throw new Error(`web_search request timed out after ${NESTED_SEARCH_TIMEOUT_MS} ms`);
+        }
         throw new Error(result.errorMessage || "web_search request failed");
       }
 

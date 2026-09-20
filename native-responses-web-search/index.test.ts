@@ -800,3 +800,24 @@ test("does not register provider overlay when tool registration fails", () => {
   const statusCmd = h.pi.commands.get("native-web-search");
   expect(statusCmd).toBeDefined();
 });
+
+test("aborts nested search immediately if caller signal is already aborted", async () => {
+  const h = pluginHarness();
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "codex",
+      endpoint: "codex",
+      modelPrefix: "gpt-",
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    codex: h.adapter as any,
+  });
+
+  const tool = h.tools.find((t: any) => t.name === "web_search");
+  const controller = new AbortController();
+  controller.abort();
+
+  await expect(tool.execute("call-1", { query: "test" }, controller.signal, undefined, toolContext(model, authRegistry())))
+    .rejects.toThrow("web_search aborted");
