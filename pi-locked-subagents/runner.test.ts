@@ -1,12 +1,28 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, beforeEach, expect, mock, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+mock.module("typebox", () => ({
+  Type: {
+    Array: (items: unknown) => items,
+    Object: (properties: unknown) => properties,
+    Optional: (schema: unknown) => schema,
+    Record: (_k: unknown, v: unknown) => v,
+    String: (options: unknown) => options,
+    Union: (items: unknown) => items,
+  },
+}));
 
 const runDir = await mkdtemp(join(tmpdir(), "pi-locked-subagents-test-"));
 const configPath = join(runDir, "locked-subagents.json");
 process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = runDir;
 process.env.PI_LOCKED_SUBAGENTS_CONFIG = configPath;
+
+beforeEach(() => {
+  process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = runDir;
+  process.env.PI_LOCKED_SUBAGENTS_CONFIG = configPath;
+});
 
 const { DEFAULT_RUN_LIMITS, projectParentOutput, runChild } = await import("./runner.ts");
 
@@ -104,7 +120,7 @@ test("stops a worker that exceeds the execution timeout", async () => {
 });
 
 test("streams more than 1 MiB of event traffic before a valid final result", async () => {
-  const event = JSON.stringify({ type: "message_update", message: { role: "assistant", content: [] } }) + "\\n";
+  const event = `${JSON.stringify({ type: "message_update", message: { role: "assistant", content: [] } })}\n`;
   const final = JSON.stringify({
     type: "message_end",
     message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
@@ -134,7 +150,7 @@ test("bounds stderr without terminating a healthy worker", async () => {
 });
 
 test("truncates the transcript archive without stopping final-state parsing", async () => {
-  const event = JSON.stringify({ type: "message_start" }) + "\\n";
+  const event = `${JSON.stringify({ type: "message_start" })}\n`;
   const final = JSON.stringify({
     type: "message_end",
     message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
@@ -207,6 +223,33 @@ test("redacts explicitly passed credentials from the transcript", async () => {
 
   expect(resultWithSecretFields.finalOutput).not.toContain(secret);
   expect(resultWithSecretFields.stopReason).not.toContain(secret);
+});
+
+test("redacts credentials containing quotes, backslashes, and newlines from transcript, final output, stderr, and projected sidecar", async () => {
+  const secret = 'sec"ret\\with\nnewline';
+  const escapedSecret = JSON.stringify(secret).slice(1, -1);
+  const event = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: `Output containing ${secret}` }],
+      stopReason: "stop",
+    },
+  });
+  const result = await runScript(
+    `process.stderr.write("Stderr with " + ${JSON.stringify(secret)} + " and escaped " + ${JSON.stringify(escapedSecret)} + "\\n"); process.stdout.write(${JSON.stringify(`${event}\n`)})`,
+    { timeoutMs: 1000, stderrMaxBytes: 1000, transcriptMaxBytes: 10000, parentOutputMaxBytes: 1000 },
+    { ...env, TEST_CREDENTIAL: secret },
+    ["TEST_CREDENTIAL"],
+  );
+  const transcript = await readFile(result.transcriptPath, "utf8");
+
+  expect(result.finalOutput).not.toContain(secret);
+  expect(result.finalOutput).not.toContain(escapedSecret);
+  expect(transcript).not.toContain(secret);
+  expect(transcript).not.toContain(escapedSecret);
+  expect(result.stderr).not.toContain(secret);
+  expect(result.stderr).not.toContain(escapedSecret);
 });
 
 test("redacts secrets before applying the stderr byte boundary", async () => {

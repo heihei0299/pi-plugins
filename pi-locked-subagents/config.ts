@@ -121,12 +121,14 @@ export function parseConfig(raw: string): Config {
 }
 
 export async function loadConfig(): Promise<Config> {
-  return parseConfig(await readFile(CONFIG_PATH, "utf8"));
+  const path = process.env.PI_LOCKED_SUBAGENTS_CONFIG || CONFIG_PATH;
+  return parseConfig(await readFile(path, "utf8"));
 }
 
 export function loadConfigSnapshot(): Config | null {
   try {
-    return parseConfig(readFileSync(CONFIG_PATH, "utf8"));
+    const path = process.env.PI_LOCKED_SUBAGENTS_CONFIG || CONFIG_PATH;
+    return parseConfig(readFileSync(path, "utf8"));
   } catch {
     return null;
   }

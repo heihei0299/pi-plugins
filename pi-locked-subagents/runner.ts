@@ -89,15 +89,39 @@ function redactionValues(env: NodeJS.ProcessEnv, explicitNames: string[]): strin
     ...explicitNames,
     ...Object.keys(env).filter((name) => SENSITIVE_ENV_NAME.test(name)),
   ]);
-  return [...new Set(
-    [...names]
-      .map((name) => env[name])
-      .filter((value): value is string => typeof value === "string" && value !== ""),
-  )].sort((left, right) => right.length - left.length);
+  const rawValues = [...names]
+    .map((name) => env[name])
+    .filter((value): value is string => typeof value === "string" && value !== "");
+
+  const allValues = new Set<string>();
+  for (const value of rawValues) {
+    allValues.add(value);
+    const escaped = JSON.stringify(value).slice(1, -1);
+    if (escaped) allValues.add(escaped);
+  }
+
+  return [...allValues].sort((left, right) => right.length - left.length);
 }
 
 function redactText(text: string, values: string[]): string {
   return values.reduce((result, value) => result.split(value).join("[redacted]"), text);
+}
+
+function redactValue(value: unknown, redactions: string[]): unknown {
+  if (typeof value === "string") {
+    return redactText(value, redactions);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactValue(item, redactions));
+  }
+  if (value !== null && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      result[k] = redactValue(v, redactions);
+    }
+    return result;
+  }
+  return value;
 }
 
 function maxValueBytes(values: readonly string[]): number {
@@ -178,7 +202,8 @@ export async function projectParentOutput(
     };
   }
 
-  const outputPath = join(RUN_DIR, `${Date.now()}-${randomUUID()}.txt`);
+  const runDir = process.env.PI_LOCKED_SUBAGENTS_RUN_DIR || RUN_DIR;
+  const outputPath = join(runDir, `${Date.now()}-${randomUUID()}.txt`);
   await writeFile(outputPath, text, { encoding: "utf8", mode: 0o600 });
   const projected = projectOutput(text, maxBytes, outputPath);
   return {
@@ -217,8 +242,9 @@ export async function runChild(
   limits: RunLimits = DEFAULT_RUN_LIMITS,
   sensitiveEnvNames: string[] = [],
 ): Promise<RunChildResult> {
-  await mkdir(RUN_DIR, { recursive: true, mode: 0o700 });
-  const transcriptPath = join(RUN_DIR, `${Date.now()}-${randomUUID()}.jsonl`);
+  const runDir = process.env.PI_LOCKED_SUBAGENTS_RUN_DIR || RUN_DIR;
+  await mkdir(runDir, { recursive: true, mode: 0o700 });
+  const transcriptPath = join(runDir, `${Date.now()}-${randomUUID()}.jsonl`);
 
   return new Promise<RunChildResult>((resolve, reject) => {
     const transcript = createWriteStream(transcriptPath, { encoding: "utf8", mode: 0o600 });
@@ -259,10 +285,10 @@ export async function runChild(
       forceKillTimer = setTimeout(() => terminate("SIGKILL"), 250);
     };
 
-    const writeTranscriptLine = (line: string, terminated: boolean) => {
+    const writeTranscriptLine = (text: string, terminated: boolean) => {
       if (transcriptTruncated) return;
-      const text = redactText(line + (terminated ? "\n" : ""), redactions);
-      const bytes = Buffer.from(text);
+      const lineText = text + (terminated ? "\n" : "");
+      const bytes = Buffer.from(lineText);
       const remaining = limits.transcriptMaxBytes - transcriptBytes;
       if (remaining <= 0) {
         transcriptTruncated = true;
@@ -277,12 +303,17 @@ export async function runChild(
     };
 
     const parseLine = (line: string, terminated: boolean) => {
-      writeTranscriptLine(line, terminated);
-      if (!line.trim()) return;
+      if (!line.trim()) {
+        writeTranscriptLine(redactText(line, redactions), terminated);
+        return;
+      }
       try {
         const event = JSON.parse(line) as { type?: string; message?: unknown };
-        if (event.type === "message_end") {
-          const info = assistantMessageInfo(event.message);
+        const redactedEvent = redactValue(event, redactions) as { type?: string; message?: unknown };
+        writeTranscriptLine(JSON.stringify(redactedEvent), terminated);
+
+        if (redactedEvent.type === "message_end") {
+          const info = assistantMessageInfo(redactedEvent.message);
           if (info) {
             sawValidMessageEnd = true;
             if (info.text !== null) finalOutput = redactText(info.text, redactions);
@@ -292,6 +323,7 @@ export async function runChild(
         }
       } catch {
         protocolError ??= "worker output contained invalid JSON";
+        writeTranscriptLine(redactText(line, redactions), terminated);
       }
     };
 
