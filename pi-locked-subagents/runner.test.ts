@@ -82,6 +82,15 @@ test("parses multiple JSONL events across arbitrary chunks", async () => {
   expect(result.finalOutput).toBe("done");
 });
 
+test("fails deterministically when one JSONL line exceeds its limit", async () => {
+  const result = await runScript(
+    `process.stdout.write("x".repeat(100))`,
+    { timeoutMs: 1000, maxJsonLineBytes: 64, stderrMaxBytes: 100, transcriptMaxBytes: 100, parentOutputMaxBytes: 100 },
+  );
+
+  expect(result.failureReason).toContain("JSONL line exceeded 64 bytes");
+});
+
 test("stops a worker that exceeds the execution timeout", async () => {
   const result = await runScript(
     `setInterval(() => {}, 1000)`,
@@ -132,10 +141,37 @@ test("truncates the transcript archive without stopping final-state parsing", as
     { timeoutMs: 1000, stderrMaxBytes: 100, transcriptMaxBytes: 32, parentOutputMaxBytes: 100 },
   );
   const transcript = await readFile(result.transcriptPath);
+  const transcriptText = transcript.toString("utf8");
 
   expect(result.failureReason).toBeUndefined();
   expect(result.transcriptTruncated).toBe(true);
   expect(transcript.byteLength).toBeLessThanOrEqual(32);
+  expect(transcriptText).not.toContain("[object");
+  for (const line of transcriptText.split("\n").filter(Boolean)) expect(() => JSON.parse(line)).not.toThrow();
+  expect(result.finalOutput).toBe("done");
+});
+
+test("keeps transcript truncation line-atomic and valid UTF-8", async () => {
+  const first = `${JSON.stringify({ type: "message_start" })}\n`;
+  const second = `${JSON.stringify({
+    type: "message_update",
+    message: { role: "assistant", content: [{ type: "text", text: "é".repeat(20) }] },
+  })}\n`;
+  const final = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+  });
+  const result = await runScript(
+    `process.stdout.write(${JSON.stringify(first + second + final)})`,
+    { timeoutMs: 1000, maxJsonLineBytes: 1024, stderrMaxBytes: 100, transcriptMaxBytes: Buffer.byteLength(first) + 2, parentOutputMaxBytes: 100 },
+  );
+  const transcriptText = (await readFile(result.transcriptPath, "utf8"));
+
+  expect(result.failureReason).toBeUndefined();
+  expect(result.transcriptTruncated).toBe(true);
+  expect(transcriptText).toBe(first);
+  expect(transcriptText).not.toContain("�");
+  expect(JSON.parse(transcriptText.trim()).type).toBe("message_start");
   expect(result.finalOutput).toBe("done");
 });
 
@@ -197,14 +233,14 @@ test("projects an already-redacted diagnostic to a bounded parent result", async
 });
 
 test("projects oversized final output to the parent and keeps a complete sidecar", async () => {
-  const text = "z".repeat(2000);
+  const text = "z".repeat(30_000);
   const event = JSON.stringify({
     type: "message_end",
     message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
   });
   const result = await runScript(
     `process.stdout.write(${JSON.stringify(event)})`,
-    { timeoutMs: 1000, stderrMaxBytes: 100, transcriptMaxBytes: 10000, parentOutputMaxBytes: 256 },
+    { timeoutMs: 1000, maxJsonLineBytes: 100_000, stderrMaxBytes: 100, transcriptMaxBytes: 100_000, parentOutputMaxBytes: 256 },
   );
 
   expect(result.projected).toBe(true);

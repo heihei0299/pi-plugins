@@ -61,11 +61,12 @@ The child receives a small default environment (`HOME`, `PATH`, locale/terminal 
 Each worker has these fixed defaults:
 
 - execution timeout: 120 seconds;
+- maximum single JSONL line: 8 MiB;
 - bounded stderr retained: 256 KiB;
 - transcript archive: 8 MiB;
 - parent-visible final output: 24 KiB.
 
-Child JSONL stdout is parsed and archived incrementally, so event-stream volume is not treated as the final reviewer-result size and does not trigger the old 1 MiB stdout kill switch. When the transcript archive reaches its limit, additional lines are not archived, `transcriptTruncated` is reported, and the worker continues so its final state can still be parsed. Stderr is retained only up to its bound and does not terminate a healthy worker by itself.
+Child JSONL stdout is parsed and archived incrementally, so event-stream volume is not treated as the final reviewer-result size and does not trigger the old 1 MiB stdout kill switch. A single JSONL line that exceeds its 8 MiB protocol limit fails deterministically while it is being received. When the transcript archive reaches its limit, later complete lines are not archived, `transcriptTruncated` is reported, and the worker continues so its final state can still be parsed. Archived transcript content remains a sequence of complete UTF-8 JSONL lines. Stderr is retained only up to its bound and does not terminate a healthy worker by itself.
 
 If the final assistant text exceeds the parent-visible limit, the complete redacted text is written to a restricted sidecar file below `~/.pi/agent/subagent-runs` (or `PI_LOCKED_SUBAGENTS_RUN_DIR`). The parent receives a bounded head/tail projection with the sidecar path, and result details include `outputPath`, `projected`, and the byte counts. Oversized failure diagnostics, including stderr and model error text, use the same parent budget and are persisted as redacted sidecars with `diagnosticPath` in the tool details. Transcripts use the same restricted directory/file permissions. A worker succeeds only when it exits normally and emits a valid final `message_end` event; a zero exit code alone is not sufficient.
 

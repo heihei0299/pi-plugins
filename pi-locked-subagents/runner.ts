@@ -4,7 +4,7 @@ import { createWriteStream } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { RUN_DIR, type AgentConfig } from "./config.ts";
-import { JsonlParser } from "./stream-parser.ts";
+import { JsonlLineLimitError, JsonlParser } from "./stream-parser.ts";
 
 const DEFAULT_SYSTEM_PROMPT =
   "You are a focused subagent. Complete the assigned task independently. " +
@@ -68,6 +68,7 @@ function assistantMessageInfo(message: unknown): AssistantMessageInfo | null {
 
 export interface RunLimits {
   timeoutMs: number;
+  maxJsonLineBytes: number;
   stderrMaxBytes: number;
   transcriptMaxBytes: number;
   parentOutputMaxBytes: number;
@@ -75,6 +76,7 @@ export interface RunLimits {
 
 export const DEFAULT_RUN_LIMITS: RunLimits = {
   timeoutMs: 120_000,
+  maxJsonLineBytes: 8 * 1024 * 1024,
   stderrMaxBytes: 256 * 1024,
   transcriptMaxBytes: 8 * 1024 * 1024,
   parentOutputMaxBytes: 24 * 1024,
@@ -267,8 +269,6 @@ export async function runChild(
         return;
       }
       if (bytes.byteLength > remaining) {
-        transcript.write(bytes.subarray(0, remaining));
-        transcriptBytes += remaining;
         transcriptTruncated = true;
         return;
       }
@@ -298,13 +298,20 @@ export async function runChild(
     const parser = new JsonlParser((line, terminated) => {
       if (settled || failureReason) return;
       parseLine(line, terminated);
-    });
+    }, limits.maxJsonLineBytes);
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       if (settled || failureReason) return;
-      parser.push(chunk);
+      try {
+        parser.push(chunk);
+      } catch (error) {
+        const reason = error instanceof JsonlLineLimitError
+          ? error.message
+          : `subagent JSONL parser failed: ${error instanceof Error ? error.message : String(error)}`;
+        stop(reason);
+      }
     });
     child.stderr.on("data", (chunk: string) => {
       if (settled) return;
