@@ -26,6 +26,14 @@ This installs the root package, its runtime dependencies, and all five extension
 
 Pi's other core extension packages remain peer dependencies supplied by Pi.
 
+## Testing
+
+Run the targeted locked-subagents tests with Bun:
+
+```bash
+bun test pi-locked-subagents/runner.test.ts
+```
+
 ## Design rule
 
 Keep the always-visible surface small. Put behavior in local configuration or opt-in commands instead of adding more LLM-callable tools and schemas.
