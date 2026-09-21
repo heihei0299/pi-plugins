@@ -315,6 +315,23 @@ test("projects an already-redacted diagnostic to a bounded parent result", async
   expect(await readFile(projection.outputPath!, "utf8")).toBe(diagnostic);
 });
 
+test("creates the run directory when projecting output directly", async () => {
+  const freshRunDir = join(runDir, "direct-output-run");
+  await rm(freshRunDir, { recursive: true, force: true });
+  const previousRunDir = process.env.PI_LOCKED_SUBAGENTS_RUN_DIR;
+  process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = freshRunDir;
+
+  try {
+    const projection = await projectParentOutput("x".repeat(300), 64);
+
+    expect(projection.outputPath).toBeDefined();
+    expect(await readFile(projection.outputPath!, "utf8")).toBe("x".repeat(300));
+  } finally {
+    if (previousRunDir === undefined) delete process.env.PI_LOCKED_SUBAGENTS_RUN_DIR;
+    else process.env.PI_LOCKED_SUBAGENTS_RUN_DIR = previousRunDir;
+  }
+});
+
 test("projects oversized final output to the parent and keeps a complete sidecar", async () => {
   const text = "z".repeat(30_000);
   const event = JSON.stringify({

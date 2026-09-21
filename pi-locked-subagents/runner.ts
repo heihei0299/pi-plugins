@@ -203,6 +203,7 @@ export async function projectParentOutput(
   }
 
   const runDir = process.env.PI_LOCKED_SUBAGENTS_RUN_DIR || RUN_DIR;
+  await mkdir(runDir, { recursive: true, mode: 0o700 });
   const outputPath = join(runDir, `${Date.now()}-${randomUUID()}.txt`);
   await writeFile(outputPath, text, { encoding: "utf8", mode: 0o600 });
   const projected = projectOutput(text, maxBytes, outputPath);
