@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { streamSimple as openAIResponsesStreamSimple } from "@earendil-works/pi-ai/api/openai-responses";
 import {
   addNativeWebSearch,
   formatStatus,
@@ -421,6 +422,67 @@ test("passes non-matching models through to the adapter unchanged", () => {
   expect(capture.calls).toHaveLength(1);
   expect(capture.calls[0].model).toBe(otherModel);
   expect(capture.calls[0].options).toBe(options);
+});
+
+test("keeps transcript-declared tools for non-matching Responses models", async () => {
+  const h = pluginHarness();
+  const channelConfig = normalizeConfig({
+    channels: [{
+      provider: "cpa",
+      endpoint: "standard",
+      modelPrefix: "gpt-5.6-luna",
+      enabled: true,
+    }],
+  });
+  installNativeResponsesWebSearch(h.pi, channelConfig, "/tmp/config", {
+    standard: openAIResponsesStreamSimple as any,
+  });
+
+  let payload: any;
+  const stream = h.pi.providers[0].config.streamSimple(
+    {
+      provider: "cpa",
+      id: "gpt-6-luna",
+      api: "openai-responses",
+      baseUrl: "http://127.0.0.1/v1",
+      input: ["text"],
+      output: ["text"],
+      contextWindow: 8192,
+      maxTokens: 1024,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    },
+    {
+      messages: [
+        {
+          role: "system",
+          content: "Use the available tools.",
+          timestamp: Date.now(),
+          toolsAdded: [{
+            name: "bash",
+            description: "Run shell commands.",
+            parameters: {
+              type: "object",
+              properties: { command: { type: "string" } },
+              required: ["command"],
+            },
+          }],
+        },
+        { role: "user", content: "Run ls.", timestamp: Date.now() },
+      ],
+    },
+    {
+      apiKey: "test",
+      fetch: async () => {
+        throw new Error("intentional test stop after payload construction");
+      },
+      onPayload: (value: any) => {
+        payload = value;
+      },
+    },
+  );
+
+  await stream.result();
+  expect(payload.tools.map((tool: any) => tool.name)).toContain("bash");
 });
 
 const searchBackendModel = {

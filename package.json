@@ -21,6 +21,6 @@
     "typebox": "*"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.85.1"
+    "@earendil-works/pi-ai": "1.1.0"
   }
 }
