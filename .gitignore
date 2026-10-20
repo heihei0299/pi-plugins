@@ -10,3 +10,9 @@ PROJECT.md
 CLAUDE.md
 /package.json
 !/package.json
+
+# === 提交内容治理：仅提交 README + 源码 ===
+# 计划与过程文档保留在本地磁盘，不纳入版本控制
+/plans/
+*.md
+!README*.md
